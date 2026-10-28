@@ -1,0 +1,1 @@
+export const clientUpdatesEnabled = false

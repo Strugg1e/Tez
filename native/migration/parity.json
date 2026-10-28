@@ -1,0 +1,1007 @@
+{
+  "version": 2,
+  "contractDigest": "34b5c1cf1bb5f5fec44a5765395c70a998bdf8ba0edfb2b0a40407c886c9de92",
+  "entries": {
+    "command:apply_dns_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:cancel_update_download": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:change_clash_core": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:check_media_unlock": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:check_media_unlock_item": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:continue_with_sidecar": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:copy_clash_env": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:copy_icon_file": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:create_local_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:create_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:create_webdav_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:delete_local_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:delete_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:delete_webdav_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:download_icon_cache": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:enhance_profiles": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:entry_lightweight_mode": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:exit_app": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:export_diagnostic_info": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:export_local_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:forget_selected_node": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_app_dir": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_app_uptime": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_auto_proxy": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_clash_info": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_clash_logs": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_clash_mode": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_core_startup_error": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_dns_config_content": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_embedded_server_port": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_network_interfaces": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_network_interfaces_info": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_next_update_time": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_pending_failures": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_profiles": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_proxy_view": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_runtime_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_runtime_logs": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_runtime_proxy_chain_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_runtime_state": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_runtime_yaml": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_sidecar_failure": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_sys_proxy": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_system_hostname": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_system_info": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_unlock_items": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:get_verge_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:import_local_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:import_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:install_service": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:install_update": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:invoke_uwp_tool": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:list_local_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:list_webdav_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:migrate_local_profiles": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:open_app_dir": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:open_core_dir": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:open_devtools": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:open_logs_dir": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:patch_clash_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:patch_clash_mode": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:patch_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:patch_profiles_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:patch_verge_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:probe_listener": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:read_profile_file": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:record_selected_node": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:reinstall_service": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:reorder_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:repair_service": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:restart_app": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:restart_core": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:restore_local_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:restore_webdav_backup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:rollback_profile_migration": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:save_dns_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:save_profile_file": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:save_proxy_ports": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:save_webdav_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:scan_migration_sources": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:set_dns_override": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:sync_runtime_providers": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:sync_tray_proxy_selection": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:take_discarded_keys_notice": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:take_dns_override_notice": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:take_service_fallback_notice": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:take_service_owner_notice": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:take_service_repair_notice": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:test_delay": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:uninstall_service": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:update_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:update_proxy_chain_config_in_runtime": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:upgrade_clash_core": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:validate_dns_config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "command:view_profile": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:profile-changed": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:profile-update-completed": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:profile-update-started": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://notice-message": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://pending-failures-changed": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://refresh-clash-config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://refresh-profiles": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://refresh-proxy-config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://refresh-verge-config": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://run-state-changed": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "event:verge://timer-updated": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bindings.ts"
+      ]
+    },
+    "mihomo:BaseConfig": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/providers/app-data-context.ts"
+      ]
+    },
+    "mihomo:closeAllConnections": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/proxy/proxy-chain.tsx",
+        "src/components/setting/mods/clash-core-viewer.tsx",
+        "src/hooks/use-system-proxy-state.ts",
+        "src/pages/connections.tsx",
+        "src/pages/profiles.tsx"
+      ]
+    },
+    "mihomo:closeConnection": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/connection/connection-detail.tsx",
+        "src/components/connection/connection-row-item.tsx",
+        "src/hooks/use-proxy-selection.ts"
+      ]
+    },
+    "mihomo:delayProxyByName": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/delay.ts"
+      ]
+    },
+    "mihomo:getBaseConfig": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/providers/app-data-provider.tsx"
+      ]
+    },
+    "mihomo:getConnections": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/hooks/use-proxy-selection.ts"
+      ]
+    },
+    "mihomo:getRuleProviders": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/providers/app-data-provider.tsx"
+      ]
+    },
+    "mihomo:getRules": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/providers/app-data-provider.tsx"
+      ]
+    },
+    "mihomo:getVersion": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/hooks/use-clash.ts"
+      ]
+    },
+    "mihomo:healthcheckNodeInProvider": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/delay.ts"
+      ]
+    },
+    "mihomo:MihomoWebSocket": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/hooks/use-connection-data.ts",
+        "src/hooks/use-log-data.ts",
+        "src/hooks/use-memory-data.ts",
+        "src/hooks/use-traffic-data.ts",
+        "src/main.tsx"
+      ]
+    },
+    "mihomo:Rule": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/rule/rule-item.tsx",
+        "src/providers/app-data-context.ts"
+      ]
+    },
+    "mihomo:RuleProvider": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/providers/app-data-context.ts"
+      ]
+    },
+    "mihomo:selectNodeForGroup": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/proxy/proxy-chain.tsx",
+        "src/hooks/use-proxy-selection.ts"
+      ]
+    },
+    "mihomo:Traffic": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/layout/traffic-graph.tsx",
+        "src/hooks/use-traffic-data.ts",
+        "src/hooks/use-traffic-monitor.ts"
+      ]
+    },
+    "mihomo:unfixedProxy": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/hooks/use-proxy-selection.ts"
+      ]
+    },
+    "mihomo:updateGeo": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/setting/setting-clash.tsx"
+      ]
+    },
+    "mihomo:updateProxyProvider": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/proxy/provider-button.tsx"
+      ]
+    },
+    "mihomo:updateRuleProvider": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/components/rule/provider-button.tsx"
+      ]
+    },
+    "workflow:backup-local-webdav-restore": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src-tauri/src/cmd/backup.rs"
+      ]
+    },
+    "workflow:connection-lifecycle": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/tez/connection.tsx"
+      ]
+    },
+    "workflow:connections-stream-and-close": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/pages/connections.tsx"
+      ]
+    },
+    "workflow:installation-upgrade-and-rollback": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "README.md"
+      ]
+    },
+    "workflow:local-migration-confirmation-undo": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/tez/migration.tsx"
+      ]
+    },
+    "workflow:logs-stream-filter-export": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/pages/logs.tsx"
+      ]
+    },
+    "workflow:media-unlock": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/pages/unlock.tsx"
+      ]
+    },
+    "workflow:notifications-and-reconnect": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/bus/use-event-bus.ts"
+      ]
+    },
+    "workflow:profile-enhancement-validation-rollback": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src-tauri/src/cmd/save_profile.rs"
+      ]
+    },
+    "workflow:profiles-import-edit-update": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/pages/profiles.tsx"
+      ]
+    },
+    "workflow:proxy-delay-and-providers": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/services/delay.ts"
+      ]
+    },
+    "workflow:proxy-selection-persistence": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/hooks/use-proxy-selection.ts"
+      ]
+    },
+    "workflow:rules-and-rule-providers": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/pages/rules.tsx"
+      ]
+    },
+    "workflow:service-ownership-repair-fallback": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src-tauri/src/cmd/service.rs"
+      ]
+    },
+    "workflow:settings-persistence-and-effects": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src/tez/settings.tsx"
+      ]
+    },
+    "workflow:tray-and-hotkeys": {
+      "status": "pending",
+      "evidence": [],
+      "sources": [
+        "src-tauri/src/core/tray/mod.rs"
+      ]
+    }
+  }
+}

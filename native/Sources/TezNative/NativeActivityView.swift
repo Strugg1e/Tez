@@ -1,0 +1,299 @@
+import SwiftUI
+
+struct NativeActivityView: View {
+    @Bindable var store: NativeBackendStore
+    @State private var model = NativeActivityModel()
+    @State private var tab = ActivityTab.connections
+    @State private var query = ""
+    @State private var paused = false
+    @State private var offset: UInt64 = 0
+    @State private var isVisible = false
+    @State private var connectionID: String?
+    @State private var ruleID: UInt64?
+    @State private var providerID: String?
+
+    private var canRead: Bool { store.supports("native_get_activity") }
+    private var connections: [NativeActivityConnection] { model.snapshot?.connections.items ?? [] }
+    private var rules: [NativeActivityRule] { model.snapshot?.rules.items ?? [] }
+    private var providers: [NativeActivityProvider] { model.snapshot?.providers.items ?? [] }
+    private var requestQuery: NativeActivityQuery { NativeActivityQuery(section: tab.rawValue, query: query, offset: offset, limit: tab.pageSize) }
+    private var pollKey: ActivityPollKey { ActivityPollKey(query: requestQuery, canRead: canRead) }
+    private var showingRequestedPage: Bool { model.snapshotQuery == requestQuery }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            summary
+            Divider()
+            controls
+            if let error = model.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24).padding(.bottom, 10)
+            }
+            content
+            Divider()
+            details
+            Divider()
+            footer
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+        .task(id: pollKey) {
+            guard canRead else { model.stop(); return }
+            let requested = requestQuery
+            model.select(requested)
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+            if !paused || model.snapshotQuery != requested { await refresh(requested) }
+            while !Task.isCancelled && canRead {
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                if !paused { await refresh(requested) }
+            }
+        }
+        .onAppear { isVisible = true }
+        .onDisappear { isVisible = false; model.stop() }
+        .onChange(of: tab) { _, _ in query = ""; offset = 0 }
+        .onChange(of: query) { _, _ in offset = 0 }
+        .onChange(of: requestQuery) { _, requested in
+            model.select(requested)
+            connectionID = nil; ruleID = nil; providerID = nil
+        }
+        .onChange(of: paused) { _, paused in if paused { model.stop() } }
+    }
+
+    private var summary: some View {
+        HStack(spacing: 20) {
+            metric("活跃连接", value: model.snapshot?.connections.state == "ready" ? model.snapshot?.connections.total.formatted() ?? "—" : "—", symbol: "point.3.connected.trianglepath.dotted")
+            metric("累计上传", value: NativeActivityFormat.bytes(model.snapshot?.connections.uploadTotal), symbol: "arrow.up")
+            metric("累计下载", value: NativeActivityFormat.bytes(model.snapshot?.connections.downloadTotal), symbol: "arrow.down")
+            metric("内存", value: NativeActivityFormat.bytes(model.snapshot?.connections.memory), symbol: "memorychip")
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 24).padding(.vertical, 22)
+        .background { TezContentMaterial(material: .headerView) }
+    }
+
+    private func metric(_ title: String, value: String, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label(title, systemImage: symbol).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 20, weight: .medium)).monospacedDigit().lineLimit(1)
+        }
+        .frame(minWidth: 100, alignment: .leading)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 12) {
+            Picker("活动类别", selection: $tab) {
+                ForEach(ActivityTab.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden().frame(width: 230)
+            .accessibilityLabel("活动类别")
+            .accessibilityIdentifier("live.activity.tabs")
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField(tab.searchPrompt, text: $query)
+                    .textFieldStyle(.plain)
+                    .accessibilityIdentifier("live.activity.search")
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).foregroundStyle(.secondary).help("清除搜索")
+                }
+            }
+            .padding(.horizontal, 9).padding(.vertical, 6)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            .frame(minWidth: 130)
+            Button { paused.toggle() } label: { Image(systemName: paused ? "play.fill" : "pause.fill").frame(width: 16, height: 16) }
+                .help(paused ? "继续刷新活动" : "暂停刷新活动")
+                .accessibilityLabel(paused ? "继续刷新活动" : "暂停刷新活动")
+                .disabled(!canRead)
+            Button { let requested = requestQuery; Task { await refresh(requested) } } label: {
+                Image(systemName: "arrow.clockwise").frame(width: 16, height: 16)
+            }
+            .help("刷新活动").accessibilityLabel("刷新活动")
+            .disabled(!canRead || model.isLoading)
+            .accessibilityIdentifier("live.activity.refresh")
+        }
+        .padding(.horizontal, 24).padding(.vertical, 14)
+    }
+
+    @ViewBuilder private var content: some View {
+        if !canRead && model.snapshot == nil {
+            ContentUnavailableView("活动查询不可用", systemImage: "waveform.path", description: Text("当前后台未开放活动查询。"))
+        } else if model.snapshot == nil {
+            if model.isLoading {
+                VStack(spacing: 10) { ProgressView(); Text("正在读取活动").font(.callout).foregroundStyle(.secondary) }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ContentUnavailableView("活动读取失败", systemImage: "exclamationmark.triangle")
+            }
+        } else if sectionState != "ready" {
+            ContentUnavailableView(tab.unavailableTitle, systemImage: "network.slash", description: Text(NativeActivityFormat.issue(sectionCode)))
+        } else if visibleCount == 0 && !showingRequestedPage && model.errorMessage == nil {
+            VStack(spacing: 10) { ProgressView(); Text("正在查询").font(.callout).foregroundStyle(.secondary) }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if visibleCount == 0 {
+            ContentUnavailableView(query.isEmpty ? tab.emptyTitle : "没有匹配结果", systemImage: query.isEmpty ? tab.symbol : "magnifyingglass")
+        } else {
+            switch tab {
+            case .connections: connectionTable
+            case .rules: ruleTable
+            case .providers: providerTable
+            }
+        }
+    }
+
+    private var connectionTable: some View {
+        Table(connections, selection: $connectionID) {
+            TableColumn("目标") { row in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(row.title).lineLimit(1)
+                    if let destination = row.destinationLabel, destination != row.title {
+                        Text(destination).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }.padding(.vertical, 3)
+            }.width(min: 150, ideal: 210)
+            TableColumn("应用") { row in Text(display(row.process)).lineLimit(1) }.width(min: 70, ideal: 100)
+            TableColumn("协议") { row in Text(display(row.network)).font(.caption).foregroundStyle(.secondary) }.width(54)
+            TableColumn("上传") { row in Text(NativeActivityFormat.bytes(row.upload)).monospacedDigit().font(.caption) }.width(78)
+            TableColumn("下载") { row in Text(NativeActivityFormat.bytes(row.download)).monospacedDigit().font(.caption) }.width(78)
+        }
+        .accessibilityIdentifier("live.activity.connections")
+    }
+
+    private var ruleTable: some View {
+        Table(rules, selection: $ruleID) {
+            TableColumn("序号") { row in Text(row.index.formatted()).monospacedDigit().foregroundStyle(.secondary) }.width(46)
+            TableColumn("类型") { row in Text(display(row.type)).lineLimit(1) }.width(min: 90, ideal: 110)
+            TableColumn("匹配内容") { row in Text(display(row.payload)).lineLimit(1) }.width(min: 160, ideal: 250)
+            TableColumn("策略") { row in Text(display(row.proxy)).lineLimit(1) }.width(min: 100, ideal: 130)
+        }
+        .accessibilityIdentifier("live.activity.rules")
+    }
+
+    private var providerTable: some View {
+        Table(providers, selection: $providerID) {
+            TableColumn("规则源") { row in Text(row.name).lineLimit(1) }.width(min: 160, ideal: 220)
+            TableColumn("行为") { row in Text(display(row.behavior)).lineLimit(1) }.width(min: 80, ideal: 100)
+            TableColumn("格式") { row in Text(display(row.format)).lineLimit(1) }.width(70)
+            TableColumn("规则数") { row in Text(row.ruleCount?.formatted() ?? "—").monospacedDigit() }.width(70)
+        }
+        .accessibilityIdentifier("live.activity.providers")
+    }
+
+    private var details: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                switch tab {
+                case .connections:
+                    if let row = model.snapshot?.connections.items.first(where: { $0.id == connectionID }) {
+                        Text(row.title).font(.system(size: 13, weight: .semibold)).textSelection(.enabled)
+                        HStack(alignment: .top, spacing: 24) {
+                            detail("应用", display(row.process))
+                            detail("类型", display(row.type))
+                            detail("规则", display(row.rule))
+                            detail("线路", row.chains.isEmpty ? "—" : row.chains.joined(separator: " → "))
+                        }
+                        if let start = row.start, !start.isEmpty { Text("开始于 \(start)").font(.caption2).foregroundStyle(.secondary).textSelection(.enabled) }
+                    } else { detailPlaceholder("选择连接以查看详情") }
+                case .rules:
+                    if let row = model.snapshot?.rules.items.first(where: { $0.index == ruleID }) {
+                        Text(display(row.payload)).font(.system(size: 13, weight: .semibold)).textSelection(.enabled)
+                        HStack(alignment: .top, spacing: 28) {
+                            detail("类型", display(row.type))
+                            detail("策略", display(row.proxy))
+                            detail("条目数", row.size?.formatted() ?? "—")
+                        }
+                    } else { detailPlaceholder("选择规则以查看详情") }
+                case .providers:
+                    if let row = model.snapshot?.providers.items.first(where: { $0.name == providerID }) {
+                        Text(row.name).font(.system(size: 13, weight: .semibold)).textSelection(.enabled)
+                        HStack(alignment: .top, spacing: 28) {
+                            detail("类型", display(row.type))
+                            detail("来源", display(row.vehicleType))
+                            detail("更新时间", display(row.updatedAt))
+                        }
+                    } else { detailPlaceholder("选择规则源以查看详情") }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24).padding(.vertical, 16)
+        }
+        .frame(height: 126)
+        .background { TezContentMaterial(material: .contentBackground) }
+    }
+
+    private func detail(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 12)).lineLimit(2).textSelection(.enabled)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func detailPlaceholder(_ title: String) -> some View {
+        Text(title).font(.callout).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 85, alignment: .leading)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            Text(footerCount)
+            if !showingRequestedPage { Text("显示上次结果") }
+            Spacer(minLength: 0)
+            if model.isLoading { ProgressView().controlSize(.mini) }
+            if paused { Text("已暂停") }
+            HStack(spacing: 4) {
+                Button { offset = offset >= tab.pageSize ? offset - tab.pageSize : 0 } label: {
+                    Image(systemName: "chevron.left").frame(width: 16, height: 16)
+                }
+                .help("上一页").accessibilityLabel("上一页").accessibilityIdentifier("live.activity.previous")
+                .disabled(!canRead || !showingRequestedPage || model.isLoading || !hasPaging || offset == 0)
+                Button { if let nextOffset { offset = nextOffset } } label: {
+                    Image(systemName: "chevron.right").frame(width: 16, height: 16)
+                }
+                .help("下一页").accessibilityLabel("下一页").accessibilityIdentifier("live.activity.next")
+                .disabled(!canRead || !showingRequestedPage || model.isLoading || nextOffset == nil)
+            }.controlSize(.mini)
+        }
+        .font(.system(size: 11)).foregroundStyle(.secondary)
+        .padding(.horizontal, 24).frame(height: 34)
+    }
+
+    private var visibleCount: Int { switch tab { case .connections: connections.count; case .rules: rules.count; case .providers: providers.count } }
+    private var total: UInt64 { switch tab { case .connections: model.snapshot?.connections.total ?? 0; case .rules: model.snapshot?.rules.total ?? 0; case .providers: model.snapshot?.providers.total ?? 0 } }
+    private var sectionState: String { switch tab { case .connections: model.snapshot?.connections.state ?? "unavailable"; case .rules: model.snapshot?.rules.state ?? "unavailable"; case .providers: model.snapshot?.providers.state ?? "unavailable" } }
+    private var sectionCode: String? { switch tab { case .connections: model.snapshot?.connections.code; case .rules: model.snapshot?.rules.code; case .providers: model.snapshot?.providers.code } }
+    private var truncated: Bool { switch tab { case .connections: model.snapshot?.connections.truncated ?? false; case .rules: model.snapshot?.rules.truncated ?? false; case .providers: model.snapshot?.providers.truncated ?? false } }
+    private var matched: UInt64? { switch tab { case .connections: model.snapshot?.connections.matched; case .rules: model.snapshot?.rules.matched; case .providers: model.snapshot?.providers.matched } }
+    private var responseOffset: UInt64? { switch tab { case .connections: model.snapshot?.connections.offset; case .rules: model.snapshot?.rules.offset; case .providers: model.snapshot?.providers.offset } }
+    private var pageOffset: UInt64 { responseOffset ?? 0 }
+    private var nextOffset: UInt64? { switch tab { case .connections: model.snapshot?.connections.nextOffset; case .rules: model.snapshot?.rules.nextOffset; case .providers: model.snapshot?.providers.nextOffset } }
+    private var hasPaging: Bool { matched != nil && responseOffset != nil }
+    private var footerCount: String {
+        guard sectionState == "ready" else { return "数据不可用" }
+        guard let matched, hasPaging else { return "\(visibleCount) / \(total.formatted()) 项\(truncated ? " · 后台未提供分页" : "")" }
+        let range = visibleCount == 0 ? "0" : "\((pageOffset + 1).formatted())–\((pageOffset + UInt64(visibleCount)).formatted())"
+        return matched == total ? "\(range) / \(total.formatted()) 项" : "\(range) / \(matched.formatted()) 匹配 · 共 \(total.formatted()) 项"
+    }
+
+    private func display(_ value: String?) -> String { value.flatMap { $0.isEmpty ? nil : $0 } ?? "—" }
+
+    private func refresh(_ requested: NativeActivityQuery) async {
+        guard isVisible, canRead, requested == requestQuery, !Task.isCancelled else { return }
+        await model.refresh(query: requested) { try await store.request("native_get_activity", params: requested.params, timeout: .seconds(15)) }
+        if let connectionID, model.snapshot?.connections.items.contains(where: { $0.id == connectionID }) != true { self.connectionID = nil }
+    }
+}
+
+private enum ActivityTab: String, CaseIterable, Identifiable {
+    case connections, rules, providers
+    var id: Self { self }
+    var pageSize: UInt64 { switch self { case .connections: 128; case .rules: 256; case .providers: 64 } }
+    var title: String { switch self { case .connections: "连接"; case .rules: "规则"; case .providers: "规则源" } }
+    var symbol: String { switch self { case .connections: "network"; case .rules: "line.3.horizontal.decrease"; case .providers: "shippingbox" } }
+    var searchPrompt: String { switch self { case .connections: "搜索连接"; case .rules: "搜索规则"; case .providers: "搜索规则源" } }
+    var emptyTitle: String { switch self { case .connections: "暂无活动连接"; case .rules: "暂无规则"; case .providers: "暂无规则源" } }
+    var unavailableTitle: String { switch self { case .connections: "连接数据不可用"; case .rules: "规则数据不可用"; case .providers: "规则源数据不可用" } }
+}
+
+private struct ActivityPollKey: Hashable {
+    let query: NativeActivityQuery
+    let canRead: Bool
+}

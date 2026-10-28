@@ -1,0 +1,18 @@
+[
+  { "id": "connection-lifecycle", "source": "src/tez/connection.tsx" },
+  { "id": "proxy-selection-persistence", "source": "src/hooks/use-proxy-selection.ts" },
+  { "id": "proxy-delay-and-providers", "source": "src/services/delay.ts" },
+  { "id": "profiles-import-edit-update", "source": "src/pages/profiles.tsx" },
+  { "id": "profile-enhancement-validation-rollback", "source": "src-tauri/src/cmd/save_profile.rs" },
+  { "id": "local-migration-confirmation-undo", "source": "src/tez/migration.tsx" },
+  { "id": "connections-stream-and-close", "source": "src/pages/connections.tsx" },
+  { "id": "logs-stream-filter-export", "source": "src/pages/logs.tsx" },
+  { "id": "rules-and-rule-providers", "source": "src/pages/rules.tsx" },
+  { "id": "media-unlock", "source": "src/pages/unlock.tsx" },
+  { "id": "settings-persistence-and-effects", "source": "src/tez/settings.tsx" },
+  { "id": "backup-local-webdav-restore", "source": "src-tauri/src/cmd/backup.rs" },
+  { "id": "service-ownership-repair-fallback", "source": "src-tauri/src/cmd/service.rs" },
+  { "id": "notifications-and-reconnect", "source": "src/services/bus/use-event-bus.ts" },
+  { "id": "tray-and-hotkeys", "source": "src-tauri/src/core/tray/mod.rs" },
+  { "id": "installation-upgrade-and-rollback", "source": "README.md" }
+]

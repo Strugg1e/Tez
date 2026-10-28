@@ -1,0 +1,6 @@
+{"version":1,"kind":"hello","protocol":"tez.native","sessionID":"fixture-session","capabilities":["get_app_dir","get_system_hostname"]}
+{"version":1,"kind":"request","id":"request-1","command":"get_app_dir","params":{}}
+{"version":1,"kind":"response","id":"request-1","result":null}
+{"version":1,"kind":"response","id":"request-2","error":{"code":"CORE_START_FAILED","detail":"保留原始失败信息","operation":{"stage":"startup","retry":false}}}
+{"version":1,"kind":"response","id":"request-3","error":{"code":null,"detail":"uncoded failure","operation":null}}
+{"version":1,"kind":"event","sequence":"184467440737095516160","name":"verge://refresh-clash-config","payload":{"node":"东京 01","active":true,"count":18446744073709551615,"signed":-9223372036854775808,"ratio":1.25,"lines":"a\nb","values":[false,null,0]}}

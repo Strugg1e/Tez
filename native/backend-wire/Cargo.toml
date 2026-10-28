@@ -1,0 +1,11 @@
+[package]
+name = "tez-backend-wire"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = "1.0"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
