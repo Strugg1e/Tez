@@ -217,8 +217,8 @@ mod tests {
     #[test]
     fn final_path_check_is_component_bounded_and_case_insensitive() {
         assert!(path_is_below_root(
-            r"\\?\C:\Users\Alice\AppData\Roaming\io.github.clash-verge-rev.clash-verge-rev",
-            r"\\?\c:\users\alice\appdata\roaming\io.github.clash-verge-rev.clash-verge-rev\logs\a.log"
+            r"\\?\C:\Users\Alice\AppData\Roaming\app.tez",
+            r"\\?\c:\users\alice\appdata\roaming\app.tez\logs\a.log"
         ));
         assert!(!path_is_below_root(
             r"\\?\C:\Users\Alice\AppData\Roaming\app",

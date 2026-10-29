@@ -6,34 +6,73 @@ import SwiftUI
 struct NativeFeaturesCheck {
     static let snapshot: BackendJSON = .object([
         "revision": .string("1"),
-        "profiles": .object(["state": .string("ready"), "current": .null, "items": .array([]), "message": .null]),
+        "profiles": .object(["state": .string("ready"), "current": .string("active"), "items": .array([
+            .object(["uid": .string("fixture"), "name": .string("Daily Configuration / Personal Network"), "type": .string("remote")]),
+            .object(["uid": .string("active"), "name": .string("Current Local Configuration"), "type": .string("local")])
+        ]), "message": .null]),
         "proxyView": .null, "core": .object(["state": .string("unavailable"), "message": .null])
     ])
 
     static func emit(_ value: BackendMessage) throws { try FileHandle.standardOutput.write(contentsOf: BackendWire.encode(value)) }
     static func fixture() throws {
-        try emit(.hello(sessionID: "features-fixture", capabilities: ["native_continuous_session", "native_subscribe", "native_get_snapshot", "native_get_settings", "native_patch_settings", "native_get_dns", "native_save_dns", "native_set_dns_override", "native_get_logs", "native_import_subscription", "native_create_local_profile", "native_subscription_details", "native_patch_subscription", "native_list_local_backups", "native_create_local_backup", "native_delete_local_backup", "native_import_local_backup", "native_export_local_backup", "native_restore_local_backup", "native_get_webdav_config", "native_save_webdav_config", "native_list_webdav_backups", "native_create_webdav_backup", "native_delete_webdav_backup", "native_restore_webdav_backup"]))
+        try emit(.hello(sessionID: "features-fixture", capabilities: ["native_continuous_session", "native_subscribe", "native_get_snapshot", "native_get_settings", "native_patch_settings", "native_set_mode", "native_get_dns", "native_save_dns", "native_set_dns_override", "native_get_logs", "native_import_subscription", "native_create_local_profile", "native_subscription_details", "native_patch_subscription", "native_update_subscription", "native_activate_profile", "native_list_local_backups", "native_create_local_backup", "native_delete_local_backup", "native_import_local_backup", "native_export_local_backup", "native_restore_local_backup", "native_get_webdav_config", "native_save_webdav_config", "native_list_webdav_backups", "native_create_webdav_backup", "native_delete_webdav_backup", "native_restore_webdav_backup"]))
         var next = 1
+        var currentSnapshot = snapshot
+        var mode = "rule"
+        var dnsContent = "dns:\n  enable: true\n  nameserver:\n    - https://example.test/dns-query\n"
+        var dnsEnabled = false
+        var subscription: [String: BackendJSON] = ["uid": .string("fixture"), "name": .string("示例订阅"), "url": .string("https://example.test/sub"), "interval": .integer(1440), "autoUpdate": .bool(true), "withProxy": .bool(false), "usage": .object(["upload": .integer(1048576), "download": .integer(10485760), "total": .integer(10737418240), "expire": .integer(1800000000)])]
         var backups: [String] = []
         var remoteBackups: [String] = []
         while let line = readLine() {
             guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { fatalError() }
             precondition(id == "seq:\(next)"); next += 1
             switch command {
-            case "native_subscribe", "native_get_snapshot": try emit(.response(id: id, outcome: .result(snapshot)))
+            case "native_subscribe", "native_get_snapshot": try emit(.response(id: id, outcome: .result(currentSnapshot)))
+            case "native_activate_profile":
+                guard case .string(let uid) = params["uid"], case .object(var root) = currentSnapshot,
+                      case .object(var profiles) = root["profiles"] else { fatalError() }
+                profiles["current"] = .string(uid); root["profiles"] = .object(profiles)
+                root["revision"] = .string("2"); currentSnapshot = .object(root)
+                try emit(.response(id: id, outcome: .result(.object(["applied": .bool(true)]))))
             case "native_get_settings":
                 Thread.sleep(forTimeInterval: 0.25)
-                try emit(.response(id: id, outcome: .result(.object(["values": .object(["verge_mixed_port": .integer(7897)]), "mode": .string("rule")]))))
+                try emit(.response(id: id, outcome: .result(.object(["values": .object(["verge_mixed_port": .integer(7897)]), "mode": .string(mode)]))))
             case "native_patch_settings":
                 try emit(.response(id: id, outcome: .error(.init(detail: "Injected failure", code: .string("SETTINGS_WRITE_FAILED"), operation: nil))))
             case "native_get_dns":
-                try emit(.response(id: id, outcome: .result(.object(["content": .string("dns:\n  enable: true\n  nameserver:\n    - https://example.test/dns-query\n"), "uid": .string("fixture"), "enabled": .bool(false)]))))
+                try emit(.response(id: id, outcome: .result(.object(["content": .string(dnsContent), "uid": .string("fixture"), "enabled": .bool(dnsEnabled)]))))
+            case "native_set_mode":
+                guard case .string(let value) = params["mode"] else { fatalError() }
+                mode = value
+                try emit(.response(id: id, outcome: .result(.object(["applied": .bool(true)]))))
+            case "native_save_dns":
+                guard case .string(let value) = params["content"] else { fatalError() }
+                dnsContent = value
+                try emit(.response(id: id, outcome: .result(.object(["saved": .bool(true), "applied": .bool(false)]))))
+            case "native_set_dns_override":
+                guard case .bool(let value) = params["enabled"] else { fatalError() }
+                dnsEnabled = value
+                try emit(.response(id: id, outcome: .result(.object(["status": .string("applied")]))))
             case "native_get_logs":
                 try emit(.response(id: id, outcome: .result(.object(["lines": .array([.string("[info] Fixture core ready"), .string("[warn] Example log entry"), .string("[info] No production core is connected")])]))))
             case "native_subscription_details":
-                try emit(.response(id: id, outcome: .result(.object(["uid": .string("fixture"), "name": .string("示例订阅"), "url": .string("https://example.test/sub"), "interval": .integer(1440), "autoUpdate": .bool(true), "withProxy": .bool(false), "usage": .object(["upload": .integer(1048576), "download": .integer(10485760), "total": .integer(10737418240), "expire": .integer(1800000000)])]))))
-            case "native_import_subscription", "native_create_local_profile", "native_patch_subscription", "native_save_dns", "native_set_dns_override":
+                try emit(.response(id: id, outcome: .result(.object(subscription))))
+            case "native_import_subscription", "native_create_local_profile", "native_patch_subscription":
+                if params["name"] == .string("模拟保存失败") {
+                    try emit(.response(id: id, outcome: .error(.init(detail: "模拟保存失败，原配置未更改。", code: .string("SUBSCRIPTION_WRITE_FAILED"), operation: nil))))
+                    continue
+                }
+                if command == "native_patch_subscription" {
+                    for key in ["name", "url", "interval"] {
+                        if let value = params[key] { subscription[key] = value }
+                    }
+                    subscription["autoUpdate"] = params["auto_update"]
+                    subscription["withProxy"] = params["with_proxy"]
+                }
                 try emit(.response(id: id, outcome: .result(.object(["saved": .bool(true), "status": .string("applied")]))))
+            case "native_update_subscription":
+                try emit(.response(id: id, outcome: .result(.object(["updated": .bool(true)]))))
             case "native_create_local_backup":
                 backups.append("fixture.zip")
                 try emit(.response(id: id, outcome: .result(.object(["filename": .string("fixture.zip")]))))
@@ -78,6 +117,43 @@ struct NativeFeaturesCheck {
         preferences.appearance = .dark; preferences.showProtocol = false; preferences.reduceTransparency = true
         let restored = TezPreviewPreferences(defaults: defaults)
         precondition(restored.appearance == .dark && !restored.showProtocol && restored.reduceTransparency)
+        for index in 1...7 { preferences.recordRoute(profileID: "profile-1", group: "GLOBAL", name: "Route \(index)") }
+        preferences.recordRoute(profileID: "profile-1", group: "GLOBAL", name: "Route 4")
+        precondition(preferences.recentRoutes.count == 5 && preferences.recentRoutes.first?.name == "Route 4")
+        precondition(TezPreviewPreferences(defaults: defaults).recentRoutes == preferences.recentRoutes)
+
+        let original: [String: BackendJSON] = ["verge_mixed_port": .integer(7897)]
+        let modeOnly = NativeNetworkPendingChanges.make(values: original, original: original, mode: "global", originalMode: "rule")
+        precondition(modeOnly.count == 1 && modeOnly.first?.id == "mode")
+        let pending = NativeNetworkPendingChanges.make(values: ["verge_mixed_port": .integer(7898)], original: original, mode: "global", originalMode: "rule")
+        precondition(pending.count == 2 && pending[0].previousValue == "规则" && pending[1].proposedValue == "7898")
+        precondition(NativeNetworkPendingChanges.make(values: original, original: original, mode: "rule", originalMode: "rule").isEmpty)
+        precondition(NativeNetworkPendingChanges.displayValue(.string("secret-script"), key: "pac_file_content") == "脚本（13 字符）")
+        precondition(NativeNetworkPendingChanges.displayValue(.string("localhost, private.test"), key: "system_proxy_bypass") == "2 个地址")
+        precondition(NativeNetworkPendingChanges.displayValue(.string("https://user:secret@example.test/check?token=secret#fragment"), key: "default_latency_test") == "https://example.test/check")
+        precondition(NativeNetworkPendingChanges.displayValue(.integer(5000), key: "default_latency_timeout") == "5000 毫秒")
+        precondition(NativeAccessSummary(snapshot: nil, connected: false).accessTitle == "流量接入未确认")
+
+        let subscriptionBaseline = NativeSubscriptionDraft()
+        var subscriptionDraft = subscriptionBaseline
+        precondition(subscriptionDraft == subscriptionBaseline && subscriptionDraft.interval == 1440 && subscriptionDraft.intervalError == nil)
+        let draftEdits: [(inout NativeSubscriptionDraft) -> Void] = [
+            { $0.name = "Changed" }, { $0.url = "https://example.test/changed" }, { $0.intervalText = "2880" },
+            { $0.autoUpdate = false }, { $0.withProxy = true }, { $0.kind = "local" }, { $0.localContent += "# Changed\n" }
+        ]
+        for edit in draftEdits {
+            subscriptionDraft = subscriptionBaseline
+            edit(&subscriptionDraft)
+            precondition(subscriptionDraft != subscriptionBaseline, "Every editable subscription field must mark the draft dirty")
+        }
+        for value in ["1440", "525600", " 2880 "] {
+            subscriptionDraft.intervalText = value
+            precondition(subscriptionDraft.intervalError == nil)
+        }
+        for value in ["", "abc", "1440.5", "1,440", "-1440", "1439", "525601", "999999999999999999999999"] {
+            subscriptionDraft.intervalText = value
+            precondition(subscriptionDraft.intervalError != nil, "Invalid text must not reuse the previous valid interval")
+        }
 
         let latency = NativeLatencyModel()
         var calls: [[String]] = []
@@ -116,6 +192,19 @@ struct NativeFeaturesCheck {
         }
         precondition(backend.state == .connected)
         let operation = NativeFeatureOperation()
+        let savedSubscription = await operation.request(backend, "native_patch_subscription", [
+            "uid": .string("fixture"), "name": .string("Changed subscription"), "url": .string("https://example.test/changed"),
+            "interval": .integer(2880), "auto_update": .bool(false), "with_proxy": .bool(true)
+        ])
+        precondition(savedSubscription != nil)
+        guard let savedDetails = await operation.request(backend, "native_subscription_details", ["uid": .string("fixture")]) else { fatalError("Missing subscription details") }
+        let subscriptionDetails = try savedDetails.decoded(NativeSubscriptionDetails.self)
+        precondition(subscriptionDetails.name == "Changed subscription" && subscriptionDetails.url == "https://example.test/changed")
+        precondition(subscriptionDetails.interval == 2880 && !subscriptionDetails.autoUpdate && subscriptionDetails.withProxy)
+        let failedSubscription = await operation.request(backend, "native_patch_subscription", ["uid": .string("fixture"), "name": .string("模拟保存失败")])
+        precondition(failedSubscription == nil && operation.error?.contains("SUBSCRIPTION_WRITE_FAILED") == true)
+        let unchangedDetails = await operation.request(backend, "native_subscription_details", ["uid": .string("fixture")])
+        precondition(unchangedDetails == savedDetails, "Failed saves must preserve the stored subscription")
         precondition(backend.supports("native_create_local_backup"))
         let created = await operation.request(backend, "native_create_local_backup")
         precondition(created == .object(["filename": .string("fixture.zip")]))
@@ -143,7 +232,7 @@ struct NativeFeaturesCheck {
         try await Task.sleep(for: .milliseconds(50))
         precondition(backend.state == .connected)
         backend.disconnect()
-        print("Native feature checks passed: backup protocol, mocked latency batching, preferences, serial requests, error preservation")
+        print("Native feature checks passed: subscription draft fields and interval validation, subscription fixture persistence, backup protocol, mocked latency batching, preferences, serial requests, error preservation")
     }
 
     @MainActor static func launchUI() {
@@ -157,7 +246,8 @@ struct NativeFeaturesCheck {
         let delegate = FeatureCheckDelegate(backend: backend, root: helper == nil ? nil : root)
         application.delegate = delegate
         let content = FeatureCheckUI(backend: backend, isolated: helper != nil)
-            .environment(preferences).frame(minWidth: 760, minHeight: 720)
+            .environment(preferences).tint(TezStyle.accent)
+            .frame(minWidth: 760, minHeight: 720)
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 800, height: 780), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = helper == nil ? "Tez 功能界面检查 · 模拟数据" : "Tez 功能界面检查 · 隔离内核"
         window.contentView = NSHostingView(rootView: content)
@@ -188,25 +278,29 @@ private final class FeatureCheckDelegate: NSObject, NSApplicationDelegate {
 
 private struct FeatureCheckUI: View {
     @Bindable var backend: NativeBackendStore
+    @Environment(TezPreviewPreferences.self) private var preferences
     let isolated: Bool
     @State private var fixtureURL = ""
     @State private var status = "等待隔离后台"
     @State private var addingSubscription = false
+    @State private var managingSubscription: NativeProfileItem?
     var body: some View {
         VStack {
             HStack { Text(status); Spacer(); if !fixtureURL.isEmpty { Text(fixtureURL).textSelection(.enabled).accessibilityIdentifier("fixture.url") } }.font(.caption).padding(8)
             TabView {
-                NativeNetworkSettingsView(store: backend).tabItem { Text("网络设置") }
-                NativeDNSSettingsView(store: backend).tabItem { Text("DNS") }
+                TezSettingsView(allowsBackendExamples: false, store: backend).tabItem { Text("设置") }
                 Button("添加配置", systemImage: "plus") { addingSubscription = true }
                     .tabItem { Text("添加订阅") }
                 if let profile = backend.snapshot?.profiles.items.first(where: { $0.type == "remote" }) {
-                    NativeSubscriptionSheet(store: backend, profile: profile).tabItem { Text("订阅管理") }
+                    Button("管理配置", systemImage: "slider.horizontal.3") { managingSubscription = profile }
+                        .tabItem { Text("订阅管理") }
                 }
                 NativeLogsView(store: backend).tabItem { Text("日志") }
                 NativeLocalBackupsView(store: backend).tabItem { Text("备份") }
             }
         }.sheet(isPresented: $addingSubscription) { NativeSubscriptionSheet(store: backend, profile: nil) }
+        .sheet(item: $managingSubscription) { NativeSubscriptionSheet(store: backend, profile: $0) }
+        .preferredColorScheme(preferences.appearance.colorScheme)
         .task {
             backend.connect()
             for _ in 0..<500 {

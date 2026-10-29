@@ -183,7 +183,7 @@ fn runtime_dir() -> PathBuf {
     Path::new(crate::control_ipc_path())
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/run/clash-verge-service"))
+        .unwrap_or_else(|| PathBuf::from("/run/tez-service"))
 }
 
 fn persistent_state_dir() -> std::io::Result<PathBuf> {
@@ -191,7 +191,7 @@ fn persistent_state_dir() -> std::io::Result<PathBuf> {
     {
         #[cfg(unix)]
         if let Some(root) = crate::isolated_test_root() { return Ok(root.join("state")); }
-        Ok(std::env::temp_dir().join("clash-verge-service-ipc-test-state"))
+        Ok(std::env::temp_dir().join("tez-service-ipc-test-state"))
     }
 
     // A root launchd daemon needs stable system state independent of unreliable HOME/XDG values
@@ -217,7 +217,7 @@ pub(crate) fn unix_mihomo_ipc_path(runtime_root: &Path, uid: u32) -> PathBuf {
     runtime_root
         .join("users")
         .join(uid.to_string())
-        .join("verge-mihomo.sock")
+        .join("mihomo.sock")
 }
 
 pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
@@ -230,7 +230,7 @@ pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
                 } else {
                     crate::CHANNEL_IDENTITY.id
                 };
-                format!(r"\\.\pipe\verge-mihomo-{}-{}", channel_id, owner_key(identity))
+                format!(r"\\.\pipe\mihomo-{}-{}", channel_id, owner_key(identity))
             }
 
             #[cfg(unix)]
@@ -251,7 +251,7 @@ pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
             } else {
                 crate::CHANNEL_IDENTITY.id
             };
-            format!(r"\\.\pipe\verge-mihomo-{}-{}", channel_id, owner_key(identity))
+            format!(r"\\.\pipe\mihomo-{}-{}", channel_id, owner_key(identity))
         }
     }
 }
@@ -268,11 +268,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_mihomo_ipc_path_is_owner_scoped_and_below_sun_path_limit() {
-        let path = unix_mihomo_ipc_path(Path::new("/var/run/clash-verge-service"), 501);
+        let path = unix_mihomo_ipc_path(Path::new("/var/run/tez-service"), 501);
 
         assert_eq!(
             path,
-            Path::new("/var/run/clash-verge-service/users/501/verge-mihomo.sock")
+            Path::new("/var/run/tez-service/users/501/mihomo.sock")
         );
         assert!(path.as_os_str().as_encoded_bytes().len() < 104);
     }
@@ -300,7 +300,7 @@ mod tests {
             sid: "S-1-5-21-1-2-3-1001".to_owned(),
         });
 
-        assert!(path.starts_with(r"\\.\pipe\verge-mihomo-test-"));
-        assert!(!path.contains("verge-mihomo-production"));
+        assert!(path.starts_with(r"\\.\pipe\mihomo-test-"));
+        assert!(!path.contains("mihomo-production"));
     }
 }

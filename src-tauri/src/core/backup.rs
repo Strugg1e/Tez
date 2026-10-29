@@ -351,6 +351,18 @@ pub async fn create_backup() -> Result<(String, PathBuf), Error> {
 
     zip.start_file(dirs::PROFILE_YAML, options)?;
     zip.write_all(fs::read(dirs::profiles_path()?).await?.as_slice())?;
+    append_proxy_chains(&mut zip, &dirs::app_home_dir()?)?;
     zip.finish()?;
     Ok((zip_file_name, scopeguard::ScopeGuard::into_inner(cleanup)))
+}
+
+pub(crate) fn append_proxy_chains(zip: &mut zip::ZipWriter<std::fs::File>, root: &std::path::Path) -> Result<(), Error> {
+    let content = match std::fs::read(root.join("tez-proxy-chains.json")) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"{\"chains\":[],\"active\":null}".to_vec(),
+        Err(error) => return Err(error.into()),
+    };
+    zip.start_file("tez-proxy-chains.json", SimpleFileOptions::default().unix_permissions(0o600))?;
+    zip.write_all(&content)?;
+    Ok(())
 }

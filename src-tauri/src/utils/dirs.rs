@@ -117,13 +117,13 @@ pub fn update_interval_migrated_path() -> Result<PathBuf> {
 #[cfg(target_os = "macos")]
 pub fn service_path() -> Result<PathBuf> {
     let res_dir = app_resources_dir()?;
-    Ok(res_dir.join("clash-verge-service"))
+    Ok(res_dir.join(if cfg!(feature = "native-host") { "tez-service" } else { "clash-verge-service" }))
 }
 
 #[cfg(windows)]
 pub fn service_path() -> Result<PathBuf> {
     let res_dir = app_resources_dir()?;
-    Ok(res_dir.join("clash-verge-service.exe"))
+    Ok(res_dir.join(if cfg!(feature = "native-host") { "tez-service.exe" } else { "clash-verge-service.exe" }))
 }
 
 pub fn sidecar_log_dir() -> Result<PathBuf> {
@@ -219,9 +219,13 @@ fn sidecar_ipc_path_for(
 
     let root = std::ffi::CStr::from_bytes_until_nul(&buffer)
         .map_err(|_| anyhow::anyhow!("macOS per-user temporary directory is not NUL-terminated"))?;
-    #[cfg(feature = "verge-dev")]
+    #[cfg(all(feature = "native-host", feature = "verge-dev"))]
+    let filename = "tez-mihomo-dev.sock";
+    #[cfg(all(feature = "native-host", not(feature = "verge-dev")))]
+    let filename = "tez-mihomo.sock";
+    #[cfg(all(not(feature = "native-host"), feature = "verge-dev"))]
     let filename = "verge-mihomo-dev.sock";
-    #[cfg(not(feature = "verge-dev"))]
+    #[cfg(all(not(feature = "native-host"), not(feature = "verge-dev")))]
     let filename = "verge-mihomo.sock";
     let path = PathBuf::from(OsStr::from_bytes(root.to_bytes())).join(filename);
 
@@ -285,9 +289,13 @@ mod ipc_tests {
 
         assert!(!path.starts_with(app_root));
         assert!(path.as_os_str().as_bytes().len() < 104);
-        #[cfg(feature = "verge-dev")]
+        #[cfg(all(feature = "native-host", feature = "verge-dev"))]
+        assert_eq!(path.file_name(), Some(OsStr::new("tez-mihomo-dev.sock")));
+        #[cfg(all(feature = "native-host", not(feature = "verge-dev")))]
+        assert_eq!(path.file_name(), Some(OsStr::new("tez-mihomo.sock")));
+        #[cfg(all(not(feature = "native-host"), feature = "verge-dev"))]
         assert_eq!(path.file_name(), Some(OsStr::new("verge-mihomo-dev.sock")));
-        #[cfg(not(feature = "verge-dev"))]
+        #[cfg(all(not(feature = "native-host"), not(feature = "verge-dev")))]
         assert_eq!(path.file_name(), Some(OsStr::new("verge-mihomo.sock")));
         assert_eq!(path, sidecar_ipc_path_for(Path::new("/different/root"), &identity)?);
         assert!(path.parent().is_some_and(Path::is_dir));

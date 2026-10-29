@@ -75,7 +75,7 @@ fn verify_archive(path: &Path) -> Result<()> {
         let parts: Vec<_> = path.components().collect();
         let allowed = match parts.as_slice() {
             [Component::Normal(root)] => {
-                ["config.yaml", "tez.yaml", "profiles.yaml", "dns_config.yaml"]
+                ["config.yaml", "tez.yaml", "profiles.yaml", "dns_config.yaml", "tez-proxy-chains.json"]
                     .iter()
                     .any(|v| root == v)
                     || (*root == "profiles" && entry.is_dir())
@@ -114,6 +114,10 @@ fn verify_archive(path: &Path) -> Result<()> {
     }
     if names.contains("dns_config.yaml") {
         let _: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&read_metadata(&mut archive, "dns_config.yaml")?)?;
+    }
+    if names.contains("tez-proxy-chains.json") {
+        crate::native_chain::Store::decode(read_metadata(&mut archive, "tez-proxy-chains.json")?.as_bytes())
+            .map_err(|error| anyhow::anyhow!(error.detail))?;
     }
     Ok(())
 }
@@ -284,6 +288,53 @@ pub(crate) async fn webdav_restore(filename: String) -> CmdResult<Value> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn proxy_chain_archive_restores_saved_definitions() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("tez-chain-backup-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir(&root)?;
+        let archive_path = root.join("backup.zip");
+        let chain = json!({"chains":[{"id":"daily","name":"Daily","group":"Select","nodes":["A","B"]}],"active":null});
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive_path)?);
+        for (name, content) in [("config.yaml", "{}"), ("tez.yaml", "{}"), ("profiles.yaml", "items: []") ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())?;
+            zip.write_all(content.as_bytes())?;
+        }
+        zip.start_file("tez-proxy-chains.json", zip::write::SimpleFileOptions::default())?;
+        zip.write_all(serde_json::to_string(&chain)?.as_bytes())?;
+        zip.finish()?;
+        let result = verify_archive(&archive_path);
+        if result.is_ok() {
+            let restored = root.join("restored");
+            zip::ZipArchive::new(std::fs::File::open(&archive_path)?)?.extract(&restored)?;
+            let store = crate::native_chain::Store::load(&restored).map_err(|e| anyhow::anyhow!(e.detail))?;
+            assert_eq!(store.chains.len(), 1);
+            assert_eq!(store.chains[0].nodes, ["A", "B"]);
+        }
+        std::fs::remove_dir_all(root)?;
+        result
+    }
+
+    #[test]
+    fn backup_writer_includes_saved_and_empty_chain_state() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("tez-chain-writer-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir(&root)?;
+        for saved in [false, true] {
+            if saved {
+                std::fs::write(root.join("tez-proxy-chains.json"), br#"{"chains":[{"id":"daily","name":"Daily","group":"Select","nodes":["A","B"]}],"active":null}"#)?;
+            }
+            let path = root.join("writer.zip");
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&path)?);
+            crate::core::backup::append_proxy_chains(&mut writer, &root)?;
+            writer.finish()?;
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+            let content = read_metadata(&mut archive, "tez-proxy-chains.json")?;
+            let store = crate::native_chain::Store::decode(content.as_bytes()).map_err(|e| anyhow::anyhow!(e.detail))?;
+            assert_eq!(store.chains.len(), usize::from(saved));
+        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn remote_filenames_and_user_paths_are_bounded() {

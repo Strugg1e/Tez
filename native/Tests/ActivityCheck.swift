@@ -123,6 +123,10 @@ struct ActivityCheck {
             do { _ = try NativeActivity.decode(.object(malformed)); preconditionFailure("Oversized text accepted") } catch {}
         }
 
+        try await checkTabContext()
+        try await checkRetainedSession()
+        checkPausedLogs()
+
         let model = NativeActivityModel()
         await model.refresh { fixture() }
         precondition(model.snapshot == projected && model.updatedAt != nil && !model.isLoading)
@@ -197,7 +201,148 @@ struct ActivityCheck {
         serialProbe.continuation?.resume(returning: fixture("outdated-page"))
         await serial.value
         precondition(secondCalls == 1 && model.snapshot?.connections.items[0].host == "second-page" && !model.isLoading)
-        print("Activity checks passed: typed projection, paging, stale-query rejection, measured transfer rates and resets, exact single-connection close, error preservation and cancellation")
+        print("Activity checks passed: typed projection, paging, retained inspection sessions, frozen log filters, honest diagnostic links, stale-query rejection, measured transfer rates and resets, exact single-connection close, error preservation and cancellation")
+    }
+
+    @MainActor private static func checkRetainedSession() async throws {
+        let session = NativeActivitySession()
+        session.context.search("Browser", in: .connections)
+        session.context.move(to: 128, in: .connections)
+        session.context.connectionID = "a"
+        session.context.search("geo", in: .providers)
+        session.context.move(to: 64, in: .providers)
+        session.context.providerID = "geosite"
+        let query = session.context.request(for: .connections)
+        guard case .object(var root) = fixture(), case .object(var connections) = root["connections"] else { fatalError() }
+        connections["total"] = .unsigned(129)
+        connections["matched"] = .unsigned(129)
+        connections["offset"] = .unsigned(128)
+        root["connections"] = .object(connections)
+        let model = session.model(for: .connections)
+        await model.refresh(query: query) { .object(root) }
+        let snapshot = model.snapshot
+        let updatedAt = model.updatedAt
+        let row = try NativeActivity.decode(fixture()).connections.items[0]
+        session.paused = true
+        session.logs.paused = true
+        session.logs.followsTail = false
+        session.showLogs(for: row)
+        precondition(session.showsLogs && session.logs.query == "example.test" && session.logs.level == "all")
+        precondition(session.logs.relatedTarget == "example.test" && session.logs.paused && !session.logs.followsTail)
+        session.showsLogs = false
+        precondition(session.tab == .connections && session.paused && session.context.connectionID == "a")
+        precondition(session.context.request(for: .connections) == query)
+        precondition(session.model(for: .connections) === model && model.snapshot == snapshot && model.updatedAt == updatedAt)
+        session.showRules(for: row)
+        let rulesQuery = session.context.request(for: .rules)
+        precondition(session.tab == .rules && rulesQuery.query == "MATCH" && rulesQuery.offset == 0)
+        await session.model(for: .rules).refresh(query: rulesQuery) { queryFixture("newer-data", query: rulesQuery) }
+        session.context.move(to: 256, in: .rules)
+        session.context.ruleID = 700
+        session.tab = .connections
+        session.showRules(for: row)
+        precondition(session.context.request(for: .rules) == rulesQuery && session.context.ruleID == nil,
+                     "A same-type rule search must reset the old page and unrelated rule selection")
+        session.context.ruleID = 0
+        session.tab = .connections
+        session.showRules(for: row)
+        precondition(session.context.ruleID == nil,
+                     "A same-type rule search must clear selection even on the first page")
+        session.tab = .connections
+        precondition(model.snapshot == snapshot && model.updatedAt == updatedAt && session.context.connectionID == "a",
+                     "Rule lookup must not overwrite a paused connection snapshot")
+        precondition(session.context.request(for: .connections) == query && session.paused)
+        precondition(session.context.request(for: .providers).offset == 64 && session.context.providerID == "geosite")
+        let unknown = NativeActivityConnection(id: "unknown", host: nil, destination: ":443", network: nil,
+            type: nil, process: nil, rule: nil, chains: [], upload: 0, download: 0, start: nil)
+        precondition(unknown.logQuery == nil && unknown.ruleQuery == nil, "Unknown metadata must not become a fabricated lookup")
+    }
+
+    @MainActor private static func checkPausedLogs() {
+        let session = NativeLogSession()
+        let payload = NativeLogPayload(lines: [
+            "time=now level=info msg=warn.example.test connected",
+            "time=now level=warning msg=example.test slow",
+            "[ERROR] example.test failed",
+            "debug another.test connected",
+            "[ERROR] example.test failed"
+        ], gap: true, truncated: true, streaming: true)
+        session.accept(payload, generation: session.generation)
+        let oldGeneration = session.generation
+        let acquiredAt = session.snapshot?.acquiredAt
+        session.paused = true
+        session.query = "EXAMPLE.TEST"
+        session.level = "warn"
+        precondition(session.lines == [payload.lines[1]], "Paused level filtering must inspect the header, not words in the message")
+        session.level = "error"
+        precondition(session.lines == [payload.lines[2], payload.lines[4]], "Frozen filtering must preserve repeated evidence")
+        session.query = "missing"
+        precondition(session.lines.isEmpty, "Paused query changes must remove mismatched rows")
+        session.query = ""
+        session.level = "all"
+        precondition(session.lines == payload.lines && session.snapshot?.acquiredAt == acquiredAt)
+        session.accept(NativeLogPayload(lines: ["info late response"]), generation: oldGeneration)
+        precondition(session.lines == payload.lines && session.paused, "Pausing must reject an in-flight read")
+        session.stop()
+        precondition(session.lines == payload.lines && session.snapshot?.gap == true && session.snapshot?.truncated == true,
+                     "Leaving the log tab must retain the frozen window and its limits")
+        session.accept(NativeLogPayload(lines: ["info manual refresh"]), generation: session.generation)
+        precondition(session.lines == ["info manual refresh"] && session.paused, "Manual refresh can replace the window without resuming")
+        precondition(NativeLogEntry("time=now level=info msg=level=error").level == "info")
+        precondition(NativeLogEntry("fatal connection closed").level == "error")
+        precondition(NativeLogSession.limit == 1000)
+    }
+
+    @MainActor private static func checkTabContext() async throws {
+        var context = NativeActivityContext()
+        context.search("Terminal", in: .connections)
+        context.move(to: 128, in: .connections)
+        context.connectionID = "a"
+        let connectionQuery = context.request(for: .connections)
+        context.search("MATCH", in: .rules)
+        context.move(to: 256, in: .rules)
+        context.ruleID = 700
+        let ruleQuery = context.request(for: .rules)
+        context.search("geo", in: .providers)
+        context.move(to: 64, in: .providers)
+        context.providerID = "geosite"
+        let providerQuery = context.request(for: .providers)
+
+        guard case .object(var root) = fixture("Terminal"),
+              case .object(var connections) = root["connections"] else { fatalError() }
+        connections["total"] = .unsigned(129)
+        connections["matched"] = .unsigned(129)
+        connections["offset"] = .unsigned(128)
+        root["connections"] = .object(connections)
+        let connectionPage = BackendJSON.object(root)
+        let model = NativeActivityModel()
+        await model.refresh(query: connectionQuery) { connectionPage }
+        model.select(ruleQuery)
+        var closeCalls = 0
+        let closedStale = await model.close(id: "a") { closeCalls += 1; return .null }
+        precondition(!closedStale && closeCalls == 0, "Switching tabs must not close a connection from the previous page")
+        await model.refresh(query: ruleQuery) { queryFixture("unfiltered-connection", query: ruleQuery) }
+        context.reconcileSelection(in: try NativeActivity.decode(pageFixture(offset: 256, matched: 700, nextOffset: nil)), for: .rules)
+        precondition(context.connectionID == "a" && context.ruleID == 700 && context.providerID == "geosite")
+        model.select(connectionQuery)
+        precondition(model.snapshotQuery != connectionQuery)
+        await model.refresh(query: connectionQuery) { connectionPage }
+        context.reconcileSelection(in: model.snapshot!, for: .connections)
+        precondition(context.request(for: .connections) == connectionQuery && context.connectionID == "a",
+                     "Returning from Rules must restore Terminal search, page and selected connection")
+        precondition(context.request(for: .rules) == ruleQuery && context.ruleID == 700)
+        precondition(context.request(for: .providers) == providerQuery && context.providerID == "geosite")
+
+        context.search("DIRECT", in: .rules)
+        precondition(context.request(for: .rules).offset == 0 && context.ruleID == nil)
+        precondition(context.request(for: .connections) == connectionQuery && context.connectionID == "a")
+        precondition(context.request(for: .providers) == providerQuery && context.providerID == "geosite")
+        context.ruleID = 0
+        context.move(to: 0, in: .connections)
+        precondition(context.request(for: .connections).query == "Terminal" && context.connectionID == nil)
+        precondition(context.ruleID == 0 && context.providerID == "geosite")
+        context.clearSelection(in: .providers)
+        precondition(context.providerID == nil && context.ruleID == 0)
     }
 
     private static func projectedConnection() -> BackendJSON {

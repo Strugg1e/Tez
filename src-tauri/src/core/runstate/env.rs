@@ -25,6 +25,15 @@ pub trait RunStateEnv: Send + Sync + 'static {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealEnv;
 
+fn core_requirement(configured: &str) -> clash_verge_service_ipc::CoreRequirement {
+    #[cfg(feature = "native-host")]
+    let configured = crate::core::service::native_core_name(configured);
+    clash_verge_service_ipc::CoreRequirement {
+        name: format!("{configured}{}", std::env::consts::EXE_SUFFIX),
+        sha256: None,
+    }
+}
+
 impl RunStateEnv for RealEnv {
     async fn probe_service_version(&self) -> Result<ServiceVersionReply> {
         // The IPC client would otherwise back off for about two minutes before failing.
@@ -43,15 +52,9 @@ impl RunStateEnv for RealEnv {
                     clash_verge_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
                 )
             }) {
-            let name = format!(
-                "{}{}",
-                crate::config::Config::verge().await.latest_arc().get_valid_clash_core(),
-                std::env::consts::EXE_SUFFIX
-            );
-            let status = clash_verge_service_ipc::inspect_installation(&[clash_verge_service_ipc::CoreRequirement {
-                name: name.clone(),
-                sha256: None,
-            }])
+            let requirement = core_requirement(&crate::config::Config::verge().await.latest_arc().get_valid_clash_core());
+            let name = requirement.name.clone();
+            let status = clash_verge_service_ipc::inspect_installation(&[requirement])
             .await?;
             status
                 .cores
@@ -114,6 +117,26 @@ impl RunStateEnv for RealEnv {
 
 #[cfg(test)]
 pub use fake::FakeEnv;
+
+#[cfg(all(test, feature = "native-host"))]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn native_service_probe_maps_legacy_configuration_names() {
+        for (configured, packaged) in [("verge-mihomo", "mihomo"), ("verge-mihomo-alpha", "mihomo-alpha"), ("mihomo", "mihomo")] {
+            assert_eq!(core_requirement(configured).name, format!("{packaged}{}", std::env::consts::EXE_SUFFIX));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Explicit read-only inspection of the installed Tez service; never starts a core"]
+    async fn installed_native_core_probe_read_only() {
+        let reply = RealEnv.probe_service_version().await.unwrap();
+        assert_eq!(reply.code, 0);
+        assert!(matches!(reply.core, Some(clash_verge_service_ipc::CoreAvailability::Ready)), "{reply:?}");
+    }
+}
 
 #[cfg(test)]
 mod fake {

@@ -29,6 +29,118 @@ struct TezMotion {
     var symbol: ContentTransition { reduced ? .identity : .symbolEffect(.replace) }
 }
 
+struct TezSettingsPage<Content: View>: View {
+    let title: String
+    let summary: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title).font(.system(size: 18, weight: .semibold))
+                    Text(summary).font(.system(size: 12)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(TezStyle.pageInset)
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+}
+
+struct TezSettingsSection<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(title).font(.system(size: 13, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct TezSettingRow<Control: View>: View {
+    let title: String
+    var detail: String? = nil
+    @ViewBuilder let control: Control
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 24) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.system(size: 13))
+                if let detail {
+                    Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            control
+        }
+        .frame(minHeight: 34)
+    }
+}
+
+struct TezSettingToggle: View {
+    let title: String
+    let detail: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        TezSettingRow(title: title, detail: detail) {
+            Toggle(title, isOn: $isOn).labelsHidden().toggleStyle(.switch)
+                .accessibilityLabel(title)
+        }
+    }
+}
+
+struct TezSettingsDisclosure<Content: View>: View {
+    let title: String
+    let summary: String
+    @Binding var isExpanded: Bool
+    var motion = TezMotion(reduced: true)
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 22) { content }.padding(.top, 18)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(summary).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .animation(motion.layout, value: isExpanded)
+    }
+}
+
+struct TezMultilineField: View {
+    let title: String
+    @Binding var text: String
+    var height: CGFloat = 88
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextEditor(text: $text)
+            .font(.system(size: 12, design: .monospaced))
+            .scrollContentBackground(.hidden)
+            .focused($focused)
+            .padding(8).frame(height: height)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(focused ? TezStyle.accent : Color(nsColor: .separatorColor), lineWidth: focused ? 2 : 1)
+            }
+            .accessibilityLabel(title)
+    }
+}
+
 struct TezSearchField: View {
     let prompt: String
     @Binding var text: String

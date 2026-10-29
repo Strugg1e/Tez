@@ -22,6 +22,7 @@ use {
 #[cfg(not(windows))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if clash_verge_service_ipc::print_identity_if_requested() { return Ok(()); }
     set_secure_process_umask();
     init_service_logging();
     let result = run_standalone().await;
@@ -42,6 +43,7 @@ fn set_secure_process_umask() {
 /// Runs as a Windows service when possible, otherwise standalone.
 #[cfg(windows)]
 fn main() -> Result<()> {
+    if clash_verge_service_ipc::print_identity_if_requested() { return Ok(()); }
     init_service_logging();
     if service_dispatcher::start(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, ffi_service_main).is_err() {
         info!("Not running as a service, starting in standalone mode.");
@@ -160,7 +162,7 @@ fn run_service() -> platform_lib::Result<()> {
 
 async fn run_standalone() -> Result<()> {
     let pid = std::process::id();
-    info!("Clash Verge Service - Standalone Mode");
+    info!("Tez Service - Standalone Mode");
     info!("Current process PID: {}", pid);
 
     let Some(_owner_guard) = acquire_service_owner().await? else {

@@ -3,7 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 
-const names = ['clash-verge-service', 'clash-verge-service-install', 'clash-verge-service-uninstall']
+const names = ['tez-service', 'tez-service-install', 'tez-service-uninstall']
 const manifestName = 'native-service-manifest.json'
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 const [mode, source, destination] = process.argv.slice(2)
@@ -23,6 +23,8 @@ function verify(directory, manifestDirectory = directory) {
   for (const name of names) {
     const file = path.join(directory, name)
     executable(file)
+    const identity = JSON.parse(execFileSync(file, ['--identity'], { encoding: 'utf8' }))
+    if (identity.testFeature || identity.channel !== manifest.channel || identity.serviceID !== manifest.serviceID || identity.serviceName !== manifest.serviceName) throw new Error(`Service identity mismatch: ${name}`)
     if (hash(file) !== manifest.files[name]) throw new Error(`Service checksum mismatch: ${name}`)
   }
   return manifest
@@ -43,7 +45,9 @@ if (mode === '--prepare') {
     executable(file)
     files[name] = hash(file)
   }
-  fs.writeFileSync(path.join(destination, manifestName), JSON.stringify({ version: 1, channel, protocol: '2.6', files }, null, 2) + '\n')
+  const identity = JSON.parse(execFileSync(path.join(destination, names[0]), ['--identity'], { encoding: 'utf8' }))
+  if (identity.testFeature || identity.channel !== channel || !identity.serviceName.startsWith('tez-') || !identity.serviceID.startsWith('app.tez.')) throw new Error('Refusing non-Tez or test-feature service tools')
+  fs.writeFileSync(path.join(destination, manifestName), JSON.stringify({ version: 1, channel, protocol: '2.6', serviceID: identity.serviceID, serviceName: identity.serviceName, files }, null, 2) + '\n')
 } else if (mode === '--source-check') {
   verify(process.env.TEZ_NATIVE_SERVICE_DIR ?? '')
 } else if (mode === '--copy') {
@@ -58,7 +62,7 @@ if (mode === '--prepare') {
   const helper = path.join(source, 'Contents/Helpers/tez-native-host')
   const build = JSON.parse(execFileSync(helper, ['--build-info'], { encoding: 'utf8' }))
   const plist = execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', path.join(source, 'Contents/Info.plist')], { encoding: 'utf8' }).trim()
-  if (build.channel !== manifest.channel || (manifest.channel === 'acceptance' && (!build.lifecycleAcceptance || plist !== 'app.tez.acceptance'))) {
+  if (build.testFeature || build.channel !== manifest.channel || build.serviceID !== manifest.serviceID || build.serviceName !== manifest.serviceName || (manifest.channel === 'acceptance' && (!build.lifecycleAcceptance || plist !== 'app.tez.acceptance'))) {
     throw new Error('Native helper, application identity and service channel differ')
   }
   console.log(`PASS: 3 signed native service tools, protocol ${manifest.protocol}, channel ${manifest.channel}`)

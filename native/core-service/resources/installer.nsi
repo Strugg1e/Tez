@@ -1,6 +1,6 @@
-OutFile "ClashVergeServiceInstaller.exe"
+OutFile "TezServiceInstaller.exe"
 
-InstallDir "$PROGRAMFILES\ClashVergeService"
+InstallDir "$PROGRAMFILES\TezService"
 
 Page directory
 Page instfiles
@@ -12,7 +12,7 @@ Section "Install"
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-    ExecShell "" "$INSTDIR\clash-verge-service-install.exe"
+    ExecShell "" "$INSTDIR\tez-service-install.exe"
 SectionEnd
 
 Section "Uninstall"

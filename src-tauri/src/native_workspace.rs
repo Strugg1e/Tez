@@ -124,6 +124,7 @@ const SETTINGS: &[&str] = &[
     "default_latency_test",
     "default_latency_timeout",
     "app_log_level",
+    "proxy_host", "enable_bypass_check", "use_default_bypass", "pac_file_content", "auto_close_connection",
 ];
 
 fn invalid(message: impl std::fmt::Display) -> CommandFailure {
@@ -188,6 +189,9 @@ pub(crate) fn parse(command: &str, params: Value) -> CmdResult<Request> {
                         .is_some_and(|v| ["silent", "error", "warn", "info", "debug", "trace"].contains(&v))
                 {
                     return Err(invalid("Invalid log level"));
+                }
+                if matches!(key.as_str(), "proxy_host" | "pac_file_content") && !value.as_str().is_some_and(|v| v.len() <= if key == "proxy_host" { 255 } else { 65536 }) {
+                    return Err(invalid("Proxy text field exceeds its limit"));
                 }
             }
         }
@@ -336,9 +340,10 @@ pub async fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
         Request::GetSettings => {
             let config = Config::verge().await.latest_arc();
             let raw = serde_json::to_value(&*config).map_err(invalid)?;
+            let defaults = serde_json::to_value(IVerge::template()).map_err(invalid)?;
             let values: serde_json::Map<_, _> = SETTINGS
                 .iter()
-                .map(|key| ((*key).into(), raw.get(*key).cloned().unwrap_or(Value::Null)))
+                .map(|key| ((*key).into(), raw.get(*key).filter(|value|!value.is_null()).or_else(||defaults.get(*key)).cloned().unwrap_or(Value::Null)))
                 .collect();
             Ok(json!({"values": values, "mode": cmd::get_clash_mode().await?}))
         }
@@ -560,25 +565,7 @@ pub async fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
                     ));
                 }
                 let mut state = LOG_STREAM.lock().await;
-                if state.0 != Some(generation) {
-                    state.1.reset();
-                    state.0 = Some(generation);
-                }
-                let connected =
-                    state.1.connect(&socket).await.map_err(|_| {
-                        CommandFailure::coded("LOG_STREAM_UNAVAILABLE", "Cannot subscribe to Core logs")
-                    })?;
-                if connected {
-                    let history = match manager.get_clash_logs().await {
-                        Ok(history) => history,
-                        Err(_) => {
-                            state.1.reset();
-                            state.0 = None;
-                            return Err(CommandFailure::coded("LOG_READ_FAILED", "Cannot read Core log history"));
-                        }
-                    };
-                    state.1.seed(history);
-                }
+                refresh_log_stream(&mut state, generation, &socket, || manager.get_clash_logs()).await?;
                 if manager.current_core_readiness_generation() != Some(generation) {
                     state.1.reset();
                     state.0 = None;
@@ -596,6 +583,38 @@ pub async fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn refresh_log_stream<F, Fut>(
+    state: &mut (Option<u64>, crate::native_logs::NativeLogStream),
+    generation: u64,
+    socket: &std::path::Path,
+    read_history: F,
+) -> CmdResult<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<String>>>,
+{
+    if state.0 != Some(generation) {
+        state.1.reset();
+        state.0 = Some(generation);
+    }
+    let connected = state.1.connect(socket).await.map_err(|_| {
+        CommandFailure::coded("LOG_STREAM_UNAVAILABLE", "Cannot subscribe to Core logs")
+    })?;
+    if connected {
+        let history = match read_history().await {
+            Ok(history) => history,
+            Err(_) => {
+                state.1.reset();
+                state.0 = None;
+                return Err(CommandFailure::coded("LOG_READ_FAILED", "Cannot read Core log history"));
+            }
+        };
+        state.1.seed(history);
+    }
+    Ok(())
 }
 
 pub(crate) fn filter_logs(lines: Vec<String>, limit: usize, level: &str, query: &str) -> Vec<String> {
@@ -697,6 +716,81 @@ fn validate_latency_names<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_logs_reconnect_reseeds_history_and_retains_new_stream_lines() -> anyhow::Result<()> {
+        use futures::{SinkExt as _, StreamExt as _};
+        use std::time::Duration;
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let path = std::env::temp_dir().join(format!("tez-log-history-{}.sock", nanoid::nanoid!()));
+        let listener = UnixListener::bind(&path)?;
+        let (history_ready, wait_for_stream) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await?;
+            let mut first = tokio_tungstenite::accept_async(first).await?;
+            for index in 0..1001 {
+                first.send(Message::Text(
+                    json!({"type":"info","payload":format!("old-stream-{index}")}).to_string().into(),
+                )).await?;
+            }
+            first.close(None).await?;
+            let (second, _) = listener.accept().await?;
+            let mut second = tokio_tungstenite::accept_async(second).await?;
+            second.send(Message::Text(
+                json!({"type":"info","payload":"during-history-read"}).to_string().into(),
+            )).await?;
+            second.send(Message::Ping(vec![1].into())).await?;
+            // A pong proves the client consumed the preceding text before history returns.
+            while let Some(message) = second.next().await {
+                if matches!(message?, Message::Pong(_)) {
+                    let _ = history_ready.send(());
+                    break;
+                }
+            }
+            let _ = wait.await;
+            anyhow::Ok(())
+        });
+        let mut state = (None, crate::native_logs::NativeLogStream::new());
+        refresh_log_stream(&mut state, 7, &path, || async { Ok(vec!["[info] old-history".into()]) })
+            .await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        for _ in 0..200 {
+            if state.1.read(1000, "all", "")["streaming"] == false {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let old = state.1.read(1000, "all", "");
+        assert_eq!(old["streaming"], false);
+        assert_eq!(old["lines"].as_array().unwrap().len(), 1000);
+        assert!(old["lines"][999].as_str().unwrap().ends_with("[info] old-stream-1000"));
+        assert_eq!(old["truncated"], true);
+
+        refresh_log_stream(&mut state, 7, &path, || async {
+            tokio::time::timeout(Duration::from_secs(3), wait_for_stream).await??;
+            Ok(vec!["[info] newly-read-history".into()])
+        }).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        refresh_log_stream(&mut state, 7, &path, || async {
+            anyhow::bail!("an active stream must not refetch history")
+        }).await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let result = state.1.read(1000, "all", "");
+        let lines = result["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "[info] newly-read-history");
+        assert!(lines[1].as_str().unwrap().ends_with("[info] during-history-read"));
+        assert_eq!(result["gap"], true);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["streaming"], true);
+        state.1.reset();
+        let _ = release.send(());
+        server.await??;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     #[test]
     fn local_backup_commands_reject_traversal_and_are_classified() {
         for filename in ["../config.zip", "/tmp/a.zip", "a/b.zip", "a\\b.zip", "a.txt", "", ".zip\n"] {

@@ -38,7 +38,7 @@ pub(crate) async fn replace(source: &Path, destination: &Path) -> std::io::Resul
 mod tests {
     #[tokio::test]
     async fn replace_overwrites_an_existing_destination() -> anyhow::Result<()> {
-        let root = std::env::temp_dir().join(format!("clash-verge-service-atomic-replace-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tez-service-atomic-replace-{}", std::process::id()));
         let source = root.join("state.json.tmp");
         let destination = root.join("state.json");
         std::fs::create_dir_all(&root)?;

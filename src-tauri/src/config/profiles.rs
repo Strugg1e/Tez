@@ -279,41 +279,24 @@ impl IProfiles {
         Ok(())
     }
 
-    /// Updates fields returned by a remote profile refresh.
-    async fn update_item(&mut self, uid: &str, item: &mut PrfItem) -> Result<()> {
-        if self.items.is_none() {
-            self.items = Some(vec![]);
-        }
-
-        let _ = self.get_item(uid)?;
-
-        if let Some(items) = self.items.as_mut() {
-            for each in items.iter_mut() {
-                if each.uid.as_deref() == Some(uid) {
-                    each.extra = item.extra;
-                    each.updated = item.updated;
-                    each.home = item.home.to_owned();
-                    each.option = PrfOption::merge(each.option.as_ref(), item.option.as_ref());
-                    if let Some(file_data) = item.file_data.take() {
-                        let file = each.file.take();
-                        let file =
-                            file.unwrap_or_else(|| item.file.take().unwrap_or_else(|| format!("{}.yaml", uid).into()));
-
-                        each.file = Some(file.clone());
-
-                        let path = dirs::app_profiles_dir()?.join(file.as_str());
-
-                        fs::write(&path, file_data.as_bytes())
-                            .await
-                            .with_context(|| format!("failed to write to file \"{file}\""))?;
-                    }
-
-                    break;
-                }
-            }
-        }
-
-        self.save_file().await
+    fn update_item_metadata(&mut self, uid: &str, item: &PrfItem) -> Result<String> {
+        let each = self
+            .items
+            .as_mut()
+            .and_then(|items| items.iter_mut().find(|entry| entry.uid.as_deref() == Some(uid)))
+            .ok_or_else(|| anyhow::anyhow!("failed to find the profile item \"uid:{uid}\""))?;
+        let file = each
+            .file
+            .clone()
+            .or_else(|| item.file.clone())
+            .unwrap_or_else(|| format!("{uid}.yaml").into());
+        Self::validate_profile_file(&file)?;
+        each.extra = item.extra;
+        each.updated = item.updated;
+        each.home = item.home.clone();
+        each.option = PrfOption::merge(each.option.as_ref(), item.option.as_ref());
+        each.file = Some(file.clone());
+        Ok(file)
     }
 
     /// Raise intervals below `min_minutes`. `None`/`0` mean "never auto-update", left alone.
@@ -466,15 +449,264 @@ pub(crate) async fn profiles_save_file_safe() -> Result<()> {
         .await
 }
 
-pub(crate) async fn profiles_update_item_safe(index: &str, item: &mut PrfItem) -> Result<()> {
+pub(crate) async fn profiles_update_item_safe<Validate, Validation>(
+    index: &str,
+    item: &mut PrfItem,
+    validate: Validate,
+) -> Result<()>
+where
+    Validate: FnOnce(IProfiles) -> Validation + Send,
+    Validation: std::future::Future<Output = Result<()>> + Send,
+{
     let _profile_write = PROFILE_WRITE_LOCK.lock().await;
+    let root = dirs::app_profiles_dir()?;
     Config::profiles()
         .await
-        .with_data_modify(|mut profiles| async move {
-            profiles.update_item(index, item).await?;
+        .with_data_modify(|profiles| async move {
+            let profiles = update_downloaded_profile(&profiles, &root, index, item, validate, |candidate| async move {
+                candidate.save_file().await
+            })
+            .await?;
             Ok((profiles, ()))
         })
         .await
+}
+
+async fn update_downloaded_profile<Validate, Validation, Save, Saved>(
+    original: &IProfiles,
+    root: &Path,
+    index: &str,
+    item: &PrfItem,
+    validate: Validate,
+    mut save: Save,
+) -> Result<IProfiles>
+where
+    Validate: FnOnce(IProfiles) -> Validation + Send,
+    Validation: std::future::Future<Output = Result<()>> + Send,
+    Save: FnMut(IProfiles) -> Saved + Send,
+    Saved: std::future::Future<Output = Result<()>> + Send,
+{
+    let mut candidate = original.clone();
+    let file = candidate.update_item_metadata(index, item)?;
+    let content = item
+        .file_data
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Downloaded profile has no content"))?;
+    let staged_name = format!(".subscription-{}.yaml", nanoid::nanoid!());
+    let staged_path = root.join(&staged_name);
+    let cleanup = scopeguard::guard(staged_path, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut staged = options.open(&*cleanup).await?;
+    use tokio::io::AsyncWriteExt as _;
+    staged.write_all(content.as_bytes()).await?;
+    staged.flush().await?;
+    drop(staged);
+
+    let mut inspection = candidate.clone();
+    inspection.current = Some(index.into());
+    inspection
+        .items
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry.uid.as_deref() == Some(index))
+        .unwrap()
+        .file = Some(staged_name.into());
+
+    // Validate enhanced bytes from the staged source before either saved file changes.
+    validate(inspection).await?;
+    save(candidate.clone()).await?;
+    if let Err(error) = fs::rename(&*cleanup, root.join(file.as_str())).await {
+        save(original.clone())
+            .await
+            .context("Could not restore profile metadata after source replacement failed")?;
+        return Err(error.into());
+    }
+    Ok(candidate)
+}
+
+#[cfg(test)]
+mod subscription_update_tests {
+    use super::*;
+
+    fn fixture() -> Result<(std::path::PathBuf, IProfiles, PrfItem)> {
+        let root = std::env::temp_dir().join(format!("tez-subscription-update-{}", nanoid::nanoid!()));
+        std::fs::create_dir(&root)?;
+        let original = IProfiles {
+            current: Some("other".into()),
+            items: Some(vec![PrfItem {
+                uid: Some("fixture".into()),
+                itype: Some("remote".into()),
+                file: Some("fixture.yaml".into()),
+                name: Some("User subscription name".into()),
+                updated: Some(1),
+                ..Default::default()
+            }]),
+        };
+        std::fs::write(root.join("fixture.yaml"), "proxies: []\nrules: ['MATCH,DIRECT']\n")?;
+        std::fs::write(root.join("profiles.yaml"), serde_yaml_ng::to_string(&original)?)?;
+        let downloaded = PrfItem {
+            uid: Some("new-download-identity".into()),
+            file: Some("download.yaml".into()),
+            updated: Some(2),
+            file_data: Some("proxies: [{name: Broken, type: unsupported-fixture}]\n".into()),
+            ..Default::default()
+        };
+        Ok((root, original, downloaded))
+    }
+
+    #[tokio::test]
+    async fn native_subscription_update_rejection_keeps_source_and_metadata() -> Result<()> {
+        for rejection in ["invalid proxy type", "validation busy", "validator exited"] {
+            let (root, original, downloaded) = fixture()?;
+            let cleanup = scopeguard::guard(root, |path| {
+                let _ = std::fs::remove_dir_all(path);
+            });
+            let old_source = fs::read(cleanup.join("fixture.yaml")).await?;
+            let old_metadata = fs::read(cleanup.join("profiles.yaml")).await?;
+            let result = update_downloaded_profile(
+                &original,
+                &cleanup,
+                "fixture",
+                &downloaded,
+                |_| async move { bail!(rejection) },
+                |candidate| {
+                    let path = cleanup.join("profiles.yaml");
+                    async move {
+                        fs::write(path, serde_yaml_ng::to_string(&candidate)?).await?;
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read(cleanup.join("fixture.yaml")).await?,
+                old_source,
+                "Rejected download overwrote the working source"
+            );
+            assert_eq!(fs::read(cleanup.join("profiles.yaml")).await?, old_metadata);
+            assert_eq!(std::fs::read_dir(&*cleanup)?.count(), 2);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_subscription_update_validates_staged_profile_before_committing() -> Result<()> {
+        let (root, original, mut downloaded) = fixture()?;
+        downloaded.file_data = Some("proxies: []\nrules: ['MATCH,REJECT']\n".into());
+        let cleanup = scopeguard::guard(root, |path| {
+            let _ = std::fs::remove_dir_all(path);
+        });
+        let checked_root = cleanup.to_path_buf();
+        let old_source = fs::read(cleanup.join("fixture.yaml")).await?;
+        let expected = downloaded.file_data.clone().unwrap();
+        let result = update_downloaded_profile(
+            &original,
+            &cleanup,
+            "fixture",
+            &downloaded,
+            |inspection| async move {
+                assert_eq!(inspection.current.as_deref(), Some("fixture"));
+                let file = inspection.get_item("fixture")?.file.as_deref().unwrap();
+                assert_ne!(file, "fixture.yaml");
+                assert_eq!(fs::read_to_string(checked_root.join(file)).await?, expected);
+                assert_eq!(fs::read(checked_root.join("fixture.yaml")).await?, old_source);
+                Ok(())
+            },
+            |candidate| {
+                let path = cleanup.join("profiles.yaml");
+                async move {
+                    fs::write(path, serde_yaml_ng::to_string(&candidate)?).await?;
+                    Ok(())
+                }
+            },
+        )
+        .await?;
+        assert_eq!(result.current, original.current);
+        let item = result.get_item("fixture")?;
+        assert_eq!(item.file.as_deref(), Some("fixture.yaml"));
+        assert_eq!(item.name.as_deref(), Some("User subscription name"));
+        assert_eq!(item.updated, Some(2));
+        assert_eq!(
+            fs::read_to_string(cleanup.join("fixture.yaml")).await?,
+            downloaded.file_data.as_deref().unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(cleanup.join("profiles.yaml")).await?,
+            serde_yaml_ng::to_string(&result)?
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(cleanup.join("fixture.yaml")).await?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(std::fs::read_dir(&*cleanup)?.count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_subscription_update_metadata_save_failure_keeps_source() -> Result<()> {
+        let (root, original, downloaded) = fixture()?;
+        let cleanup = scopeguard::guard(root, |path| {
+            let _ = std::fs::remove_dir_all(path);
+        });
+        let old_source = fs::read(cleanup.join("fixture.yaml")).await?;
+        let old_metadata = fs::read(cleanup.join("profiles.yaml")).await?;
+        let result = update_downloaded_profile(
+            &original,
+            &cleanup,
+            "fixture",
+            &downloaded,
+            |_| async { Ok(()) },
+            |_| async { bail!("fixture metadata save failed") },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(fs::read(cleanup.join("fixture.yaml")).await?, old_source);
+        assert_eq!(fs::read(cleanup.join("profiles.yaml")).await?, old_metadata);
+        assert_eq!(std::fs::read_dir(&*cleanup)?.count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_subscription_update_source_commit_failure_restores_metadata() -> Result<()> {
+        let (root, original, downloaded) = fixture()?;
+        let cleanup = scopeguard::guard(root, |path| {
+            let _ = std::fs::remove_dir_all(path);
+        });
+        let old_metadata = fs::read(cleanup.join("profiles.yaml")).await?;
+        fs::remove_file(cleanup.join("fixture.yaml")).await?;
+        fs::create_dir(cleanup.join("fixture.yaml")).await?;
+        let result = update_downloaded_profile(
+            &original,
+            &cleanup,
+            "fixture",
+            &downloaded,
+            |_| async { Ok(()) },
+            |candidate| {
+                let path = cleanup.join("profiles.yaml");
+                async move {
+                    fs::write(path, serde_yaml_ng::to_string(&candidate)?).await?;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(fs::read(cleanup.join("profiles.yaml")).await?, old_metadata);
+        assert!(cleanup.join("fixture.yaml").is_dir());
+        assert_eq!(std::fs::read_dir(&*cleanup)?.count(), 2);
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

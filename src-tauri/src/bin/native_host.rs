@@ -37,8 +37,9 @@ fn options(args: &[std::ffi::OsString]) -> Option<(bool, Option<PathBuf>, Option
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--build-info" {
-        println!("{}", serde_json::json!({"channel":clash_verge_service_ipc::CHANNEL_IDENTITY.id,
-            "lifecycleAcceptance":cfg!(feature = "native-lifecycle-acceptance")}));
+        let mut identity=clash_verge_service_ipc::identity_info();
+        identity["lifecycleAcceptance"]=serde_json::json!(cfg!(feature="native-lifecycle-acceptance"));
+        println!("{identity}");
         return ExitCode::SUCCESS;
     }
     #[cfg(target_os = "macos")]

@@ -18,6 +18,7 @@ struct LiveWorkspaceView: View {
     @State private var showCoreUpgrade = false
     @State private var confirmServiceInstall = false
     @State private var serviceInstallInspection: NativeCoreInspection?
+    @State private var maintenanceExpanded = false
 
     private var connectionPresentation: TezConnectionPresentation {
         TezConnectionPresentation(state: store.state, hasSnapshot: store.snapshot != nil,
@@ -164,35 +165,14 @@ struct LiveWorkspaceView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("连接概况").font(.system(size: 22, weight: .semibold))
-                VStack(spacing: 0) {
-                    LiveMetadataRow(title: "后台", value: connectionPresentation.title)
-                    Divider()
-                    LiveMetadataRow(title: "内核", value: connectionPresentation.coreTitle)
-                    Divider()
-                    LiveMetadataRow(title: "系统代理", value: store.state == .connected ? snapshot.network?.systemProxy.label ?? "未确认" : "未确认")
-                        .help("读取 macOS 当前网络服务的代理状态。")
-                    Divider()
-                    LiveMetadataRow(title: "TUN", value: store.state == .connected ? snapshot.network?.tun.label ?? "未确认" : "未确认")
-                        .help("读取运行内核的 TUN 启用状态，不代表全部流量已通过 TUN。")
-                    Divider()
-                    LiveMetadataRow(title: "分流模式", value: store.state == .connected ? snapshot.network?.mode.label ?? "未确认" : "未确认")
-                        .help("读取运行内核的模式，而非保存的配置。")
-                    if snapshot.network?.pac.enabled == true {
-                        Divider()
-                        LiveMetadataRow(title: "PAC", value: store.state == .connected ? snapshot.network?.pac.label ?? "未确认" : "未确认")
-                    }
-                    Divider()
-                    LiveMetadataRow(title: "当前配置", value: snapshot.profiles.items.first { $0.uid == snapshot.profiles.current }.map(LiveText.profileName) ?? "未指定")
-                    Divider()
-                    HStack {
-                        Text("策略组").foregroundStyle(.secondary)
-                        Spacer()
-                        Button("查看线路", systemImage: "chevron.right") { selection = .routes }
-                            .buttonStyle(.plain).foregroundStyle(TezStyle.accent)
-                    }.font(.system(size: 13)).padding(.vertical, 15)
+                NativeConnectionOverview(summary: NativeAccessSummary(snapshot: snapshot, connected: store.state == .connected)) {
+                    selection = .routes
                 }
+                Divider()
+                NativeProxyControls(store: store, snapshot: snapshot)
+                Divider()
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("内核控制").font(.headline)
+                    Text("内核与服务").font(.system(size: 13, weight: .semibold))
                     if LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) || store.supports("native_upgrade_core") {
                         HStack(spacing: 12) {
                             ForEach(LiveCoreAction.allCases) { action in
@@ -201,41 +181,59 @@ struct LiveWorkspaceView: View {
                                               || (action == .start && snapshot.core.state == "ready"))
                                     .accessibilityIdentifier("live.core.\(action.rawValue)")
                             }
-                            if store.supports("native_upgrade_core") {
-                                Button("更新内核…", systemImage: "arrow.up.circle") { showCoreUpgrade = true }
-                                    .disabled(store.state != .connected || coreBusy || store.workspaceBusy)
-                            }
                             if coreBusy { ProgressView().controlSize(.small) }
                             Spacer()
                         }
                     }
                     if let inspection = snapshot.core.lifecycle {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(inspection.explanation).font(.callout).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if store.supports("native_install_service") {
-                                Button(inspection.serviceProtocol == nil ? "安装后台服务…" : "升级后台服务…", systemImage: "gearshape.2") {
-                                    serviceInstallInspection = inspection
-                                    confirmServiceInstall = true
+                        Text(inspection.explanation).font(.callout).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if store.serviceSetupInProgress {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("等待系统授权并更新后台服务…")
+                        }.font(.callout).foregroundStyle(.secondary)
+                    }
+                    if snapshot.core.lifecycle != nil || store.supports("native_upgrade_core") || store.supports("native_install_service") {
+                        TezSettingsDisclosure(title: "高级维护", summary: "更新内核、后台服务与控制权", isExpanded: $maintenanceExpanded,
+                                              motion: TezMotion(reduced: preferences.reduceMotion || systemReduceMotion)) {
+                            if store.supports("native_upgrade_core") {
+                                TezSettingRow(title: "更新内核", detail: "替换处理代理流量的内核版本。") {
+                                    Button("检查更新…", systemImage: "arrow.up.circle") { showCoreUpgrade = true }
+                                        .disabled(store.state != .connected || coreBusy || store.workspaceBusy)
                                 }
-                                .disabled(coreBusy || store.workspaceBusy)
-                                .accessibilityIdentifier("live.service.install")
                             }
-                            if store.serviceSetupInProgress {
-                                HStack(spacing: 8) {
-                                    ProgressView().controlSize(.small)
-                                    Text("等待系统授权并更新后台服务…")
-                                }.font(.callout).foregroundStyle(.secondary)
+                            if snapshot.core.lifecycle == nil && store.supports("native_install_service") {
+                                TezSettingRow(title: "后台服务", detail: "先停止内核，再使用当前应用附带的服务重新安装。安装后内核保持停止。") {
+                                    Button("重新安装后台服务…", systemImage: "gearshape.2") { inspectServiceInstall() }
+                                        .disabled(store.state != .connected || coreBusy || store.workspaceBusy || snapshot.core.state == "ready")
+                                        .accessibilityIdentifier("live.service.install")
+                                }
                             }
-                            Button("重新检测内核", systemImage: "arrow.clockwise") { inspectCore() }
-                                .disabled(inspectionBusy || store.workspaceBusy || store.state != .connected)
-                            if store.supports("native_claim_core") {
-                                Button("接管控制权…", systemImage: "key.fill") { claimInspection = inspection; confirmClaim = true }
-                                    .disabled(coreBusy || store.workspaceBusy || inspection.state != "runningReadOnly" || inspection.serviceStartedAt == nil)
-                                    .accessibilityIdentifier("live.core.claim")
+                            if let inspection = snapshot.core.lifecycle {
+                                if store.supports("native_install_service") {
+                                    TezSettingRow(title: "后台服务", detail: inspection.serviceProtocol == nil ? "尚未安装。安装时 macOS 会请求授权。" : "更新时 macOS 会请求授权。") {
+                                        Button(inspection.serviceProtocol == nil ? "安装后台服务…" : "升级后台服务…", systemImage: "gearshape.2") {
+                                            serviceInstallInspection = inspection
+                                            confirmServiceInstall = true
+                                        }
+                                        .disabled(coreBusy || store.workspaceBusy)
+                                        .accessibilityIdentifier("live.service.install")
+                                    }
+                                }
+                                TezSettingRow(title: "内核控制权", detail: "重新检测运行状态；接管后原管理会话失效。") {
+                                    HStack {
+                                        TezToolButton(title: "重新检测内核", symbol: "arrow.clockwise", enabled: !inspectionBusy && !store.workspaceBusy && store.state == .connected) { inspectCore() }
+                                        if store.supports("native_claim_core") {
+                                            Button("接管控制权…", systemImage: "key.fill") { claimInspection = inspection; confirmClaim = true }
+                                                .disabled(coreBusy || store.workspaceBusy || inspection.state != "runningReadOnly" || inspection.serviceStartedAt == nil)
+                                                .accessibilityIdentifier("live.core.claim")
+                                        }
+                                    }
+                                }
                             }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 16)
                     }
                     if snapshot.core.lifecycle == nil && !LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) {
                         Text("只读连接：当前后台未开放内核控制。")
@@ -251,6 +249,8 @@ struct LiveWorkspaceView: View {
                 }
                 Divider()
                 DisclosureGroup("诊断详情") {
+                    LiveMetadataRow(title: "后台", value: connectionPresentation.title)
+                    LiveMetadataRow(title: "内核", value: connectionPresentation.coreTitle)
                     LiveMetadataRow(title: "快照版本", value: snapshot.revision)
                     LiveMetadataRow(title: "配置状态", value: LiveText.state(snapshot.profiles.state))
                     if let inspection = snapshot.core.lifecycle {
@@ -329,12 +329,38 @@ struct LiveWorkspaceView: View {
                 guard case .object(let fields) = result, fields["installed"] == .bool(true) else {
                     throw NativeBackendError.unavailable("后台服务更新结果未确认，请重新检测。")
                 }
-                coreMessage = "后台服务更新完成，正在恢复连接。检测完成后可启动或接管内核。"
-                store.reconnectAfterClaim()
+                if fields["reconnectRequired"] == .bool(false) {
+                    coreMessage = "后台服务重新安装完成。内核保持停止，请手动启动。"
+                    store.refresh()
+                } else {
+                    coreMessage = "后台服务更新完成，正在恢复连接。检测完成后可启动或接管内核。"
+                    store.reconnectAfterClaim()
+                }
             } catch {
                 coreMessage = "后台服务更新未完成。取消授权后可以重试；其他情况请重新检测内核状态。"
                 coreDetails = NativeFeatureError.message(error)
-                if case NativeBackendError.remote = error { store.reconnectAfterClaim() }
+                if store.isReadOnlyConnection, case NativeBackendError.remote = error { store.reconnectAfterClaim() }
+                else { store.refresh() }
+            }
+        }
+    }
+
+    private func inspectServiceInstall() {
+        guard !coreBusy, !store.workspaceBusy, store.supports("native_inspect_core") else { return }
+        coreBusy = true
+        Task { @MainActor in
+            defer { coreBusy = false }
+            do {
+                let inspection = try await store.request("native_inspect_core").decoded(NativeCoreInspection.self)
+                guard inspection.canStart, inspection.corePid == nil, inspection.processes.isEmpty else {
+                    coreMessage = "请先停止内核，并确认没有其他运行中的内核，再重新安装后台服务。"
+                    return
+                }
+                serviceInstallInspection = inspection
+                confirmServiceInstall = true
+            } catch {
+                coreMessage = "后台服务状态尚未确认，未开始安装。"
+                coreDetails = NativeFeatureError.message(error)
             }
         }
     }
@@ -470,7 +496,6 @@ private struct LiveProfilesView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: search) { _, _ in selectedID = nil }
         .sheet(item: $managementTarget) { target in
             NativeSubscriptionSheet(store: store, profile: target.profile).environment(preferences)
         }
@@ -495,10 +520,13 @@ private struct LiveProfilesView: View {
 
     private var profileSidebar: some View {
         VStack(spacing: 0) {
-            TezSearchField(prompt: "搜索配置", text: $search, identifier: "live.profiles.search")
+            TezSearchField(prompt: "搜索配置", text: Binding(get: { search }, set: {
+                if let selected { selectedID = selected.uid }
+                search = $0
+            }), identifier: "live.profiles.search")
                 .padding(12)
             Divider()
-            List(selection: Binding(get: { selected?.uid }, set: { selectedID = $0 })) {
+            List(selection: Binding(get: { selected?.uid }, set: { if let id = $0 { selectedID = id } })) {
                 if !configurations.isEmpty {
                     Section("配置") {
                         ForEach(configurations) { profileRow($0) }
@@ -633,11 +661,19 @@ private struct LiveRoutesView: View {
     @State private var latency = NativeLatencyModel()
     @State private var latencyURL = "https://www.gstatic.com/generate_204"
     @State private var latencyTimeout = 5000
+    @State private var showsChains = false
+    @State private var sortOrder: [LiveRouteLatencyComparator] = []
+    @State private var comparison = NativeRouteComparisonSelection()
+    @State private var showsComparison = false
+    @State private var measurementEmphasis: Set<String> = []
 
     private var supportsSelection: Bool { store.supports("native_select_route") }
     private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
     private var canSwitch: Bool {
-        guard store.state == .connected, supportsSelection, !switching, !store.workspaceBusy, !latency.busy, let group, let selected, selected.isResolved, !selected.isCurrent else { return false }
+        selected.map(canSwitch(to:)) ?? false
+    }
+    private func canSwitch(to selected: LiveRouteMember) -> Bool {
+        guard store.state == .connected, supportsSelection, !switching, !store.workspaceBusy, !latency.busy, let group, selected.isResolved, !selected.isCurrent else { return false }
         return ["selector", "urltest", "fallback"].contains(group.type.lowercased().replacingOccurrences(of: "-", with: ""))
             && rows.filter { $0.member.name == selected.member.name }.count == 1
     }
@@ -656,13 +692,18 @@ private struct LiveRoutesView: View {
             view.records[id].map { NativeProxyMember(kind: "node", name: $0.name, recordId: id, reason: nil) }
         }
         return members.enumerated().map { index, member in
-            LiveRouteMember(member: member, index: index, view: view, isCurrent: group?.now == member.name)
+            LiveRouteMember(member: member, index: index, view: view, isCurrent: group?.now == member.name,
+                            measuredLatency: latency.results[member.name], sessionMeasuredAt: latency.measuredAt[member.name])
         }
     }
     private var visibleRows: [LiveRouteMember] {
         rows.filter { search.isEmpty || "\($0.name) \($0.type) \($0.source)".localizedCaseInsensitiveContains(search) }
+            .sorted(using: sortOrder)
     }
     private var selected: LiveRouteMember? { visibleRows.first { $0.id == selectedID } }
+    private var comparisonRows: [LiveRouteMember] {
+        comparison.ids.compactMap { id in rows.first { $0.id == id } }
+    }
 
     var body: some View {
         if let view = snapshot.proxyView {
@@ -681,7 +722,7 @@ private struct LiveRoutesView: View {
                         .padding(.horizontal, TezStyle.pageInset).padding(.vertical, 9)
                         .background(Color(nsColor: .controlBackgroundColor))
                     }
-                    routeList(showProtocol: preferences.showProtocol && geometry.size.width >= 630)
+                    routeList(showProtocol: preferences.showProtocol && geometry.size.width >= 700)
                     Divider()
                     detailRail
                 }
@@ -690,6 +731,23 @@ private struct LiveRoutesView: View {
                 selectedID = nil
                 switchMessage = nil
                 switchDetails = nil
+                comparison.clear()
+            }
+            .sheet(isPresented: $showsChains) { NativeProxyChainView(store: store) }
+            .sheet(isPresented: $showsComparison) { comparisonSheet }
+            .onChange(of: rows.map(\.id)) { _, ids in comparison.retain(Set(ids)) }
+            .onChange(of: snapshot.profiles.current) { _, _ in
+                comparison.clear()
+                latency = NativeLatencyModel()
+            }
+            .onChange(of: latency.measuredAt) { old, new in
+                measurementEmphasis = Set(new.keys.filter { old[$0] != new[$0] })
+            }
+            .task(id: measurementEmphasis) {
+                guard !measurementEmphasis.isEmpty else { return }
+                try? await Task.sleep(for: .seconds(1.4))
+                guard !Task.isCancelled else { return }
+                measurementEmphasis = []
             }
             .onChange(of: selectedID) { _, _ in
                 switchMessage = nil
@@ -729,7 +787,7 @@ private struct LiveRoutesView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             if !compact {
                 VStack(alignment: .trailing, spacing: 5) {
-                    Text(group?.type ?? "独立线路").font(.system(size: 12, weight: .medium))
+                    Text(group.map { LiveText.groupType($0.type) } ?? "独立线路").font(.system(size: 12, weight: .medium))
                     Text("\(rows.count) 个成员").font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -740,7 +798,7 @@ private struct LiveRoutesView: View {
     }
 
     private func filterBar(_ view: NativeProxyView) -> some View {
-        HStack(spacing: 20) {
+        HStack(spacing: 12) {
             TezSearchField(prompt: "搜索线路", text: $search, identifier: "live.routes.search",
                            surface: Color(nsColor: .textBackgroundColor))
             .frame(maxWidth: .infinity)
@@ -749,17 +807,27 @@ private struct LiveRoutesView: View {
                     ForEach(groups) { item in Text(LiveText.name(item.name, fallback: "未命名策略组")).tag(item.name) }
                 }
                 .labelsHidden().pickerStyle(.menu)
-                .frame(maxWidth: 210)
+                .frame(maxWidth: 180)
                 .help("查看策略组，不更改后台选择")
                 .accessibilityIdentifier("live.routes.group")
             }
+            Button("对比线路", systemImage: comparison.ids.isEmpty ? "square.split.2x2" : "square.split.2x2.fill") {
+                showsComparison = true
+            }
+            .labelStyle(.iconOnly).help("对比线路（\(comparison.ids.count)/3）")
+            .accessibilityValue("\(comparison.ids.count) 条候选线路")
+            .accessibilityIdentifier("live.routes.compare")
+            Button("链式代理", systemImage: "link") { showsChains = true }
+                .labelStyle(.iconOnly).help("链式代理管理")
+                .disabled(!store.supports("native_get_proxy_chains"))
+                .accessibilityIdentifier("live.routes.chains")
             if latency.busy {
                 ProgressView(value: Double(latency.completed), total: Double(max(1, latency.total))).frame(width: 54)
                 Button("停止测速", systemImage: "stop.fill") { latency.stopAfterCurrentBatch() }
                     .labelStyle(.iconOnly).help("当前批次结束后停止")
             } else {
                 Button("测速", systemImage: "speedometer") { testLatency(visibleRows) }
-                    .disabled(store.state != .connected || !store.supports("native_test_latency") || store.workspaceBusy || testable(visibleRows).isEmpty)
+                    .disabled(!canTest(visibleRows))
                     .help("测试当前筛选结果的延迟，不切换线路")
             }
         }
@@ -777,7 +845,7 @@ private struct LiveRoutesView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color(nsColor: .textBackgroundColor))
             } else if showProtocol {
-                Table(visibleRows, selection: $selectedID) {
+                Table(visibleRows, selection: $selectedID, sortOrder: $sortOrder) {
                     routeIconColumn
                     routeNameColumn
                     TableColumn("协议 / 类型") { row in
@@ -787,7 +855,7 @@ private struct LiveRoutesView: View {
                     routeStatusColumn
                 }
             } else {
-                Table(visibleRows, selection: $selectedID) {
+                Table(visibleRows, selection: $selectedID, sortOrder: $sortOrder) {
                     routeIconColumn
                     routeNameColumn
                     routeLatencyColumn
@@ -806,8 +874,13 @@ private struct LiveRoutesView: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(row.name, forType: .string)
                 }
+                Button(comparison.contains(row.id) ? "移出对比" : "加入对比",
+                       systemImage: comparison.contains(row.id) ? "pin.slash" : "pin") {
+                    toggleComparison(row)
+                }
+                .disabled(!comparison.contains(row.id) && comparison.isFull)
                 Button("测试延迟", systemImage: "speedometer") { testLatency([row]) }
-                    .disabled(store.state != .connected || latency.busy || store.workspaceBusy || !store.supports("native_test_latency") || testable([row]).isEmpty)
+                    .disabled(!canTest([row]))
             }
         }
     }
@@ -822,17 +895,21 @@ private struct LiveRoutesView: View {
     private var routeNameColumn: some TableColumnContent<LiveRouteMember, Never> {
         TableColumn("线路名称") { (row: LiveRouteMember) in
             Text(row.name).lineLimit(1).help(row.name)
-        }.width(min: 180, ideal: 300)
+        }.width(min: 150, ideal: 300)
     }
 
-    private var routeLatencyColumn: some TableColumnContent<LiveRouteMember, Never> {
-        TableColumn("延迟") { (row: LiveRouteMember) in
-            TezLatencyValue(label: latency.label(for: row.member.name, fallback: row.latency),
-                            testing: latency.testing.contains(row.member.name),
-                            failed: latency.results[row.member.name].map { $0.error != nil || ($0.delay ?? 0) == 0 }
-                                ?? (row.latency == "超时"), motion: motion,
-                            inheritsForeground: true)
-        }.width(92).alignment(.trailing)
+    private var routeLatencyColumn: some TableColumnContent<LiveRouteMember, LiveRouteLatencyComparator> {
+        TableColumn("延迟", sortUsing: LiveRouteLatencyComparator()) { (row: LiveRouteMember) in
+            VStack(alignment: .trailing, spacing: 3) {
+                latencyValue(row, inheritsForeground: true)
+                measurementLabel(row)
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 4)
+            .background(measurementEmphasis.contains(row.member.name) ? TezStyle.accent.opacity(0.12) : .clear,
+                        in: RoundedRectangle(cornerRadius: 4))
+            .animation(motion.feedback, value: measurementEmphasis.contains(row.member.name))
+        }.width(146).alignment(.trailing)
     }
 
     private var routeStatusColumn: some TableColumnContent<LiveRouteMember, Never> {
@@ -842,6 +919,176 @@ private struct LiveRoutesView: View {
                            symbol: row.isCurrent && row.isResolved ? "checkmark.circle.fill" : nil, motion: motion,
                            inheritsForeground: true)
         }.width(110).alignment(.trailing)
+    }
+
+    private func latencyValue(_ row: LiveRouteMember, inheritsForeground: Bool = false) -> some View {
+        TezLatencyValue(label: latency.label(for: row.member.name, fallback: row.latency),
+                        testing: latency.testing.contains(row.member.name),
+                        failed: row.measuredLatency.map { $0.error != nil || ($0.delay ?? 0) == 0 }
+                            ?? (row.latency == "超时"), motion: motion,
+                        inheritsForeground: inheritsForeground)
+    }
+
+    private func measurementLabel(_ row: LiveRouteMember) -> some View {
+        TimelineView(.periodic(from: .now, by: 60)) { _ in
+            Text(row.measurement.origin == .none ? "未测速"
+                 : "\(row.measurement.originLabel) · \(row.measurement.relativeAge(at: Date()))")
+                .font(.system(size: 10)).lineLimit(1)
+                .help("\(row.measurement.originLabel)：\(row.measurement.exactTime)")
+                .accessibilityLabel("\(row.measurement.originLabel)，\(row.measurement.exactTime)")
+        }
+    }
+
+    private func toggleComparison(_ row: LiveRouteMember) {
+        if comparison.contains(row.id) { comparison.remove(row.id) }
+        else { comparison.add(row.id) }
+    }
+
+    private var comparisonSheet: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Text("线路对比").font(.system(size: 18, weight: .semibold))
+                Text("\(comparisonRows.count) / 3").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                Spacer()
+                Menu {
+                    ForEach(rows.filter { !comparison.contains($0.id) }) { row in
+                        Button(row.isCurrent ? "当前线路 · \(row.name)" : row.name) { comparison.add(row.id) }
+                    }
+                } label: {
+                    Label("添加候选", systemImage: "plus")
+                }
+                .disabled(comparison.isFull || rows.allSatisfy { comparison.contains($0.id) })
+                .accessibilityIdentifier("live.routes.compare.add")
+                Button("清空", systemImage: "trash") { comparison.clear() }
+                    .labelStyle(.iconOnly).help("清空候选线路")
+                    .disabled(comparison.ids.isEmpty)
+                    .accessibilityIdentifier("live.routes.compare.clear")
+                Button("关闭", systemImage: "xmark") { showsComparison = false }
+                    .labelStyle(.iconOnly).help("关闭对比").keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("live.routes.compare.close")
+            }
+            .padding(20)
+            Divider()
+            if comparisonRows.isEmpty {
+                ContentUnavailableView("尚无候选线路", systemImage: "square.split.2x2")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    comparisonGrid.padding(20)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                if let switchMessage {
+                    LiveCommandFeedback(message: switchMessage, details: switchDetails, tone: switchTone)
+                }
+                if let error = latency.error { TezOperationFeedback(message: error, tone: .error) }
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("测速地址：\(latencyURL)").lineLimit(1).help(latencyURL)
+                        Text("延迟不代表端到端连接状态。")
+                        Text("切换此策略组的线路可能中断连接。")
+                    }
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    if latency.busy {
+                        ProgressView(value: Double(latency.completed), total: Double(max(1, latency.total)))
+                            .frame(width: 64)
+                        Button("停止测速", systemImage: "stop.fill") { latency.stopAfterCurrentBatch() }
+                            .labelStyle(.iconOnly).help("当前批次结束后停止")
+                    } else {
+                        Button("重新测速", systemImage: "speedometer") { testLatency(comparisonRows) }
+                            .disabled(!canTest(comparisonRows))
+                            .accessibilityIdentifier("live.routes.compare.retest")
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .frame(width: 700, height: 490)
+        .background(Color(nsColor: .textBackgroundColor))
+        .animation(motion.feedback, value: comparison.ids)
+        .accessibilityIdentifier("live.routes.comparison")
+    }
+
+    private var comparisonGrid: some View {
+        let candidates = comparisonRows
+        let width = (660 - 72 - CGFloat(candidates.count) * 12) / CGFloat(max(1, candidates.count))
+        return Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 16) {
+            GridRow(alignment: .top) {
+                Text("线路").foregroundStyle(.secondary).frame(width: 72, alignment: .leading)
+                ForEach(candidates) { row in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .top, spacing: 4) {
+                            Text(row.name).fontWeight(.semibold).lineLimit(3).help(row.name)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button("移出对比", systemImage: "pin.slash") { comparison.remove(row.id) }
+                                .labelStyle(.iconOnly).help("移出对比：\(row.name)")
+                                .accessibilityIdentifier("live.routes.compare.remove.\(row.id)")
+                        }
+                        TezStatusLabel(title: row.isCurrent && store.state != .connected ? "上次使用" : row.status,
+                                       tone: row.isCurrent && store.state == .connected ? .success : .neutral, motion: motion)
+                    }
+                    .frame(width: width, alignment: .leading)
+                }
+            }
+            Divider().gridCellColumns(candidates.count + 1)
+            GridRow {
+                Text("延迟").foregroundStyle(.secondary)
+                ForEach(candidates) { row in
+                    latencyValue(row)
+                        .frame(width: width, alignment: .leading)
+                        .padding(.vertical, 4)
+                        .background(measurementEmphasis.contains(row.member.name) ? TezStyle.accent.opacity(0.12) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 4))
+                        .animation(motion.feedback, value: measurementEmphasis.contains(row.member.name))
+                }
+            }
+            GridRow(alignment: .top) {
+                Text("最近测速").foregroundStyle(.secondary)
+                ForEach(candidates) { row in
+                    VStack(alignment: .leading, spacing: 5) {
+                        measurementLabel(row)
+                        Text(row.measurement.exactTime).font(.system(size: 11)).foregroundStyle(.secondary)
+                            .lineLimit(3).textSelection(.enabled)
+                    }
+                    .frame(width: width, alignment: .leading)
+                }
+            }
+            GridRow(alignment: .top) {
+                Text("协议 / 类型").foregroundStyle(.secondary)
+                ForEach(candidates) { row in
+                    Text(row.type).lineLimit(3).help(row.type).frame(width: width, alignment: .leading)
+                }
+            }
+            GridRow(alignment: .top) {
+                Text("来源").foregroundStyle(.secondary)
+                ForEach(candidates) { row in
+                    Text(row.source).lineLimit(3).help(row.source).frame(width: width, alignment: .leading)
+                }
+            }
+            Divider().gridCellColumns(candidates.count + 1)
+            GridRow {
+                Color.clear.frame(width: 72, height: 1).accessibilityHidden(true)
+                ForEach(candidates) { row in
+                    Button(row.isCurrent ? "当前线路" : "切换线路", systemImage: row.isCurrent ? "checkmark" : "arrow.right") {
+                        guard let group else { return }
+                        switchRoute(row, in: group)
+                    }
+                    .disabled(!canSwitch(to: row))
+                    .help(row.isCurrent ? "这条线路已经是当前线路" : "切换到 \(row.name)，现有连接可能中断")
+                    .accessibilityIdentifier("live.routes.compare.select.\(row.id)")
+                    .frame(width: width, alignment: .leading)
+                }
+            }
+        }
+        .font(.system(size: 12))
+    }
+
+    private func canTest(_ candidates: [LiveRouteMember]) -> Bool {
+        store.state == .connected && store.supports("native_test_latency") && !store.workspaceBusy
+            && !latency.busy && !switching && !testable(candidates).isEmpty
     }
 
     private var detailRail: some View {
@@ -896,7 +1143,7 @@ private struct LiveRoutesView: View {
                         .lineLimit(2).help(row.name).textSelection(.enabled)
                     Text("\(row.type) · \(row.source) · UDP \(row.udp.map { $0 ? "支持" : "不支持" } ?? "未提供")")
                         .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
-                        .help("\(row.source)\n最近测速：\(latency.measuredAt[row.member.name]?.formatted(date: .omitted, time: .standard) ?? row.measuredAt ?? "未测速")")
+                        .help("\(row.source)\n\(row.measurement.originLabel)：\(row.measurement.exactTime)")
                 } else {
                     Text(supportsSelection ? "尚无待切换的线路" : "当前后台未开放线路切换")
                         .font(.system(size: 13)).foregroundStyle(.secondary)
@@ -906,6 +1153,16 @@ private struct LiveRoutesView: View {
             .accessibilityIdentifier("live.routes.preview")
             HStack(spacing: 8) {
                 if switching { ProgressView().controlSize(.small) }
+                if let selected {
+                    Button(comparison.contains(selected.id) ? "移出对比" : "加入对比",
+                           systemImage: comparison.contains(selected.id) ? "pin.fill" : "pin") {
+                        toggleComparison(selected)
+                    }
+                    .labelStyle(.iconOnly)
+                    .help(comparison.contains(selected.id) ? "移出对比" : comparison.isFull ? "最多对比 3 条线路" : "加入对比（\(comparison.ids.count)/3）")
+                    .disabled(!comparison.contains(selected.id) && comparison.isFull)
+                    .accessibilityIdentifier("live.routes.pin")
+                }
                 Button(switching ? "正在切换" : "切换线路", systemImage: "arrow.right") { switchRoute() }
                     .modifier(TezPrimaryActionStyle())
                     .disabled(!canSwitch)
@@ -925,11 +1182,17 @@ private struct LiveRoutesView: View {
         guard let selected else { return "尚未选择线路" }
         if selected.isCurrent { return "这条线路已经是当前线路" }
         if !canSwitch { return "当前策略组或成员不支持手动切换" }
-        return "切换到 \(selected.name)"
+        return "切换到 \(selected.name)，现有连接可能中断"
     }
 
     private func switchRoute() {
         guard canSwitch, let group, let selected else { return }
+        switchRoute(selected, in: group)
+    }
+
+    private func switchRoute(_ selected: LiveRouteMember, in group: NativeProxyGroup) {
+        guard canSwitch(to: selected) else { return }
+        let profileID = snapshot.profiles.current
         switching = true
         switchMessage = nil
         switchDetails = nil
@@ -944,7 +1207,18 @@ private struct LiveRoutesView: View {
                       case .bool(let persisted) = value["persisted"] else {
                     throw BackendWireError.invalid("Invalid native_select_route response")
                 }
-                if applied && persisted {
+                let cleanupIncomplete: Bool
+                if case .object(let cleanup) = value["connectionCleanup"] {
+                    cleanupIncomplete = cleanup["requested"] == .bool(true) && cleanup["completed"] != .bool(true)
+                } else {
+                    cleanupIncomplete = false
+                }
+                if applied && cleanupIncomplete {
+                    switchTone = .warning
+                    switchMessage = persisted
+                        ? "线路已切换并保存，但部分旧连接未能关闭。请检查详情。"
+                        : "线路已切换，但选择保存和旧连接清理未完成。请检查详情。"
+                } else if applied && persisted {
                     switchTone = .success
                     switchMessage = "已切换到 \(selected.name)，选择已保存。"
                 } else if applied {
@@ -953,6 +1227,9 @@ private struct LiveRoutesView: View {
                 } else {
                     switchTone = .error
                     switchMessage = "线路未切换。请检查详情和当前线路。"
+                }
+                if applied {
+                    preferences.recordRoute(profileID: profileID, group: group.name, name: selected.member.name)
                 }
                 switchDetails = LiveCommandFeedback.render(result)
             } catch {
@@ -974,6 +1251,7 @@ private struct LiveRoutesView: View {
 
     private func testLatency(_ candidates: [LiveRouteMember]) {
         let names = testable(candidates)
+        guard canTest(candidates) else { return }
         Task { @MainActor in
             await latency.test(names: names, url: latencyURL, timeout: latencyTimeout) { command, params in
                 try await store.request(command, params: params, timeout: .seconds(150), serialWorkspace: true)
@@ -984,11 +1262,13 @@ private struct LiveRoutesView: View {
 
 }
 
-private struct LiveRouteMember: Identifiable {
+struct LiveRouteMember: Identifiable {
     let member: NativeProxyMember
     let index: Int
     let view: NativeProxyView
     let isCurrent: Bool
+    var measuredLatency: NativeLatencyPayload.Result? = nil
+    var sessionMeasuredAt: Date? = nil
     var id: String { "\(index):\(member.kind):\(member.recordId ?? member.name)" }
     var name: String { LiveText.name(member.name, fallback: member.kind == "group" ? "未命名策略组" : "未命名线路") }
     private var node: NativeProxyNode? {
@@ -1000,11 +1280,22 @@ private struct LiveRouteMember: Identifiable {
         return view.groups.first { $0.name == member.name } ?? (view.global?.name == member.name ? view.global : nil)
     }
     var isResolved: Bool { node != nil || group != nil }
-    var type: String { node?.type ?? group.map { "策略组 · \($0.type)" } ?? "未解析" }
+    var type: String { node?.type ?? group.map { "策略组 · \(LiveText.groupType($0.type))" } ?? "未解析" }
     var udp: Bool? { node?.udp ?? group?.udp }
     private var latest: NativeDelayHistory? { (node?.history ?? group?.history ?? []).last }
+    var sortDelay: UInt64? {
+        if let measuredLatency {
+            guard measuredLatency.error == nil, let delay = measuredLatency.delay, delay > 0 else { return nil }
+            return UInt64(delay)
+        }
+        return latest.flatMap { $0.delay > 0 ? $0.delay : nil }
+    }
     var latency: String { latest.map { $0.delay == 0 ? "超时" : "\($0.delay) ms" } ?? "未测速" }
     var measuredAt: String? { latest?.time }
+    var measurement: NativeRouteMeasurement {
+        NativeRouteMeasurement(sessionDate: sessionMeasuredAt, snapshotTime: measuredAt,
+                               hasSessionResult: measuredLatency != nil)
+    }
     var source: String {
         if let node {
             return node.source.providerName ?? (node.source.kind == "core" ? "内核" : node.source.kind)
@@ -1023,7 +1314,34 @@ private struct LiveRouteMember: Identifiable {
     }
 }
 
+struct LiveRouteLatencyComparator: SortComparator {
+    var order: SortOrder = .forward
+
+    func compare(_ lhs: LiveRouteMember, _ rhs: LiveRouteMember) -> ComparisonResult {
+        switch (lhs.sortDelay, rhs.sortDelay) {
+        case (.some(let left), .some(let right)) where left != right:
+            return (left < right) == (order == .forward) ? .orderedAscending : .orderedDescending
+        case (.some, .none): return .orderedAscending
+        case (.none, .some): return .orderedDescending
+        default:
+            if lhs.index == rhs.index { return .orderedSame }
+            return lhs.index < rhs.index ? .orderedAscending : .orderedDescending
+        }
+    }
+}
+
 private enum LiveText {
+    static func groupType(_ value: String) -> String {
+        switch value.lowercased().replacingOccurrences(of: "-", with: "") {
+        case "selector": "手动选择"
+        case "urltest": "自动测速"
+        case "fallback": "故障切换"
+        case "loadbalance": "负载均衡"
+        case "relay": "链式代理"
+        default: value
+        }
+    }
+
     static func profileName(_ profile: NativeProfileItem) -> String {
         name(profile.name, fallback: "\(profileType(profile.type)) · \(profile.uid.suffix(6))")
     }

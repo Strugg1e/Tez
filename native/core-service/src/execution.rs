@@ -165,9 +165,9 @@ fn coordination_path() -> Result<PathBuf> {
     };
     // Both channels may keep idle helpers, but core execution is shared.
     #[cfg(feature = "test")]
-    let name = "clash-verge-service.core-execution-test.lock";
+    let name = "tez-service.core-execution-test.lock";
     #[cfg(all(not(feature = "test"), not(feature = "acceptance-channel")))]
-    let name = "clash-verge-service.core-execution.lock";
+    let name = "tez-service.core-execution.lock";
     #[cfg(all(not(feature = "test"), feature = "acceptance-channel"))]
     let name = "tez-acceptance-service.core-execution.lock";
     Ok(root.join(name))
@@ -311,20 +311,20 @@ fn require_no_unix_core_processes(processes: &str, include_service: bool) -> Res
         .join(format!(
             "{}.bundle",
             if cfg!(feature = "development-channel") {
-                "io.github.clash-verge-rev.clash-verge-rev.service"
+                "app.tez.service"
             } else {
-                "io.github.clash-verge-rev.clash-verge-rev.dev.service"
+                "app.tez.dev.service"
             }
         ))
-        .join("Contents/MacOS/clash-verge-service");
+        .join("Contents/MacOS/tez-service");
     #[cfg(target_os = "linux")]
     let other_helper = PathBuf::from("/var/lib")
         .join(if cfg!(feature = "development-channel") {
-            "clash-verge-service"
+            "tez-service"
         } else {
-            "clash-verge-service-dev"
+            "tez-service-dev"
         })
-        .join("bin/clash-verge-service");
+        .join("bin/tez-service");
     // A residual helper outranks a core so the refusal stays repairable in any ps order.
     let mut remaining_core = None;
     for process in processes.lines() {
@@ -335,10 +335,10 @@ fn require_no_unix_core_processes(processes: &str, include_service: bool) -> Res
             .unwrap_or((process.trim(), ""));
         let executable = Path::new(process.trim());
         let name = executable.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        if ["verge-mihomo", "verge-mihomo-alpha", "verge-mihomo-al"].contains(&name) {
+        if ["mihomo", "mihomo-alpha", "verge-mihomo", "verge-mihomo-alpha", "verge-mihomo-al"].contains(&name) {
             remaining_core.get_or_insert(name);
         }
-        if include_service && ["clash-verge-service", "clash-verge-ser"].contains(&name) {
+        if include_service && ["tez-service", "clash-verge-ser"].contains(&name) {
             // Linux comm is truncated; argv[0] retains the installed helper's channel path.
             #[cfg(target_os = "linux")]
             let executable = Path::new(arguments.split_whitespace().next().unwrap_or(""));
@@ -596,27 +596,27 @@ mod tests {
     #[test]
     fn linux_idle_helper_from_other_channel_does_not_block_fallback() -> Result<()> {
         let other = if cfg!(feature = "development-channel") {
-            "clash-verge-service"
+            "tez-service"
         } else {
-            "clash-verge-service-dev"
+            "tez-service-dev"
         };
         let current = crate::SERVICE_SLUG;
         require_no_unix_core_processes(
-            &format!("clash-verge-ser /var/lib/{other}/bin/clash-verge-service"),
+            &format!("clash-verge-ser /var/lib/{other}/bin/tez-service"),
             true,
         )?;
         assert!(
             require_no_unix_core_processes(
-                &format!("clash-verge-ser /var/lib/{current}/bin/clash-verge-service"),
+                &format!("clash-verge-ser /var/lib/{current}/bin/tez-service"),
                 true
             )
             .is_err()
         );
-        assert!(require_no_unix_core_processes("clash-verge-ser /tmp/clash-verge-service", true).is_err());
+        assert!(require_no_unix_core_processes("clash-verge-ser /tmp/tez-service", true).is_err());
         assert!(
             require_no_unix_core_processes(
                 &format!(
-                    "clash-verge-ser /var/lib/{other}/bin/clash-verge-service\nverge-mihomo-al /tmp/verge-mihomo-alpha"
+                    "clash-verge-ser /var/lib/{other}/bin/tez-service\nverge-mihomo-al /tmp/verge-mihomo-alpha"
                 ),
                 true
             )
@@ -626,9 +626,11 @@ mod tests {
     }
     #[cfg(all(unix, feature = "client"))]
     #[test]
-    fn linux_truncated_alpha_core_blocks_fallback() {
+    fn named_and_legacy_cores_block_fallback() {
         for ipc_failed in [false, true] {
-            assert!(require_no_unix_core_processes("verge-mihomo-al", ipc_failed).is_err());
+            for name in ["mihomo", "mihomo-alpha", "verge-mihomo", "verge-mihomo-al"] {
+                assert!(require_no_unix_core_processes(name, ipc_failed).is_err());
+            }
         }
     }
 
@@ -667,8 +669,8 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "client"))]
     #[test]
     fn an_idle_helper_from_the_other_channel_does_not_block_fallback() -> Result<()> {
-        let production = "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service";
-        let development = "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.dev.service.bundle/Contents/MacOS/clash-verge-service";
+        let production = "/Library/PrivilegedHelperTools/app.tez.service.bundle/Contents/MacOS/tez-service";
+        let development = "/Library/PrivilegedHelperTools/app.tez.dev.service.bundle/Contents/MacOS/tez-service";
         let (current, other) = if cfg!(feature = "development-channel") {
             (development, production)
         } else {
@@ -677,9 +679,9 @@ mod tests {
         require_no_unix_core_processes(other, true)?;
         for residual in [
             current.to_owned(),
-            "clash-verge-service".into(),
+            "tez-service".into(),
             format!("/tmp{other}"),
-            format!("{other}\n/Library/Application Support/clash-verge-service/cores/verge-mihomo"),
+            format!("{other}\n/Library/Application Support/tez-service/cores/verge-mihomo"),
         ] {
             assert!(
                 require_no_unix_core_processes(&residual, true).is_err(),

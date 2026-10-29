@@ -15,9 +15,9 @@ use windows_sys::Win32::{
 };
 
 #[cfg(not(feature = "test"))]
-pub(super) const NAME: &str = r"Global\clash-verge-service.core-execution";
+pub(super) const NAME: &str = r"Global\tez-service.core-execution";
 #[cfg(feature = "test")]
-pub(super) const NAME: &str = r"Global\clash-verge-service.core-execution-test";
+pub(super) const NAME: &str = r"Global\tez-service.core-execution-test";
 
 #[derive(Debug)]
 pub(super) struct Reservation {

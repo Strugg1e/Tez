@@ -4,7 +4,11 @@ Based on clash-verge-service-ipc v2.7.6, commit
 `b2a7427d6681c8d3780ab83a73f4dc21da2f22d6` from
 https://github.com/clash-verge-rev/clash-verge-service-ipc.
 Upstream authorship and GPL-3.0 licensing are preserved. The library name and
-legacy routes remain compatible with the installed service during migration.
+in-process API remain source-compatible. Tez production uses its own service
+identity (`app.tez.service`), executable (`tez-service`), IPC directory and state
+directory. It does not discover or control the old production service socket.
+Moving a running legacy core requires a separately approved service cutover;
+building or testing this source performs no such cutover.
 
 Protocol 2.6 adds explicit session recovery, compare-and-claim ownership and
 verified, separately approved core upgrades with rollback. None of these routes

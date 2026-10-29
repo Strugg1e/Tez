@@ -21,7 +21,10 @@ use clash_verge_draft::Draft;
 use clash_verge_logging::{Type, logging, logging_error};
 use serde_yaml_ng::{Mapping, Value};
 use smartstring::alias::String;
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 use tokio::time::sleep;
 
@@ -157,6 +160,9 @@ impl Config {
 
     async fn generate_and_validate() -> Result<Option<(NoticeStatus, String)>> {
         if let Err(err) = Self::generate().await {
+            if !Self::generation_allows_fallback(&err) {
+                return Err(err);
+            }
             let error_msg: String = err.to_string().into();
             logging!(error, Type::Config, "生成运行时配置失败: {}", error_msg);
             CoreManager::global()
@@ -211,6 +217,14 @@ impl Config {
         }
     }
 
+    fn generation_allows_fallback(_error: &anyhow::Error) -> bool {
+        #[cfg(feature = "native-host")]
+        if _error.is::<crate::native_chain::ChainReapplyError>() {
+            return false;
+        }
+        true
+    }
+
     pub async fn generate_file() -> Result<PathBuf> {
         let yaml = Self::runtime_config_yaml().await?;
         Self::write_runtime_file(&yaml).await
@@ -245,24 +259,29 @@ impl Config {
     }
 
     pub(crate) async fn generate_with_profiles(profiles: &IProfiles) -> Result<()> {
-        let (mut config, exists_keys, logs, dns_override) = enhance::enhance(profiles).await?;
+        let (config, exists_keys, logs, dns_override) = enhance::enhance(profiles).await?;
+        let generated = IRuntime {
+            config: Some(config),
+            dns_override: Some(dns_override),
+            exists_keys,
+            chain_logs: logs,
+        };
+        Self::stage_generated_runtime(&Self::runtime().await, generated, profiles.current.as_deref(), &dirs::app_home_dir()?)
+    }
 
-        resolve_provider_path_conflicts(&mut config, &dirs::app_home_dir()?)?;
-        sanitize_tunnels_proxy(&mut config);
+    fn stage_generated_runtime(runtime: &Draft<IRuntime>, mut generated: IRuntime, _profile: Option<&str>, root: &Path) -> Result<()> {
+        let config = generated.config.as_mut().ok_or_else(|| anyhow!("generated configuration is unavailable"))?;
+        resolve_provider_path_conflicts(config, root)?;
+        sanitize_tunnels_proxy(config);
+        #[cfg(feature = "native-host")]
+        {
+            *config = crate::native_chain::reapply_active(config, _profile, root)?;
+        }
         // Apply only to generated core config so the saved choice survives the next launch.
         if let Some(port) = MixedPort::session_fallback() {
             config.insert(MIXED_PORT_KEY.into(), port.into());
         }
-
-        Self::runtime().await.edit_draft(|d| {
-            *d = IRuntime {
-                config: Some(config),
-                dns_override: Some(dns_override),
-                exists_keys,
-                chain_logs: logs,
-            }
-        });
-
+        runtime.edit_draft(|draft| *draft = generated);
         Ok(())
     }
 
@@ -376,6 +395,138 @@ fn collect_names(config: &Mapping, list_key: &str, out: &mut HashSet<String>) {
             && !n.is_empty()
         {
             out.insert(n.into());
+        }
+    }
+}
+
+#[cfg(all(test, feature = "native-host"))]
+mod native_chain_generation_tests {
+    use super::*;
+    use crate::native_chain::{Active, Chain, Store, links_match};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("tez-chain-generation-{}", nanoid::nanoid!(8)));
+            std::fs::create_dir(&root).unwrap();
+            let chain = Self::chain();
+            Store {
+                chains: vec![chain.clone()],
+                active: Some(Active { id: chain.id.clone(), profile: "fixture".into(), chain, previous: Some("A".into()) }),
+            }.save(&root).unwrap();
+            Self(root)
+        }
+
+        fn chain() -> Chain {
+            Chain { id: "fixture-chain".into(), name: "Two hops".into(), group: "Fixture".into(), nodes: vec!["A".into(), "B".into()] }
+        }
+
+        fn generated() -> Mapping {
+            serde_yaml_ng::from_str("mode: rule\nproxies:\n- {name: A, type: socks5}\n- {name: B, type: socks5}\nproxy-groups:\n- {name: Fixture, type: select, proxies: [A, B]}\n").unwrap()
+        }
+
+        fn rebuild(&self, config: Mapping, profile: &str) -> Result<Mapping> {
+            let runtime = Draft::new(IRuntime::default());
+            Config::stage_generated_runtime(&runtime, IRuntime { config: Some(config), ..Default::default() }, Some(profile), &self.0)?;
+            Ok(runtime.latest_arc().config.clone().unwrap())
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+    }
+
+    #[test]
+    fn native_subscription_generation_retains_active_chain() {
+        let fixture = Fixture::new();
+        let next = fixture.rebuild(Fixture::generated(), "fixture").unwrap();
+        assert!(links_match(&next, &Fixture::chain()), "subscription regeneration must retain both hops");
+    }
+
+    #[test]
+    fn native_proxy_settings_generation_retains_active_chain() {
+        let fixture = Fixture::new();
+        let mut generated = Fixture::generated();
+        generated.insert("allow-lan".into(), true.into());
+        generated.insert("tun".into(), serde_yaml_ng::from_str::<Value>("{enable: false, mtu: 1400}").unwrap());
+        let next = fixture.rebuild(generated, "fixture").unwrap();
+        assert!(links_match(&next, &Fixture::chain()), "settings regeneration must retain both hops");
+        assert_eq!(next["allow-lan"].as_bool(), Some(true));
+        assert_eq!(next["tun"]["mtu"].as_u64(), Some(1400));
+    }
+
+    #[test]
+    fn native_chain_generation_rejects_missing_node_or_group_without_publishing() {
+        let fixture = Fixture::new();
+        let original = crate::native_chain::change_links(&Fixture::generated(), &Fixture::chain(), true).unwrap();
+        let runtime = Draft::new(IRuntime { config: Some(original.clone()), ..Default::default() });
+        for section in ["proxies", "proxy-groups"] {
+            let mut generated = Fixture::generated();
+            generated.remove(section);
+            let result = Config::stage_generated_runtime(&runtime, IRuntime { config: Some(generated), ..Default::default() }, Some("fixture"), &fixture.0);
+            let error = result.expect_err(&format!("removing {section} must reject the rebuild instead of dropping the chain"));
+            assert!(error.to_string().contains("CHAIN_REAPPLY_FAILED"));
+            assert!(!Config::generation_allows_fallback(&error), "an invalid active chain must not start a single-hop default configuration");
+            assert_eq!(runtime.data_arc().config.as_ref(), Some(&original));
+            assert_eq!(runtime.latest_arc().config.as_ref(), Some(&original));
+        }
+        assert!(Config::generation_allows_fallback(&anyhow!("unrelated generation error")));
+    }
+
+    #[test]
+    fn native_chain_generation_does_not_cross_profiles() {
+        let fixture = Fixture::new();
+        let next = fixture.rebuild(Fixture::generated(), "other").unwrap();
+        assert!(!links_match(&next, &Fixture::chain()));
+    }
+
+    #[test]
+    fn native_chain_generation_rejects_changed_group_or_conflicting_nodes() {
+        let fixture = Fixture::new();
+        for group in ["{name: Fixture, type: load-balance, proxies: [A, B]}", "{name: Fixture, type: select, proxies: [A]}"] {
+            let mut generated = Fixture::generated();
+            generated.insert("proxy-groups".into(), Value::Sequence(vec![serde_yaml_ng::from_str(group).unwrap()]));
+            assert!(fixture.rebuild(generated, "fixture").is_err());
+        }
+        let mut generated = Fixture::generated();
+        generated.get_mut("proxies").unwrap().as_sequence_mut().unwrap()
+            .push(serde_yaml_ng::from_str("{name: A, type: socks5}").unwrap());
+        assert!(fixture.rebuild(generated, "fixture").is_err());
+        let mut generated = Fixture::generated();
+        generated.get_mut("proxies").unwrap().as_sequence_mut().unwrap()[1]
+            .as_mapping_mut().unwrap().insert("dialer-proxy".into(), "Other".into());
+        assert!(fixture.rebuild(generated, "fixture").is_err());
+    }
+
+    #[test]
+    fn native_chain_generation_supports_existing_links_and_include_all_groups() {
+        let fixture = Fixture::new();
+        let generated = crate::native_chain::change_links(&Fixture::generated(), &Fixture::chain(), true).unwrap();
+        assert!(links_match(&fixture.rebuild(generated, "fixture").unwrap(), &Fixture::chain()));
+        let mut generated = Fixture::generated();
+        generated.insert("proxy-groups".into(), serde_yaml_ng::from_str("[{name: Fixture, type: select, include-all-proxies: true}]").unwrap());
+        assert!(links_match(&fixture.rebuild(generated, "fixture").unwrap(), &Fixture::chain()));
+        let mut store = Store::load(&fixture.0).unwrap();
+        store.active.as_mut().unwrap().chain.group = "GLOBAL".into();
+        store.save(&fixture.0).unwrap();
+        let mut generated = Fixture::generated();
+        generated.remove("proxy-groups");
+        assert!(links_match(&fixture.rebuild(generated, "fixture").unwrap(), &Fixture::chain()));
+    }
+
+    #[test]
+    fn native_chain_generation_rejects_unverified_filtered_membership() {
+        let fixture = Fixture::new();
+        for group in [
+            "{name: Fixture, type: select, include-all-proxies: true, filter: '^A$'}",
+            "{name: Fixture, type: select, proxies: [A, B], exclude-filter: '^B$'}",
+            "{name: Fixture, type: select, proxies: [A, B], exclude-type: socks5}",
+        ] {
+            let mut generated = Fixture::generated();
+            generated.insert("proxy-groups".into(), Value::Sequence(vec![serde_yaml_ng::from_str(group).unwrap()]));
+            let error = fixture.rebuild(generated.clone(), "fixture").unwrap_err();
+            assert!(error.to_string().contains("filtered strategy-group membership cannot be verified"));
+            assert!(!Config::generation_allows_fallback(&error));
+            assert!(fixture.rebuild(generated, "other").is_ok(), "inactive chains must not restrict another profile's groups");
         }
     }
 }

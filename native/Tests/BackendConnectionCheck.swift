@@ -72,7 +72,9 @@ struct BackendConnectionCheck {
             if mode == "renewal-unsafe" { capabilities.append("native_save_profile") }
             try emit(.hello(sessionID: String(getpid()), capabilities: capabilities))
         } else if mode.hasPrefix("prepared-") || mode.hasPrefix("recovery-") {
-            try emit(.hello(sessionID: "fixture", capabilities: ["native_subscribe", "native_get_snapshot", "native_prepare_shutdown"]))
+            var capabilities = ["native_subscribe", "native_get_snapshot", "native_prepare_shutdown"]
+            if mode == "prepared-service-install" { capabilities.append("native_install_service") }
+            try emit(.hello(sessionID: "fixture", capabilities: capabilities))
         } else if mode == "automatic-readonly" {
             try emit(.hello(sessionID: "fixture", capabilities: ["native_continuous_session", "native_subscribe", "native_get_snapshot", "native_inspect_core", "native_claim_core", "native_install_service"]))
         } else if mode == "automatic-unsafe" {
@@ -99,14 +101,14 @@ struct BackendConnectionCheck {
                 guard params["confirmed"] == .bool(true) else { exit(2) }
                 try Data("claimed".utf8).write(to: claimedFile)
                 try emit(.response(id: id, outcome: .result(.object(["claimed": .bool(true), "reconnectRequired": .bool(true)]))))
-            } else if command == "native_install_service" && requestedMode.hasPrefix("automatic-install") {
+            } else if command == "native_install_service" && (requestedMode.hasPrefix("automatic-install") || mode == "prepared-service-install") {
                 guard params["confirmed"] == .bool(true) else { exit(2) }
                 Thread.sleep(forTimeInterval: requestedMode == "automatic-install-cancel" ? 1.5 : 0.25)
                 if requestedMode == "automatic-install-cancel" {
                     try emit(.response(id: id, outcome: .error(.init(detail: "Administrator authorization cancelled", code: .string("SERVICE_INSTALL_CANCELLED"), operation: nil))))
                 } else {
-                    try Data("installed".utf8).write(to: installedFile)
-                    try emit(.response(id: id, outcome: .result(.object(["installed": .bool(true), "reconnectRequired": .bool(true)]))))
+                    if mode != "prepared-service-install" { try Data("installed".utf8).write(to: installedFile) }
+                    try emit(.response(id: id, outcome: .result(.object(["installed": .bool(true), "reconnectRequired": .bool(mode != "prepared-service-install")]))))
                 }
             } else if command == "break-main" {
                 try FileHandle.standardOutput.close()
@@ -256,6 +258,23 @@ struct BackendConnectionCheck {
         precondition(automaticManaged.requiresManagedShutdown && !automaticManaged.isReadOnlyConnection)
         let managedAutomaticClosed = await automaticManaged.shutdownForTermination()
         precondition(managedAutomaticClosed && automaticManaged.state == .disconnected)
+        let managedInstall = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "prepared-service-install"],
+            timeout: .seconds(1), mode: .automatic)
+        managedInstall.connect()
+        try await wait { managedInstall.state == .connected }
+        let reinstalling = Task { try await managedInstall.installService(params: ["confirmed": .bool(true), "expected": .null]) }
+        try await Task.sleep(for: .milliseconds(20))
+        precondition(managedInstall.serviceSetupInProgress && managedInstall.workspaceBusy,
+                     "Managed service reinstallation must retain its authorization lease")
+        precondition(managedInstall.requiresManagedShutdown && managedInstall.blocksTermination)
+        let quitDuringReinstall = await managedInstall.shutdownForTermination()
+        precondition(!quitDuringReinstall && managedInstall.state == .connected)
+        let reinstalled = try await reinstalling.value
+        guard case .object(let reinstallFields) = reinstalled else { fatalError() }
+        precondition(reinstallFields["installed"] == .bool(true) && reinstallFields["reconnectRequired"] == .bool(false))
+        precondition(!managedInstall.serviceSetupInProgress && !managedInstall.workspaceBusy && managedInstall.state == .connected)
+        let reinstalledClosed = await managedInstall.shutdownForTermination()
+        precondition(reinstalledClosed && managedInstall.state == .disconnected)
         let claimedAutomatic = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-claim"],
             timeout: .seconds(1), mode: .automatic)
         claimedAutomatic.connect()

@@ -32,6 +32,8 @@ pub const CAPABILITIES: &[&str] = &[
     "native_save_profile",
     "native_select_route",
     "native_close_connection",
+    "native_get_proxy_config", "native_patch_proxy_config",
+    "native_get_proxy_chains", "native_save_proxy_chain", "native_delete_proxy_chain", "native_activate_proxy_chain", "native_deactivate_proxy_chain",
     "native_core_start",
     "native_core_stop",
     "native_core_restart",
@@ -133,7 +135,7 @@ pub(crate) fn inspect_bundle(executable: &Path) -> Result<BundlePaths> {
         "managed Helpers directory must not traverse symlinks"
     );
     for core in crate::config::IVerge::VALID_CLASH_CORES {
-        ordinary_file(&helpers.join(core), true)?;
+        ordinary_file(&helpers.join(crate::core::service::native_core_name(core)), true)?;
     }
     let resources = contents.join("Resources").join("resources");
     ensure!(
@@ -264,9 +266,28 @@ fn dispatch_with(
 }
 
 fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
+    if crate::native_chain::COMMANDS.contains(&command) {
+        return tauri::async_runtime::block_on(crate::native_chain::dispatch(command, params));
+    }
+    if crate::native_proxy::COMMANDS.contains(&command) {
+        return tauri::async_runtime::block_on(crate::native_proxy::dispatch(command, params));
+    }
     #[cfg(target_os = "macos")]
     if command == "native_upgrade_core" {
         return tauri::async_runtime::block_on(crate::native_ownership::upgrade(params));
+    }
+    #[cfg(target_os = "macos")]
+    if command == "native_install_service" {
+        return tauri::async_runtime::block_on(crate::native_ownership::install_managed_service(params));
+    }
+    #[cfg(target_os = "macos")]
+    if command == "native_inspect_core" {
+        if !params.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Err(CommandFailure::coded("INVALID_PARAMS", "Core inspection requires empty params"));
+        }
+        return tauri::async_runtime::block_on(async {
+            serde_json::to_value(crate::native_lifecycle::inspect().await).map_err(CommandFailure::plain)
+        });
     }
     #[cfg(target_os = "macos")]
     if command == "native_get_core_control" {
@@ -341,6 +362,10 @@ impl ManagedRecovery {
             crate::native_workspace::validate(command, params.clone())?;
             if crate::native_workspace::mutates(command) { self.cleanup_owed = true; }
         }
+        if crate::native_proxy::COMMANDS.contains(&command) {
+            if crate::native_proxy::parse(command,params.clone())?.is_some() { self.cleanup_owed = true; }
+        }
+        if crate::native_chain::COMMANDS.contains(&command) { crate::native_chain::validate(command,params.clone())?; }
         execute(command, params)
     }
 
@@ -455,6 +480,7 @@ fn run_stdio_with(restored: Option<clash_verge_service_ipc::OwnerSessionProof>) 
             Ok((socket, bundle, recovery, data))
         })()
         .context(ActivationRefused::Preflight)?;
+        let pac_server = tauri::async_runtime::block_on(crate::utils::server::start_native_pac_server())?;
         let activity_data = data.clone();
         let mut context = tauri::generate_context!();
         context.config_mut().app.windows.clear();
@@ -493,7 +519,12 @@ fn run_stdio_with(restored: Option<clash_verge_service_ipc::OwnerSessionProof>) 
                                 }
                             }
                             let mut capabilities = CAPABILITIES.to_vec();
-                            if tauri::async_runtime::block_on(crate::native_ownership::supported()) { capabilities.extend(["native_upgrade_core", "native_prepare_core_upgrade", "native_get_core_control"]); }
+                            if tauri::async_runtime::block_on(crate::native_ownership::supported()) {
+                                capabilities.extend(["native_upgrade_core", "native_prepare_core_upgrade", "native_get_core_control"]);
+                                if crate::native_ownership::service_tools_available() {
+                                    capabilities.extend(["native_install_service", "native_inspect_core"]);
+                                }
+                            }
                             crate::native_host::serve_managed_with_activity(
                                 || Ok(tauri::async_runtime::block_on(data.snapshot())),
                                 |query| Ok(tauri::async_runtime::block_on(activity_data.activity_query(query))),
@@ -596,12 +627,22 @@ fn run_stdio_with(restored: Option<clash_verge_service_ipc::OwnerSessionProof>) 
             .map_err(|_| anyhow!("managed runtime result lock was poisoned"))?
             .take()
             .unwrap_or_else(|| Err(anyhow!("managed runtime exited without confirmed pipe shutdown")));
-        outcome
+        outcome.and(tauri::async_runtime::block_on(pac_server.shutdown()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_pac_server_lifetime_brackets_managed_runtime() {
+        let source = include_str!("native_managed.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let initialization = production.find("start_native_pac_server");
+        assert!(initialization.is_some(), "native management must initialize its PAC listener");
+        assert!(initialization.unwrap() < production.find(".setup(move |app|").unwrap());
+        assert!(production.find("pac_server.shutdown()").unwrap() > production.find("app.run(move").unwrap());
+    }
+
     #[test]
     fn startup_refusal_codes_do_not_certify_runtime_failures() {
         use super::*;
@@ -831,7 +872,7 @@ mod tests {
             fs::create_dir_all(&resources)?;
             let fixture = Self(root);
             for name in
-                std::iter::once("tez-native-host").chain(crate::config::IVerge::VALID_CLASH_CORES.iter().copied())
+                std::iter::once("tez-native-host").chain(crate::config::IVerge::VALID_CLASH_CORES.iter().map(|name|crate::core::service::native_core_name(name)))
             {
                 let file = helpers.join(name);
                 fs::write(&file, b"injected fixture")?;
@@ -896,9 +937,9 @@ mod tests {
     fn bundle_gate_refuses_a_borrowed_core_symlink() -> Result<()> {
         let fixture = Fixture::new()?;
         let helpers = fixture.executable().parent().context("fixture parent")?.to_path_buf();
-        let core = helpers.join(crate::config::IVerge::VALID_CLASH_CORES[0]);
+        let core = helpers.join(crate::core::service::native_core_name(crate::config::IVerge::VALID_CLASH_CORES[0]));
         fs::remove_file(&core)?;
-        std::os::unix::fs::symlink(helpers.join(crate::config::IVerge::VALID_CLASH_CORES[1]), core)?;
+        std::os::unix::fs::symlink(helpers.join(crate::core::service::native_core_name(crate::config::IVerge::VALID_CLASH_CORES[1])), core)?;
         assert!(inspect_bundle(&fixture.executable()).is_err());
         Ok(())
     }

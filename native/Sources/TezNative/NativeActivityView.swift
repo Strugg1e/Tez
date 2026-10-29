@@ -2,36 +2,38 @@ import SwiftUI
 
 struct NativeActivityView: View {
     @Bindable var store: NativeBackendStore
-    @Binding var tab: ActivityTab
+    @Bindable var session: NativeActivitySession
     @Environment(TezPreviewPreferences.self) private var preferences
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
-    @State private var model = NativeActivityModel()
-    @State private var query = ""
-    @State private var paused = false
-    @State private var offset: UInt64 = 0
     @State private var isVisible = false
-    @State private var connectionID: String?
-    @State private var ruleID: UInt64?
-    @State private var providerID: String?
     @State private var pendingClose: NativeActivityConnection?
 
+    private var tab: ActivityTab { session.tab }
+    private var model: NativeActivityModel { session.model(for: tab) }
+    private var paused: Bool { session.paused }
     private var canRead: Bool { store.supports("native_get_activity") }
     private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
     private var connections: [NativeActivityConnection] { model.snapshot?.connections.items ?? [] }
     private var rules: [NativeActivityRule] { model.snapshot?.rules.items ?? [] }
     private var providers: [NativeActivityProvider] { model.snapshot?.providers.items ?? [] }
-    private var requestQuery: NativeActivityQuery { NativeActivityQuery(section: tab.rawValue, query: query, offset: offset, limit: tab.pageSize) }
+    private var requestQuery: NativeActivityQuery { session.context.request(for: tab) }
+    private var query: String { requestQuery.query }
+    private var offset: UInt64 { requestQuery.offset }
+    private var queryBinding: Binding<String> {
+        Binding(get: { query }, set: { session.context.search($0, in: tab) })
+    }
     private var pollKey: ActivityPollKey { ActivityPollKey(query: requestQuery, canRead: canRead) }
     private var showingRequestedPage: Bool { model.snapshotQuery == requestQuery }
-    private var selectedConnection: NativeActivityConnection? { connections.first { $0.id == connectionID } }
+    private var selectedConnection: NativeActivityConnection? { connections.first { $0.id == session.context.connectionID } }
     private var canClose: Bool {
-        store.supports("native_close_connection") && !store.workspaceBusy && model.closingID == nil && !model.isLoading
+        showingRequestedPage && store.supports("native_close_connection") && !store.workspaceBusy && model.closingID == nil && !model.isLoading
     }
     private var hasSelectedDetails: Bool {
-        switch tab {
-        case .connections: connections.contains { $0.id == connectionID }
-        case .rules: rules.contains { $0.index == ruleID }
-        case .providers: providers.contains { $0.name == providerID }
+        guard showingRequestedPage else { return false }
+        return switch tab {
+        case .connections: connections.contains { $0.id == session.context.connectionID }
+        case .rules: rules.contains { $0.index == session.context.ruleID }
+        case .providers: providers.contains { $0.name == session.context.providerID }
         }
     }
 
@@ -62,25 +64,27 @@ struct NativeActivityView: View {
         .background(Color(nsColor: .textBackgroundColor))
         .animation(motion.layout, value: hasSelectedDetails)
         .task(id: pollKey) {
-            guard canRead else { model.stop(); return }
+            let activeModel = model
+            guard canRead else { activeModel.stop(); return }
             let requested = requestQuery
-            model.select(requested)
+            activeModel.select(requested)
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
-            if !paused || model.snapshotQuery != requested { await refresh(requested) }
+            if !paused || activeModel.snapshotQuery != requested { await refresh(requested) }
             while !Task.isCancelled && canRead {
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
                 if !paused { await refresh(requested) }
             }
         }
         .onAppear { isVisible = true }
-        .onDisappear { isVisible = false; model.stop() }
-        .onChange(of: tab) { _, _ in query = ""; offset = 0 }
-        .onChange(of: query) { _, _ in offset = 0 }
+        .onDisappear { isVisible = false; model.stop(preservingRates: paused) }
         .onChange(of: requestQuery) { _, requested in
             model.select(requested)
-            connectionID = nil; ruleID = nil; providerID = nil
+            pendingClose = nil
         }
-        .onChange(of: paused) { _, paused in if paused { model.stop() } }
+        .onChange(of: tab) { previous, _ in
+            session.model(for: previous).stop(preservingRates: paused)
+        }
+        .onChange(of: paused) { _, paused in model.stop(preservingRates: paused) }
         .alert(item: $pendingClose) { row in
             Alert(title: Text("关闭这条连接？"),
                   message: Text("\(row.title)\n\(display(row.process))\n仅关闭选中的连接。应用可能自动重新连接。"),
@@ -105,12 +109,12 @@ struct NativeActivityView: View {
 
     private var controls: some View {
         HStack(spacing: 12) {
-            TezSearchField(prompt: tab.searchPrompt, text: $query, identifier: "live.activity.search",
+            TezSearchField(prompt: tab.searchPrompt, text: queryBinding, identifier: "live.activity.search",
                            surface: Color(nsColor: .textBackgroundColor))
             TezStatusLabel(title: !canRead ? "未同步" : paused ? "已暂停" : model.errorMessage != nil ? "读取失败" : "每秒更新", symbol: !canRead ? "clock" : paused ? "pause.circle" : "arrow.triangle.2.circlepath", motion: motion)
                 .fixedSize()
             TezToolButton(title: paused ? "继续刷新活动" : "暂停刷新活动", symbol: paused ? "play.fill" : "pause.fill",
-                          enabled: canRead, motion: motion) { paused.toggle() }
+                          enabled: canRead, motion: motion) { session.paused.toggle() }
                 .accessibilityIdentifier("live.activity.pause")
             TezToolButton(title: "刷新活动", symbol: "arrow.clockwise", enabled: canRead && !model.isLoading) {
                 let requested = requestQuery; Task { await refresh(requested) }
@@ -127,10 +131,10 @@ struct NativeActivityView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if !canRead && model.snapshot == nil {
+        if !canRead && !showingRequestedPage {
             TezEmptyState(title: "活动查询不可用", symbol: "waveform.path", detail: "当前后台未开放活动查询。")
-        } else if model.snapshot == nil {
-            if model.isLoading {
+        } else if model.snapshot == nil || !showingRequestedPage {
+            if canRead && model.errorMessage == nil {
                 VStack(spacing: 10) { ProgressView(); Text("正在读取活动").font(.callout).foregroundStyle(.secondary) }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -138,9 +142,6 @@ struct NativeActivityView: View {
             }
         } else if sectionState != "ready" {
             TezEmptyState(title: tab.unavailableTitle, symbol: "network.slash", detail: NativeActivityFormat.issue(sectionCode))
-        } else if visibleCount == 0 && !showingRequestedPage && model.errorMessage == nil {
-            VStack(spacing: 10) { ProgressView(); Text("正在查询").font(.callout).foregroundStyle(.secondary) }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if visibleCount == 0 {
             TezEmptyState(title: query.isEmpty ? tab.emptyTitle : "没有匹配结果", symbol: query.isEmpty ? tab.symbol : "magnifyingglass")
         } else {
@@ -153,7 +154,7 @@ struct NativeActivityView: View {
     }
 
     private var connectionTable: some View {
-        Table(connections, selection: $connectionID) {
+        Table(connections, selection: $session.context.connectionID) {
             TableColumn("目标") { row in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(row.title).lineLimit(1)
@@ -188,7 +189,7 @@ struct NativeActivityView: View {
     }
 
     private var ruleTable: some View {
-        Table(rules, selection: $ruleID) {
+        Table(rules, selection: $session.context.ruleID) {
             TableColumn("序号") { row in Text(row.index.formatted()).monospacedDigit() }.width(46)
             TableColumn("类型") { row in Text(display(row.type)).lineLimit(1) }.width(min: 90, ideal: 110)
             TableColumn("匹配内容") { row in Text(display(row.payload)).lineLimit(1) }.width(min: 160, ideal: 250)
@@ -198,7 +199,7 @@ struct NativeActivityView: View {
     }
 
     private var providerTable: some View {
-        Table(providers, selection: $providerID) {
+        Table(providers, selection: $session.context.providerID) {
             TableColumn("规则源") { row in Text(row.name).lineLimit(1) }.width(min: 160, ideal: 220)
             TableColumn("行为") { row in Text(display(row.behavior)).lineLimit(1) }.width(min: 80, ideal: 100)
             TableColumn("格式") { row in Text(display(row.format)).lineLimit(1) }.width(70)
@@ -212,25 +213,17 @@ struct NativeActivityView: View {
             VStack(alignment: .leading, spacing: 10) {
                 switch tab {
                 case .connections:
-                    if let row = model.snapshot?.connections.items.first(where: { $0.id == connectionID }) {
+                    if let row = connections.first(where: { $0.id == session.context.connectionID }) {
                         HStack {
                             TezInspectorHeader(title: row.title, close: clearSelection)
                             Button("关闭连接", systemImage: "xmark.circle", role: .destructive) { pendingClose = row }
                                 .disabled(!canClose || row.closeable != true)
                                 .accessibilityIdentifier("live.activity.detail.close")
                         }
-                        HStack(alignment: .top, spacing: 24) {
-                            detail("应用", display(row.process))
-                            detail("类型", display(row.type))
-                            detail("规则", display(row.rule))
-                            detail("开始时间", display(row.start))
-                        }
-                        Label(row.chains.isEmpty ? "—" : row.chains.joined(separator: " → "), systemImage: "point.3.connected.trianglepath.dotted")
-                            .font(.system(size: 12)).lineLimit(2).textSelection(.enabled)
-                            .help("线路：\(row.chains.joined(separator: " → "))")
+                        connectionExplanation(row)
                     }
                 case .rules:
-                    if let row = model.snapshot?.rules.items.first(where: { $0.index == ruleID }) {
+                    if let row = rules.first(where: { $0.index == session.context.ruleID }) {
                         TezInspectorHeader(title: display(row.payload), close: clearSelection)
                         HStack(alignment: .top, spacing: 28) {
                             detail("类型", display(row.type))
@@ -239,7 +232,7 @@ struct NativeActivityView: View {
                         }
                     }
                 case .providers:
-                    if let row = model.snapshot?.providers.items.first(where: { $0.name == providerID }) {
+                    if let row = providers.first(where: { $0.name == session.context.providerID }) {
                         TezInspectorHeader(title: row.name, close: clearSelection)
                         HStack(alignment: .top, spacing: 28) {
                             detail("类型", display(row.type))
@@ -252,7 +245,7 @@ struct NativeActivityView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, TezStyle.pageInset).padding(.vertical, 12)
         }
-        .frame(height: tab == .connections ? 136 : 112)
+        .frame(height: tab == .connections ? 220 : 112)
         .background { TezContentMaterial(material: .contentBackground) }
         .accessibilityIdentifier("live.activity.detail")
         .animation(motion.feedback, value: selectedDetailKey)
@@ -262,22 +255,53 @@ struct NativeActivityView: View {
         TezDetailField(title: title, value: value)
     }
 
+    private func connectionExplanation(_ row: NativeActivityConnection) -> some View {
+        let protocolLabel = [row.network, row.type].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " / ")
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 24) {
+                detail("应用 / 进程", row.process.flatMap { $0.isEmpty ? nil : $0 } ?? "未知")
+                detail("目标", row.destinationLabel ?? "未知")
+                detail("协议 / 类型", protocolLabel.isEmpty ? "未知" : protocolLabel)
+            }
+            HStack(alignment: .top, spacing: 24) {
+                detail("命中规则类型", row.ruleQuery ?? "未知")
+                detail("规则匹配内容", "内核未提供")
+                detail("开始时间", display(row.start))
+            }
+            HStack(alignment: .top, spacing: 12) {
+                Text("链路").foregroundStyle(.secondary)
+                Text(row.chains.isEmpty ? "未知" : row.chains.joined(separator: " · "))
+                    .textSelection(.enabled).lineLimit(2)
+                if !row.chains.isEmpty { Text("顺序未确认").foregroundStyle(.secondary).fixedSize() }
+            }.font(.system(size: 12))
+            HStack(spacing: 12) {
+                Button("搜索同类规则", systemImage: "line.3.horizontal.decrease") { session.showRules(for: row) }
+                    .disabled(row.ruleQuery == nil)
+                    .help("按内核返回的规则类型搜索；未提供精确规则条目")
+                    .accessibilityIdentifier("live.activity.detail.rules")
+                Button("查看相关日志", systemImage: "text.alignleft") { session.showLogs(for: row) }
+                    .disabled(row.logQuery == nil)
+                    .help("按目标关键词搜索，不代表同一连接的追踪记录")
+                    .accessibilityIdentifier("live.activity.detail.logs")
+            }.controlSize(.small)
+        }
+    }
+
     private var selectedDetailKey: String? {
         switch tab {
-        case .connections: connectionID
-        case .rules: ruleID.map(String.init)
-        case .providers: providerID
+        case .connections: session.context.connectionID
+        case .rules: session.context.ruleID.map(String.init)
+        case .providers: session.context.providerID
         }
     }
 
     private func clearSelection() {
-        connectionID = nil; ruleID = nil; providerID = nil
+        session.context.clearSelection(in: tab)
     }
 
     private var footer: some View {
         HStack(spacing: 12) {
             Text(footerCount)
-            if !showingRequestedPage { Text("显示上次结果") }
             Spacer(minLength: 0)
             if let updatedAt = model.updatedAt {
                 Text(updatedAt.formatted(date: .omitted, time: .standard)).monospacedDigit()
@@ -285,12 +309,12 @@ struct NativeActivityView: View {
             }
             if model.isLoading { ProgressView().controlSize(.mini) }
             HStack(spacing: 4) {
-                Button { offset = offset >= tab.pageSize ? offset - tab.pageSize : 0 } label: {
+                Button { session.context.move(to: offset >= tab.pageSize ? offset - tab.pageSize : 0, in: tab) } label: {
                     Image(systemName: "chevron.left").frame(width: 16, height: 16)
                 }
                 .help("上一页").accessibilityLabel("上一页").accessibilityIdentifier("live.activity.previous")
                 .disabled(!canRead || !showingRequestedPage || model.isLoading || !hasPaging || offset == 0)
-                Button { if let nextOffset { offset = nextOffset } } label: {
+                Button { if let nextOffset { session.context.move(to: nextOffset, in: tab) } } label: {
                     Image(systemName: "chevron.right").frame(width: 16, height: 16)
                 }
                 .help("下一页").accessibilityLabel("下一页").accessibilityIdentifier("live.activity.next")
@@ -312,6 +336,10 @@ struct NativeActivityView: View {
     private var nextOffset: UInt64? { switch tab { case .connections: model.snapshot?.connections.nextOffset; case .rules: model.snapshot?.rules.nextOffset; case .providers: model.snapshot?.providers.nextOffset } }
     private var hasPaging: Bool { matched != nil && responseOffset != nil }
     private var footerCount: String {
+        guard showingRequestedPage else {
+            if !canRead { return "数据不可用" }
+            return model.errorMessage == nil ? "正在查询" : "查询失败"
+        }
         guard sectionState == "ready" else { return "数据不可用" }
         guard let matched, hasPaging else { return "\(visibleCount) / \(total.formatted()) 项\(truncated ? " · 后台未提供分页" : "")" }
         let range = visibleCount == 0 ? "0" : "\((pageOffset + 1).formatted())–\((pageOffset + UInt64(visibleCount)).formatted())"
@@ -322,30 +350,22 @@ struct NativeActivityView: View {
 
     private func refresh(_ requested: NativeActivityQuery) async {
         guard isVisible, canRead, !store.workspaceBusy, model.closingID == nil, requested == requestQuery, !Task.isCancelled else { return }
-        await model.refresh(query: requested) { try await store.request("native_get_activity", params: requested.params, timeout: .seconds(15)) }
-        if let connectionID, model.snapshot?.connections.items.contains(where: { $0.id == connectionID }) != true { self.connectionID = nil }
+        let activeModel = model
+        await activeModel.refresh(query: requested) { try await store.request("native_get_activity", params: requested.params, timeout: .seconds(15)) }
+        guard requested == requestQuery, activeModel.snapshotQuery == requested, let snapshot = activeModel.snapshot else { return }
+        session.context.reconcileSelection(in: snapshot, for: tab)
     }
 
     private func close(_ row: NativeActivityConnection) {
-        guard store.supports("native_close_connection"), !store.workspaceBusy, model.closingID == nil, row.closeable == true else { return }
+        guard tab == .connections, canClose, row.closeable == true else { return }
+        let activeModel = model
         Task { @MainActor in
-            _ = await model.close(id: row.id) {
+            _ = await activeModel.close(id: row.id) {
                 try await store.request("native_close_connection", params: ["id": .string(row.id)], serialWorkspace: true)
             }
             await refresh(requestQuery)
         }
     }
-}
-
-enum ActivityTab: String, CaseIterable, Identifiable {
-    case connections, rules, providers
-    var id: Self { self }
-    var pageSize: UInt64 { switch self { case .connections: 128; case .rules: 256; case .providers: 64 } }
-    var title: String { switch self { case .connections: "连接"; case .rules: "规则"; case .providers: "规则源" } }
-    var symbol: String { switch self { case .connections: "network"; case .rules: "line.3.horizontal.decrease"; case .providers: "shippingbox" } }
-    var searchPrompt: String { switch self { case .connections: "搜索连接"; case .rules: "搜索规则"; case .providers: "搜索规则源" } }
-    var emptyTitle: String { switch self { case .connections: "暂无活动连接"; case .rules: "暂无规则"; case .providers: "暂无规则源" } }
-    var unavailableTitle: String { switch self { case .connections: "连接数据不可用"; case .rules: "规则数据不可用"; case .providers: "规则源数据不可用" } }
 }
 
 private struct ActivityPollKey: Hashable {

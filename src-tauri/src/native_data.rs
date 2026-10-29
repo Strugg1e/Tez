@@ -290,6 +290,17 @@ mod tests {
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
     }
 
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    #[test]
+    fn native_default_controller_does_not_use_legacy_socket() {
+        let fixture = Fixture::new();
+        let automatic = NativeData::new_attach(fixture.0.clone(), None).unwrap();
+        let expected = if cfg!(feature = "verge-dev") { "tez-mihomo-dev.sock" } else { "tez-mihomo.sock" };
+        assert_eq!(automatic.socket_path.file_name().unwrap(), expected);
+        let explicit = fixture.0.join("verge-mihomo.sock");
+        assert_eq!(NativeData::new_attach(fixture.0.clone(), Some(explicit.clone())).unwrap().socket_path, explicit);
+    }
+
     #[tokio::test]
     async fn missing_and_invalid_metadata_are_sanitized() {
         let fixture = Fixture::new();

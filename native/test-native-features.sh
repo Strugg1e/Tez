@@ -10,9 +10,14 @@ swiftc -target "$(uname -m)-apple-macosx14.0" -module-cache-path .build/module-c
     Sources/TezNative/BackendConnection.swift \
     Sources/TezNative/TezStyle.swift \
     Sources/TezNative/TezUI.swift \
+    Sources/TezNative/TezSettingsView.swift \
     Sources/TezNative/NativeActivity.swift \
     Sources/TezNative/NativeActivityView.swift \
     Sources/TezNative/NativeFeatureViews.swift \
+    Sources/TezNative/NativePendingChanges.swift \
+    Sources/TezNative/NativeConnectionOverview.swift \
+    Sources/TezNative/NativeMenuBarPanel.swift \
+    Sources/TezNative/NativeProxyControls.swift \
     Sources/TezNative/NativeLatency.swift \
     Sources/TezNative/NativeSubscriptions.swift \
     Tests/NativeFeaturesCheck.swift -o .build/native-features-check

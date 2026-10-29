@@ -230,7 +230,7 @@ final class NativeBackendStore {
     }
 
     func installService(params: [String: BackendJSON]) async throws -> BackendJSON {
-        guard mode == .automatic, observerSession, supports("native_install_service"), !serviceSetupInProgress else {
+        guard mode != .attach, state == .connected, supports("native_install_service"), !serviceSetupInProgress else {
             throw NativeBackendError.unavailable("当前连接未开放后台服务更新")
         }
         serviceSetupInProgress = true

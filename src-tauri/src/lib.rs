@@ -27,6 +27,10 @@ mod native_activity;
 #[cfg(feature = "native-host")]
 mod native_network;
 #[cfg(feature = "native-host")]
+mod native_proxy;
+#[cfg(feature = "native-host")]
+mod native_chain;
+#[cfg(feature = "native-host")]
 mod native_workspace;
 #[cfg(feature = "native-host")]
 mod native_backup;

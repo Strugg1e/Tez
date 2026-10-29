@@ -13,6 +13,26 @@ struct NativeSubscriptionDetails: Decodable {
     var nextUpdate: Int64?
 }
 
+struct NativeSubscriptionDraft: Equatable {
+    var name = ""
+    var url = ""
+    var localContent = "proxies: []\nproxy-groups: []\nrules: []\n"
+    var kind = "remote"
+    var intervalText = "1440"
+    var autoUpdate = true
+    var withProxy = false
+
+    var interval: Int64? {
+        let text = intervalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+        return Int64(text)
+    }
+    var intervalError: String? {
+        guard let interval else { return "请输入整数分钟，不支持小数或其他字符。" }
+        return (1440...525600).contains(interval) ? nil : "更新间隔必须为 1440–525600 分钟。"
+    }
+}
+
 struct NativeSubscriptionSheet: View {
     let store: NativeBackendStore
     let profile: NativeProfileItem?
@@ -20,24 +40,31 @@ struct NativeSubscriptionSheet: View {
     @Environment(TezPreviewPreferences.self) private var preferences
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var operation = NativeFeatureOperation()
-    @State private var name = ""
-    @State private var url = ""
-    @State private var localContent = "proxies: []\nproxy-groups: []\nrules: []\n"
-    @State private var kind = "remote"
-    @State private var interval = 1440
-    @State private var autoUpdate = true
-    @State private var withProxy = false
+    @State private var draft: NativeSubscriptionDraft
+    @State private var baseline: NativeSubscriptionDraft?
     @State private var revealsURL = false
     @State private var showsImporter = false
     @State private var confirmsDelete = false
     @State private var confirmsActivation = false
+    @State private var confirmsClose = false
     @State private var details: NativeSubscriptionDetails?
     private var isCurrent: Bool { profile?.uid == store.snapshot?.profiles.current }
-    private var isRemote: Bool { (profile?.type ?? kind) == "remote" }
+    private var isRemote: Bool { draft.kind == "remote" }
+    private var dirty: Bool { baseline.map { draft != $0 } ?? false }
     private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
     private var canSave: Bool {
-        !operation.busy && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && (!isRemote || (!url.isEmpty && (1440...525600).contains(interval)))
+        !operation.busy && baseline != nil && canWrite && !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (!isRemote || (!draft.url.isEmpty && draft.intervalError == nil))
+    }
+
+    init(store: NativeBackendStore, profile: NativeProfileItem?) {
+        self.store = store
+        self.profile = profile
+        var initial = NativeSubscriptionDraft()
+        initial.name = profile?.name ?? ""
+        initial.kind = profile?.type ?? "remote"
+        _draft = State(initialValue: initial)
+        _baseline = State(initialValue: profile == nil ? initial : nil)
     }
 
     var body: some View {
@@ -45,27 +72,45 @@ struct NativeSubscriptionSheet: View {
             HStack(spacing: 10) {
                 Image(systemName: profile == nil ? "doc.badge.plus" : "slider.horizontal.3").foregroundStyle(TezStyle.accent)
                 Text(profile == nil ? "添加配置" : "配置管理").font(.system(size: 15, weight: .semibold))
+                if dirty {
+                    Text("未保存").font(.caption).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("subscription.dirty")
+                }
                 Spacer()
                 if operation.busy { ProgressView().controlSize(.small) }
-                TezToolButton(title: "关闭配置管理", symbol: "xmark", enabled: !operation.busy) { dismiss() }
+                TezToolButton(title: "关闭配置管理", symbol: "xmark", enabled: !operation.busy) { close() }
+                    .accessibilityIdentifier("subscription.close")
             }.padding(20)
             Divider()
             Form {
                 if profile == nil {
-                    Picker("来源", selection: $kind) { Text("订阅").tag("remote"); Text("本地 YAML").tag("local") }.pickerStyle(.segmented)
+                    Picker("来源", selection: $draft.kind) { Text("订阅").tag("remote"); Text("本地 YAML").tag("local") }.pickerStyle(.segmented)
                 }
-                TextField("名称", text: $name)
+                TextField("名称", text: $draft.name).disabled(!canWrite)
+                    .accessibilityIdentifier("subscription.name")
                 if isRemote {
                     Section("订阅") {
                         HStack {
-                            if revealsURL { TextField("订阅地址", text: $url) }
-                            else { SecureField("订阅地址", text: $url) }
+                            Group {
+                                if revealsURL { TextField("订阅地址", text: $draft.url) }
+                                else { SecureField("订阅地址", text: $draft.url) }
+                            }.disabled(!canWrite).accessibilityIdentifier("subscription.url")
                             Button(revealsURL ? "隐藏地址" : "显示地址", systemImage: revealsURL ? "eye.slash" : "eye") { revealsURL.toggle() }
                                 .labelStyle(.iconOnly).help(revealsURL ? "隐藏订阅地址" : "显示订阅地址")
                         }.privacySensitive()
-                        Toggle("自动更新", isOn: $autoUpdate)
-                        TextField("更新间隔（分钟）", value: $interval, format: .number.grouping(.never))
-                        Toggle("使用代理下载", isOn: $withProxy)
+                        Toggle("自动更新", isOn: $draft.autoUpdate).disabled(!canWrite)
+                        VStack(alignment: .leading, spacing: 6) {
+                            TextField("更新间隔（分钟）", text: $draft.intervalText).disabled(!canWrite)
+                                .accessibilityIdentifier("subscription.interval")
+                            Text("允许范围：1440–525600 分钟（1–365 天）")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if let error = draft.intervalError {
+                                Label(error, systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(.red)
+                                    .accessibilityIdentifier("subscription.interval.error")
+                            }
+                        }
+                        Toggle("使用代理下载", isOn: $draft.withProxy).disabled(!canWrite)
                         if let next = details?.nextUpdate { LabeledContent("下次更新", value: Date(timeIntervalSince1970: TimeInterval(next)).formatted()) }
                     }
                     if let usage = details?.usage {
@@ -78,26 +123,35 @@ struct NativeSubscriptionSheet: View {
                 } else if profile == nil {
                     Section("配置内容") {
                         Button("选择 YAML 文件…", systemImage: "doc.badge.plus") { showsImporter = true }
-                        TextEditor(text: $localContent).font(.system(size: 12, design: .monospaced)).frame(minHeight: 200)
-                    }
+                        TextEditor(text: $draft.localContent).font(.system(size: 12, design: .monospaced)).frame(minHeight: 200)
+                            .accessibilityLabel("配置内容").accessibilityIdentifier("subscription.content")
+                    }.disabled(!canWrite)
                 }
                 if profile != nil {
                     Section("操作") {
                         HStack {
                             Button("启用配置", systemImage: "checkmark.circle") { confirmsActivation = true }
-                                .disabled(isCurrent || !store.supports("native_activate_profile"))
+                                .disabled(dirty || isCurrent || !store.supports("native_activate_profile"))
+                                .help(dirty ? "请先保存修改，再启用配置。" : "启用此配置的已保存版本")
+                                .accessibilityIdentifier("subscription.activate")
                             if isRemote {
                                 Button("更新订阅", systemImage: "arrow.clockwise") { Task { await update() } }
-                                    .disabled(!store.supports("native_update_subscription"))
+                                    .disabled(dirty || !store.supports("native_update_subscription"))
+                                    .help(dirty ? "请先保存修改，或关闭并放弃更改后再更新订阅。" : "下载最新订阅")
                             }
                             Spacer()
                             Button("删除配置…", systemImage: "trash", role: .destructive) { confirmsDelete = true }
                                 .disabled(!store.supports("native_delete_profile"))
                         }
+                        if dirty {
+                            Text(isRemote ? "启用配置或更新订阅前，请先保存修改；或关闭并放弃更改。" : "启用配置前，请先保存修改；或关闭并放弃更改。")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .accessibilityIdentifier("subscription.activation.draftHint")
+                        }
                         reorderControls
                     }
                 }
-            }.formStyle(.grouped).disabled(operation.busy)
+            }.formStyle(.grouped).disabled(operation.busy || baseline == nil)
             Divider()
             HStack {
                 if let error = operation.error {
@@ -106,13 +160,27 @@ struct NativeSubscriptionSheet: View {
                     TezOperationFeedback(message: message, tone: .success)
                 }
                 Spacer()
+                if baseline == nil {
+                    Button("重试读取") { Task { await load() } }
+                        .disabled(operation.busy || !store.supports("native_subscription_details"))
+                }
                 Button(profile == nil ? "添加" : "保存", systemImage: "square.and.arrow.down") { Task { await save() } }
-                    .modifier(TezPrimaryActionStyle()).disabled(!canSave || !canWrite)
+                    .modifier(TezPrimaryActionStyle()).disabled(!canSave)
+                    .accessibilityIdentifier("subscription.save")
             }.padding(16)
         }
         .frame(width: 600, height: 560)
-        .interactiveDismissDisabled(operation.busy)
-        .task { name = profile?.name ?? ""; if profile != nil { await load() } }
+        .interactiveDismissDisabled(dirty || operation.busy)
+        .onExitCommand { close() }
+        .task { if profile != nil && baseline == nil { await load() } }
+        .onChange(of: draft) { _, _ in if dirty { operation.message = nil } }
+        .confirmationDialog("保存此配置的修改？", isPresented: $confirmsClose, titleVisibility: .visible) {
+            Button("保存并关闭") { Task { await save(closeAfterSaving: true) } }.disabled(!canSave)
+            Button("放弃更改", role: .destructive) { dismiss() }
+            Button("继续编辑", role: .cancel) {}
+        } message: {
+            Text(operation.error.map { "修改仍保留。\n\(String($0.prefix(240)))" } ?? "关闭后，未保存的修改会丢失。")
+        }
         .alert("删除此配置？", isPresented: $confirmsDelete) {
             Button("取消", role: .cancel) {}
             Button("删除", role: .destructive) { Task { await delete() } }
@@ -120,7 +188,7 @@ struct NativeSubscriptionSheet: View {
         .confirmationDialog("启用此配置？", isPresented: $confirmsActivation, titleVisibility: .visible) {
             Button("启用") { Task { await activate() } }
             Button("取消", role: .cancel) {}
-        } message: { Text("将重新验证并应用配置，当前连接可能中断。") }
+        } message: { Text("将启用「\(baseline?.name ?? profile?.name ?? "此配置")」的已保存版本。当前连接可能中断。") }
         .fileImporter(isPresented: $showsImporter, allowedContentTypes: [.plainText, .data]) { result in
             do {
                 let file = try result.get()
@@ -129,14 +197,18 @@ struct NativeSubscriptionSheet: View {
                 guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 2 * 1024 * 1024 else {
                     throw NativeBackendError.unavailable("文件超过 2 MiB")
                 }
-                localContent = try String(contentsOf: file, encoding: .utf8)
-                if name.isEmpty { name = file.deletingPathExtension().lastPathComponent }
+                draft.localContent = try String(contentsOf: file, encoding: .utf8)
+                if draft.name.isEmpty { draft.name = file.deletingPathExtension().lastPathComponent }
             } catch { operation.error = NativeFeatureError.message(error) }
         }
     }
 
     private var canWrite: Bool {
         store.supports(profile == nil ? (isRemote ? "native_import_subscription" : "native_create_local_profile") : "native_patch_subscription")
+    }
+    private func close() {
+        guard !operation.busy else { return }
+        if dirty { confirmsClose = true } else { dismiss() }
     }
     private var orderedProfiles: [NativeProfileItem] { store.snapshot?.profiles.items.filter { $0.type == "remote" || $0.type == "local" } ?? [] }
     private var selectedIndex: Int? { orderedProfiles.firstIndex { $0.uid == profile?.uid } }
@@ -149,37 +221,46 @@ struct NativeSubscriptionSheet: View {
         }
     }
     private func load() async {
-        guard let profile, let result = await operation.request(store, "native_subscription_details", ["uid": .string(profile.uid)]) else { return }
+        guard !dirty, let profile, let result = await operation.request(store, "native_subscription_details", ["uid": .string(profile.uid)]) else { return }
         do {
             let result = try result.decoded(NativeSubscriptionDetails.self)
-            details = result; name = result.name ?? ""; url = result.url ?? ""
-            interval = Int(result.interval); autoUpdate = result.autoUpdate; withProxy = result.withProxy
+            details = result; draft.name = result.name ?? ""; draft.url = result.url ?? ""
+            draft.intervalText = String(result.interval); draft.autoUpdate = result.autoUpdate; draft.withProxy = result.withProxy
+            baseline = draft
         } catch { operation.error = NativeFeatureError.message(error) }
     }
-    private func save() async {
+    private func save(closeAfterSaving: Bool = false) async {
+        guard canSave else { return }
+        let submitted = draft
         let params: [String: BackendJSON]
         let command: String
         if let profile {
             command = "native_patch_subscription"
-            var patch: [String: BackendJSON] = ["uid": .string(profile.uid), "name": .string(name), "interval": .integer(Int64(interval)),
-                "auto_update": .bool(autoUpdate), "with_proxy": .bool(withProxy)]
-            if isRemote { patch["url"] = .string(url) }
+            var patch: [String: BackendJSON] = ["uid": .string(profile.uid), "name": .string(submitted.name), "interval": .integer(submitted.interval ?? 1440),
+                "auto_update": .bool(submitted.autoUpdate), "with_proxy": .bool(submitted.withProxy)]
+            if isRemote { patch["url"] = .string(submitted.url) }
             params = patch
         } else if isRemote {
-            command = "native_import_subscription"; params = ["url": .string(url), "name": .string(name),
-                "interval": .integer(Int64(interval)), "auto_update": .bool(autoUpdate), "with_proxy": .bool(withProxy)]
+            command = "native_import_subscription"; params = ["url": .string(submitted.url), "name": .string(submitted.name),
+                "interval": .integer(submitted.interval ?? 1440), "auto_update": .bool(submitted.autoUpdate), "with_proxy": .bool(submitted.withProxy)]
         } else {
-            command = "native_create_local_profile"; params = ["name": .string(name), "content": .string(localContent)]
+            command = "native_create_local_profile"; params = ["name": .string(submitted.name), "content": .string(submitted.localContent)]
         }
-        guard await operation.request(store, command, params, refresh: true) != nil else { return }
-        if profile == nil { dismiss() } else { await load(); operation.message = "配置已保存" }
+        guard await operation.request(store, command, params, refresh: true) != nil else {
+            if closeAfterSaving { confirmsClose = true }
+            return
+        }
+        baseline = submitted
+        if profile == nil || closeAfterSaving { dismiss() }
+        else { await load(); if operation.error == nil { operation.message = "配置已保存" } }
     }
     private func update() async {
-        guard let profile, await operation.request(store, "native_update_subscription", ["uid": .string(profile.uid)], refresh: true) != nil else { return }
-        await load(); operation.message = "订阅已更新"
+        guard !dirty, let profile, await operation.request(store, "native_update_subscription", ["uid": .string(profile.uid)], refresh: true) != nil else { return }
+        await load(); if operation.error == nil { operation.message = "订阅已更新" }
     }
     private func activate() async {
-        guard let profile, await operation.request(store, "native_activate_profile", ["uid": .string(profile.uid)], refresh: true) != nil else { return }
+        guard baseline != nil, !dirty, !isCurrent, let profile,
+              await operation.request(store, "native_activate_profile", ["uid": .string(profile.uid)], refresh: true) != nil else { return }
         operation.message = "配置已启用"
     }
     private func delete() async {

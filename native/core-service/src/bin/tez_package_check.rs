@@ -91,12 +91,12 @@ async fn execute(mode: &str, root: &Path) -> Result<()> {
             "Refusing to replace an existing acceptance service"
         );
         let helpers = bundle.join("Contents/Helpers");
-        let cores = ["verge-mihomo", "verge-mihomo-alpha"].map(|name| management::CoreSource {
+        let cores = ["mihomo", "mihomo-alpha"].map(|name| management::CoreSource {
             name: name.into(),
             path: helpers.join(name),
         });
         management::install(
-            &helpers.join("clash-verge-service-install"),
+            &helpers.join("tez-service-install"),
             &cores,
             false,
             Some(unsafe { platform_lib::getegid() }),
@@ -112,7 +112,7 @@ async fn execute(mode: &str, root: &Path) -> Result<()> {
             "Stop the isolated fixture before uninstalling"
         );
         let tool = root.join("uninstall-tool");
-        std::fs::copy(bundle.join("Contents/Helpers/clash-verge-service-uninstall"), &tool)?;
+        std::fs::copy(bundle.join("Contents/Helpers/tez-service-uninstall"), &tool)?;
         let command = format!(
             "cd /; '{}' && /bin/rm -rf '/Library/Application Support/tez-acceptance-service' '/var/run/tez-acceptance-service' '/private/tmp/tez-acceptance-service.core-execution.lock'",
             tool.display()
@@ -155,7 +155,7 @@ async fn execute(mode: &str, root: &Path) -> Result<()> {
                     remote_providers: vec![],
                     core_path: service_paths()?
                         .core_dir()
-                        .join("verge-mihomo")
+                        .join("mihomo")
                         .to_string_lossy()
                         .into_owned(),
                 },

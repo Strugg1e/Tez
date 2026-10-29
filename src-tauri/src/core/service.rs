@@ -556,13 +556,14 @@ fn macos_service_tool_path(source: &Path) -> Result<PathBuf> {
 }
 
 fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
-    let sibling = current_exe()
+    let executable = current_exe()
         .map_err(|error| {
             anyhow::anyhow!(
                 "failed to locate the current executable while resolving Service core {clash_core:?}: {error}"
             )
-        })?
-        .with_file_name(format!("{clash_core}{bin_ext}"));
+        })?;
+    let name = if executable.file_name().is_some_and(|n| n == "tez-native-host") { native_core_name(clash_core) } else { clash_core };
+    let sibling = executable.with_file_name(format!("{name}{bin_ext}"));
 
     #[cfg(all(target_os = "macos", feature = "verge-dev"))]
     {
@@ -574,6 +575,10 @@ fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
 
     #[cfg(not(all(target_os = "macos", feature = "verge-dev")))]
     Ok(sibling)
+}
+
+pub(crate) fn native_core_name(name: &str) -> &str {
+    match name { "verge-mihomo" => "mihomo", "verge-mihomo-alpha" => "mihomo-alpha", _ => name }
 }
 
 #[cfg(target_os = "macos")]
@@ -614,8 +619,8 @@ fn uninstall_service() -> Result<()> {
     use runas::Command as RunasCommand;
     use std::os::windows::process::CommandExt as _;
 
-    let uninstall_path = packaged_service_tool_path("clash-verge-service-uninstall.exe", || {
-        Ok(dirs::service_path()?.with_file_name("clash-verge-service-uninstall.exe"))
+    let uninstall_path = packaged_service_tool_path("tez-service-uninstall.exe", || {
+        Ok(dirs::service_path()?.with_file_name("tez-service-uninstall.exe"))
     })?;
 
     if !uninstall_path.exists() {
@@ -643,8 +648,8 @@ fn uninstall_service() -> Result<()> {
 fn uninstall_service() -> Result<()> {
     logging!(info, Type::Service, "uninstall service");
 
-    let uninstall_path = packaged_service_tool_path("clash-verge-service-uninstall", || {
-        Ok(tauri::utils::platform::current_exe()?.with_file_name("clash-verge-service-uninstall"))
+    let uninstall_path = packaged_service_tool_path("tez-service-uninstall", || {
+        Ok(tauri::utils::platform::current_exe()?.with_file_name("tez-service-uninstall"))
     })?;
 
     if !uninstall_path.exists() {
@@ -702,8 +707,8 @@ fn linux_running_as_root() -> bool {
 fn uninstall_service() -> Result<()> {
     logging!(info, Type::Service, "uninstall service");
 
-    let uninstall_path = packaged_service_tool_path("clash-verge-service-uninstall", || {
-        Ok(dirs::service_path()?.with_file_name("clash-verge-service-uninstall"))
+    let uninstall_path = packaged_service_tool_path("tez-service-uninstall", || {
+        Ok(dirs::service_path()?.with_file_name("tez-service-uninstall"))
     })?;
 
     if !uninstall_path.exists() {
@@ -751,7 +756,7 @@ fn install_service() -> Result<()> {
 }
 
 fn invoke_service_install(cores: &[clash_verge_service_ipc::management::CoreSource], core_only: bool) -> Result<()> {
-    let name = format!("clash-verge-service-install{}", std::env::consts::EXE_SUFFIX);
+    let name = format!("tez-service-install{}", std::env::consts::EXE_SUFFIX);
     let installer = packaged_service_tool_path(&name, || {
         #[cfg(target_os = "linux")]
         let executable = tauri::utils::platform::current_exe()?;
@@ -2218,14 +2223,14 @@ mod tests {
 
         let root = TestDirectory::new("development-service-tool")?;
         let home = root.path().join("home");
-        let source = root.path().join("clash-verge-service-install");
+        let source = root.path().join("tez-service-install");
         std::fs::write(&source, b"development installer")?;
 
         let selected = service_tool_path_for(&source, Some(&home), true)?;
 
         assert_eq!(
             selected,
-            service_tools_staging_directory(&home).join("clash-verge-service-install")
+            service_tools_staging_directory(&home).join("tez-service-install")
         );
         assert_eq!(std::fs::read(&selected)?, b"development installer");
         assert_ne!(std::fs::metadata(&selected)?.permissions().mode() & 0o111, 0);
@@ -2520,7 +2525,7 @@ mod tests {
         assert!(
             !super::macos_service_install_markers()
                 .iter()
-                .any(|marker| marker == "/tmp/verge/clash-verge-service.sock")
+                .any(|marker| marker == "/tmp/verge/tez-service.sock")
         );
     }
 

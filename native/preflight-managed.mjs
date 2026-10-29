@@ -97,14 +97,14 @@ for (const [name, args] of [['systemProxy', ['--proxy']], ['systemDNS', ['--dns'
 
 const processes = command('/bin/ps', ['-axo', 'pid=,comm='])
 if (processes.ok) {
-  const names = new Set(['verge-mihomo', 'verge-mihomo-alpha', 'clash-verge-service', 'tez-native-host', 'TezNativePreview', 'Tez', 'tez'])
+  const names = new Set(['mihomo', 'mihomo-alpha', 'tez-service', 'verge-mihomo', 'verge-mihomo-alpha', 'clash-verge-service', 'tez-native-host', 'TezNativePreview', 'Tez', 'tez'])
   report.checks.relatedProcesses = processes.bytes.toString('utf8').split('\n').flatMap(line => {
     const match = line.trim().match(/^(\d+)\s+(.+)$/)
     if (!match) return []
     const name = path.basename(match[2])
     return names.has(name) ? [{ pid: Number(match[1]), name }] : []
   })
-  if (report.checks.relatedProcesses.some(item => ['verge-mihomo', 'verge-mihomo-alpha'].includes(item.name))) {
+  if (report.checks.relatedProcesses.some(item => ['mihomo', 'mihomo-alpha', 'verge-mihomo', 'verge-mihomo-alpha'].includes(item.name))) {
     blocked('ACTIVE_CORE', 'A core is present; do not stop it or acquire its service without user confirmation.')
   }
 } else {

@@ -1108,7 +1108,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("cvs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir(&directory)?;
-        let path = directory.join("verge-mihomo.sock");
+        let path = directory.join("mihomo.sock");
         let listener = tokio::net::UnixListener::bind(&path)?;
         let owner = OwnerIdentity::Unix {
             uid: unsafe { platform_lib::geteuid() },

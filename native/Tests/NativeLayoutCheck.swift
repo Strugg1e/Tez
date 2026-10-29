@@ -12,6 +12,10 @@ struct NativeLayoutCheck {
     private static var routeControlsEnabled: Bool {
         CommandLine.arguments.contains("--route-controls") || Bundle.main.object(forInfoDictionaryKey: "TezLayoutFixtureUI") as? Bool == true
     }
+    private static var managedServiceIdle: Bool { CommandLine.arguments.contains("--managed-service-idle") }
+    static let idleInspection = NativeCoreInspection(state: "stopped", source: "service", canStart: true,
+        reason: "idle-service", corePid: nil, serviceGeneration: nil, processes: [],
+        serviceProtocol: "2.6", serviceControlAvailable: true)
     static let inspection = NativeCoreInspection(state: "runningReadOnly", source: "service", canStart: false,
         reason: "service-upgrade-required", corePid: 123, serviceGeneration: 42,
         serviceStartedAt: 1793180000,
@@ -30,7 +34,7 @@ struct NativeLayoutCheck {
         try JSONDecoder().decode(BackendJSON.self, from: JSONEncoder().encode(value))
     }
 
-    static func snapshot(current: String? = nil, revision: String = "1") throws -> BackendJSON {
+    static func snapshot(current: String? = nil, revision: String = "1", mode: String = "global", systemProxy: Bool = true, tun: Bool = true) throws -> BackendJSON {
         let names = (1...24).map { $0 == 2 ? "Tokyo Residential - Long Route Name 02" : "Tokyo \(String(format: "%02d", $0))" }
         let records = Dictionary(uniqueKeysWithValues: names.enumerated().map { index, name in
             let id = "node-\(index)"
@@ -48,10 +52,10 @@ struct NativeLayoutCheck {
             current: "profile-1", items: profiles, message: nil),
             proxyView: NativeProxyView(schemaVersion: 1, orderSource: "core", providerState: "ready",
                 global: group, direct: nil, groups: [], records: records, standalone: [], providers: []),
-            core: NativeCoreSnapshot(state: "ready", message: nil, source: "service", lifecycle: inspection),
-            network: NativeNetworkSnapshot(systemProxy: NativeObservedSwitch(state: "ready", enabled: true),
-                pac: NativeObservedSwitch(state: "ready", enabled: false), tun: NativeObservedSwitch(state: "ready", enabled: true),
-                mode: NativeObservedMode(state: "ready", value: "global"))))
+            core: NativeCoreSnapshot(state: managedServiceIdle ? "unavailable" : "ready", message: nil, source: "service", lifecycle: managedServiceIdle ? nil : inspection),
+            network: NativeNetworkSnapshot(systemProxy: NativeObservedSwitch(state: "ready", enabled: systemProxy),
+                pac: NativeObservedSwitch(state: "ready", enabled: false), tun: NativeObservedSwitch(state: "ready", enabled: tun),
+                mode: NativeObservedMode(state: "ready", value: mode))))
     }
 
     static func fixture() throws {
@@ -61,12 +65,16 @@ struct NativeLayoutCheck {
         let routeControls = routeControlsEnabled
         var current: String?
         var revision = 1
+        var mode = "global"
+        var systemProxy = true
+        var tun = true
         var activityReads = 0
         var closedConnections: Set<String> = []
         let capabilities = ["native_continuous_session", "native_subscribe",
             "native_get_snapshot", "native_get_activity", "native_close_connection", "native_get_settings", "native_get_logs", "native_inspect_core", "native_subscription_details",
             "native_claim_core", "native_get_core_control", "native_prepare_core_upgrade", "native_upgrade_core", "native_install_service"]
-            + (routeControls ? ["native_select_route", "native_test_latency"] : [])
+            + (routeControls ? ["native_select_route", "native_test_latency", "native_patch_settings", "native_set_mode"] : [])
+            + (managedServiceIdle ? ["native_prepare_shutdown"] : [])
         try emit(.hello(sessionID: "layout-fixture", capabilities: capabilities))
         while let line = readLine() {
             guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { fatalError() }
@@ -76,25 +84,41 @@ struct NativeLayoutCheck {
                 guard case .string(let id) = params["id"], id.hasPrefix("connection-") else { fatalError() }
                 closedConnections.insert(id)
                 result = .object(["closed": .bool(true), "id": .string(id)])
-            case "native_subscribe", "native_get_snapshot": result = try snapshot(current: current, revision: String(revision))
+            case "native_subscribe", "native_get_snapshot": result = try snapshot(current: current, revision: String(revision), mode: mode, systemProxy: systemProxy, tun: tun)
+            case "native_set_mode" where routeControls:
+                guard case .string(let value) = params["mode"] else { fatalError() }
+                mode = value; revision += 1
+                result = .object(["applied": .bool(true)])
+            case "native_patch_settings" where routeControls:
+                guard case .object(let values) = params["values"] else { fatalError() }
+                if case .bool(let value) = values["enable_system_proxy"] { systemProxy = value }
+                if case .bool(let value) = values["enable_tun_mode"] { tun = value }
+                revision += 1
+                result = .object(["saved": .bool(true)])
             case "native_select_route" where routeControls:
                 guard case .string(let name) = params["name"] else { fatalError() }
                 Thread.sleep(forTimeInterval: 0.5)
                 current = name
                 revision += 1
-                result = .object(["applied": .bool(true), "persisted": .bool(true)])
+                result = .object(["applied": .bool(true), "persisted": .bool(true),
+                    "connectionCleanup": .object(["requested": .bool(true), "completed": .bool(false), "closed": .integer(0),
+                        "failure": .object(["code": .string("CONNECTION_CLOSE_FAILED"), "detail": .string("Isolated fixture cleanup refusal")])])])
             case "native_test_latency" where routeControls:
                 guard case .array(let names) = params["names"] else { fatalError() }
                 Thread.sleep(forTimeInterval: 0.45)
                 result = .object(["results": .array(names.enumerated().map { index, name in
                     .object(["name": name, "delay": .integer(Int64(38 + index * 17)), "error": .null])
                 })])
-            case "native_inspect_core": result = try json(inspection)
+            case "native_inspect_core": result = try json(managedServiceIdle ? idleInspection : inspection)
+            case "native_install_service":
+                guard params["confirmed"] == .bool(true), !managedServiceIdle || params["expected"] == .null else { fatalError() }
+                result = .object(["installed": .bool(true), "reconnectRequired": .bool(!managedServiceIdle)])
+            case "native_prepare_shutdown" where managedServiceIdle: result = .object(["safeToExit": .bool(true)])
             case "native_get_core_control": result = .object(["generation": .integer(42), "pid": .integer(123), "started_at": .integer(1793180000)])
             case "native_claim_core": result = .object(["claimed": .bool(true), "reconnectRequired": .bool(true)])
             case "native_prepare_core_upgrade": result = .object(["path": .string("/fixture/tez-" + String(repeating: "a", count: 64)), "sha256": .string(String(repeating: "a", count: 64)), "version": .string("fixture-1")])
             case "native_upgrade_core": result = .object(["outcome": .string("rolled_back"), "pid": .integer(124), "versionSelectionSaved": .bool(true)])
-            case "native_get_settings": result = .object(["values": .object([:]), "mode": .string("rule")])
+            case "native_get_settings": result = .object(["values": .object(["enable_system_proxy": .bool(systemProxy), "enable_tun_mode": .bool(tun)]), "mode": .string(mode)])
             case "native_subscription_details":
                 guard case .string(let uid) = params["uid"] else { fatalError() }
                 result = .object(["uid": .string(uid), "name": .string(profiles.first { $0.uid == uid }?.name ?? ""),
@@ -181,6 +205,8 @@ struct NativeLayoutCheck {
     }
 
     @MainActor static func check(app: NSApplication) async throws {
+        try checkLatencySort()
+        try checkTaskModels()
         let offline = TezConnectionPresentation(state: .failed, hasSnapshot: true, coreState: "ready", writable: true)
         precondition(offline.coreTitle == "内核状态未确认" && offline.context.contains("离线快照"))
         let connected = TezConnectionPresentation(state: .connected, hasSnapshot: true, coreState: "ready", writable: false)
@@ -190,10 +216,11 @@ struct NativeLayoutCheck {
         let defaults = UserDefaults(suiteName: suite)!
         let preferences = TezPreviewPreferences(defaults: defaults)
         let selection = LayoutSelection()
+        if managedServiceIdle { selection.section = .connection }
         if Bundle.main.object(forInfoDictionaryKey: "TezProfilesFixtureUI") as? Bool == true { selection.section = .profiles }
         if CommandLine.arguments.contains("--profile-search-check") { selection.section = .profiles }
         let store = NativeBackendStore(helperURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL,
-            arguments: ["--fixture"] + (routeControlsEnabled ? ["--route-controls"] : []), mode: .attach)
+            arguments: ["--fixture"] + (routeControlsEnabled ? ["--route-controls"] : []) + (managedServiceIdle ? ["--managed-service-idle"] : []), mode: managedServiceIdle ? .automatic : .attach)
         store.connect()
         for _ in 0..<200 {
             if store.state == .connected { break }
@@ -214,10 +241,24 @@ struct NativeLayoutCheck {
             return
         }
         if CommandLine.arguments.contains("--ui") || Bundle.main.object(forInfoDictionaryKey: "TezLayoutFixtureUI") as? Bool == true {
-            showUI(app: app, window: window, preferences: preferences, store: store, suite: suite)
+            showUI(app: app, window: window, preferences: preferences, store: store, selection: selection, suite: suite)
             return
         }
         defer { store.disconnect(); defaults.removePersistentDomain(forName: suite) }
+        if managedServiceIdle {
+            await settle(host)
+            precondition(store.snapshot?.core.lifecycle == nil && store.snapshot?.core.state == "unavailable")
+            precondition(store.supports("native_install_service") && store.requiresManagedShutdown && !store.isReadOnlyConnection)
+            let observed = try await store.request("native_inspect_core").decoded(NativeCoreInspection.self)
+            precondition(observed.canStart && observed.corePid == nil && observed.processes.isEmpty)
+            let result = try await store.installService(params: ["confirmed": .bool(true), "expected": .null])
+            guard case .object(let fields) = result else { fatalError() }
+            precondition(fields["installed"] == .bool(true) && fields["reconnectRequired"] == .bool(false))
+            let closed = await store.shutdownForTermination()
+            precondition(closed)
+            print("PASS: idle managed service reinstallation without a lifecycle snapshot uses explicit nil identity, retains its managed session and closes safely")
+            return
+        }
         for width in [1040.0, 800.0] {
             window.setContentSize(NSSize(width: width, height: width == 1040 ? 700 : 560))
             for scheme in [TezAppearance.light, .dark] {
@@ -293,6 +334,27 @@ struct NativeLayoutCheck {
         host.layoutSubtreeIfNeeded()
     }
 
+    static func checkLatencySort() throws {
+        let value = try NativeSnapshot.decode(Self.snapshot())
+        guard let view = value.proxyView, let group = view.global else { fatalError("Missing routes fixture") }
+        var rows = group.members.enumerated().map {
+            LiveRouteMember(member: $0.element, index: $0.offset, view: view, isCurrent: $0.element.name == group.now)
+        }
+        let missing = rows.filter { $0.sortDelay == nil }.map(\.id)
+        let ascending = rows.sorted(using: LiveRouteLatencyComparator())
+        let descending = rows.sorted(using: LiveRouteLatencyComparator(order: .reverse))
+        precondition(ascending.first?.sortDelay == 49 && descending.first?.sortDelay == 203)
+        for sorted in [ascending, descending] {
+            precondition(sorted.suffix(missing.count).map(\.id) == missing, "Failed and unmeasured routes must remain last in both directions")
+            precondition(Set(sorted.map(\.id)) == Set(rows.map(\.id)), "Sorting must preserve route identities")
+        }
+        rows[5].measuredLatency = NativeLatencyPayload.Result(name: rows[5].name, delay: 1, error: nil)
+        precondition(rows.sorted(using: LiveRouteLatencyComparator()).first?.id == rows[5].id, "Sorting must use fresh latency results")
+        rows[5].measuredLatency = NativeLatencyPayload.Result(name: rows[5].name, delay: nil, error: "timeout")
+        precondition(rows[5].sortDelay == nil, "A failed measurement must replace historical latency")
+        print("PASS: latency sorting in both directions, missing values last, stable identities and latest results")
+    }
+
     @MainActor static func profileSearchCheck(_ host: NSView) async throws {
         await settle(host)
         func fields(_ view: NSView) -> [NSTextField] {
@@ -329,6 +391,9 @@ struct NativeLayoutCheck {
             precondition(field.stringValue.isEmpty && restoredTable.numberOfRows == originalCount, "Profile clear did not restore the real list")
             let restoredHeights = (0..<restoredTable.numberOfRows).map { restoredTable.rect(ofRow: $0).height }
             precondition(restoredHeights == originalHeights, "Profile clear changed row geometry")
+            if query == "Research" {
+                precondition(restoredTable.selectedRow == 2, "Clearing search must keep Research selected, not return to the current Daily profile")
+            }
         }
         print("PASS: profile search and clear use the real native list")
     }
@@ -337,14 +402,43 @@ struct NativeLayoutCheck {
         (view as? NSTableView).map { [$0] } ?? view.subviews.flatMap { tables($0) }
     }
 
-    @MainActor static func showUI(app: NSApplication, window: NSWindow, preferences: TezPreviewPreferences, store: NativeBackendStore, suite: String) {
-        let target = LayoutMenuTarget(window: window, preferences: preferences, store: store, suite: suite)
+    @MainActor static func checkTaskModels() throws {
+        let snapshot = try NativeSnapshot.decode(snapshot())
+        let summary = NativeAccessSummary(snapshot: snapshot, connected: true)
+        precondition(summary.accessTitle == "系统代理与 TUN 已开启" && summary.routeTitle == "Tokyo 01")
+        precondition(NativeAccessSummary(snapshot: snapshot, connected: false).routeTitle == "连接后台后读取")
+        let direct = try NativeSnapshot.decode(Self.snapshot(mode: "direct", systemProxy: false, tun: false))
+        precondition(NativeAccessSummary(snapshot: direct, connected: true).routeTitle == "直连，不经过代理节点")
+        precondition(NativeAccessSummary(snapshot: direct, connected: true).accessTitle == "未开启流量接入")
+        let route = NativeRecentRoute(profileID: "profile-1", group: "GLOBAL", name: "Tokyo 01")
+        precondition(route.isAvailable(in: snapshot) && route.isCurrent(in: snapshot))
+        precondition(!NativeRecentRoute(profileID: "profile-2", group: "GLOBAL", name: "Tokyo 01").isAvailable(in: snapshot))
+        precondition(!NativeRecentRoute(profileID: "profile-1", group: "GLOBAL", name: "Missing").isAvailable(in: snapshot))
+        var selection = NativeRouteComparisonSelection()
+        for id in ["a", "a", "b", "c", "d"] { selection.add(id) }
+        precondition(selection.ids == ["a", "b", "c"] && selection.isFull)
+        selection.remove("b"); selection.add("d"); selection.retain(["a", "d"])
+        precondition(selection.ids == ["a", "d"])
+        selection.clear(); precondition(selection.ids.isEmpty)
+        let historical = NativeRouteMeasurement(sessionDate: nil, snapshotTime: "2026-10-29T10:00:00Z")
+        precondition(historical.origin == .snapshot && historical.date != nil)
+        let date = Date(timeIntervalSince1970: 100)
+        let fresh = NativeRouteMeasurement(sessionDate: date, snapshotTime: "2026-10-29T10:00:00Z")
+        precondition(fresh.origin == .session && fresh.date == date)
+        let failed = NativeRouteMeasurement(sessionDate: nil, snapshotTime: "2026-10-29T10:00:00Z", hasSessionResult: true)
+        precondition(failed.origin == .session && failed.date == nil)
+    }
+
+    @MainActor private static func showUI(app: NSApplication, window: NSWindow, preferences: TezPreviewPreferences, store: NativeBackendStore, selection: LayoutSelection, suite: String) {
+        let target = LayoutMenuTarget(window: window, preferences: preferences, store: store, selection: selection, suite: suite)
         uiTarget = target
         app.delegate = target
         let menu = NSMenu()
         let item = NSMenuItem(); let appMenu = NSMenu()
         for (title, selector, key) in [("Compact Window", #selector(LayoutMenuTarget.compact), "1"),
                                        ("Standard Window", #selector(LayoutMenuTarget.standard), "2"),
+                                       ("Open Menu Panel", #selector(LayoutMenuTarget.openMenuPanel), "b"),
+                                       ("Disconnect Fixture", #selector(LayoutMenuTarget.disconnectFixture), "0"),
                                        ("Toggle Dark Mode", #selector(LayoutMenuTarget.toggleDark), "d"),
                                        ("Toggle Protocol", #selector(LayoutMenuTarget.toggleProtocol), "p"),
                                        ("Toggle Reduced Motion", #selector(LayoutMenuTarget.toggleMotion), "m"),
@@ -363,9 +457,11 @@ private final class LayoutMenuTarget: NSObject, NSApplicationDelegate {
     let window: NSWindow
     let preferences: TezPreviewPreferences
     let store: NativeBackendStore
+    let selection: LayoutSelection
     let suite: String
-    init(window: NSWindow, preferences: TezPreviewPreferences, store: NativeBackendStore, suite: String) {
-        self.window = window; self.preferences = preferences; self.store = store; self.suite = suite
+    private var panel: NSWindow?
+    init(window: NSWindow, preferences: TezPreviewPreferences, store: NativeBackendStore, selection: LayoutSelection, suite: String) {
+        self.window = window; self.preferences = preferences; self.store = store; self.selection = selection; self.suite = suite
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ notification: Notification) {
@@ -378,4 +474,18 @@ private final class LayoutMenuTarget: NSObject, NSApplicationDelegate {
     @objc func toggleProtocol() { preferences.showProtocol.toggle() }
     @objc func toggleMotion() { preferences.reduceMotion.toggle() }
     @objc func toggleTransparency() { preferences.reduceTransparency.toggle() }
+    @objc func disconnectFixture() { store.disconnect() }
+    @objc func openMenuPanel() {
+        if let panel { panel.makeKeyAndOrderFront(nil); return }
+        let panel = NSWindow(contentRect: NSRect(x: window.frame.maxX - 340, y: window.frame.midY - 270, width: 340, height: 540),
+                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.title = "Tez 菜单面板 · 模拟数据"
+        panel.contentView = NSHostingView(rootView: NativeMenuBarPanel(store: store,
+            openWorkspace: { self.window.makeKeyAndOrderFront(nil) },
+            openRoutes: { self.selection.section = .routes; self.window.makeKeyAndOrderFront(nil) },
+            connect: { self.store.connect() }, quit: { NSApp.terminate(nil) }).environment(preferences))
+        self.panel = panel
+        panel.makeKeyAndOrderFront(nil)
+    }
 }

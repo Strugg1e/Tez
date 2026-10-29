@@ -56,31 +56,21 @@ struct TezNativeApp: App {
         }
 
         MenuBarExtra(Self.interfaceOnly ? "Tez 界面检查" : "Tez", systemImage: "network") {
-            Label(backend.state == .connected && backend.snapshot?.core.state == "ready" ? "内核运行中" : backend.statusText,
-                  systemImage: backend.state == .connected ? "checkmark.circle" : "exclamationmark.circle")
-            Button("显示 Tez", systemImage: "macwindow") { showWorkspace() }
-            Divider()
-            if backend.state == .connected {
-                Button("启动内核", systemImage: "play.fill") { performCoreCommand("native_core_start") }
-                    .disabled(coreOperationInProgress || backend.workspaceBusy || !backend.supports("native_core_start") || backend.snapshot?.core.state == "ready")
-                Button("重启内核", systemImage: "arrow.clockwise") { performCoreCommand("native_core_restart") }
-                    .disabled(coreOperationInProgress || backend.workspaceBusy || !backend.supports("native_core_restart"))
-                Button("停止内核", systemImage: "stop.fill") { performCoreCommand("native_core_stop") }
-                    .disabled(coreOperationInProgress || backend.workspaceBusy || !backend.supports("native_core_stop"))
-            } else if backend.state == .shutdownFailed {
-                Button("重试安全退出", systemImage: "arrow.clockwise") { backend.disconnect() }
-            } else {
-                Button("连接后台", systemImage: "link") { Task { await connectAndStart() } }
-                    .disabled(Self.interfaceOnly || coreOperationInProgress || backend.requiresManagedShutdown)
-            }
-            Divider()
-            SettingsLink { Label("设置…", systemImage: "gearshape") }
-            Button("退出 Tez", systemImage: "power") {
+            NativeMenuBarPanel(store: backend, openWorkspace: showWorkspace, openRoutes: {
+                selection = .routes
+                showWorkspace()
+            }, connect: {
+                guard !Self.interfaceOnly, !coreOperationInProgress else { return }
+                Task { await connectAndStart() }
+            }, quit: {
                 appDelegate.backend = backend
                 NSApplication.shared.terminate(nil)
-            }
+            })
+            .environment(preferences)
+            .tint(TezStyle.accent)
+            .preferredColorScheme(preferences.appearance.colorScheme)
         }
-        .menuBarExtraStyle(.menu)
+        .menuBarExtraStyle(.window)
 
         Settings {
             TezSettingsView(allowsBackendExamples: false, store: Self.interfaceOnly ? nil : backend)
@@ -107,16 +97,6 @@ struct TezNativeApp: App {
         }
         guard backend.supports("native_core_start") else { return }
         await executeCoreCommand("native_core_start")
-    }
-
-    @MainActor
-    private func performCoreCommand(_ command: String) {
-        guard !coreOperationInProgress, !backend.workspaceBusy, backend.supports(command) else { return }
-        coreOperationInProgress = true
-        Task { @MainActor in
-            defer { coreOperationInProgress = false }
-            await executeCoreCommand(command)
-        }
     }
 
     @MainActor

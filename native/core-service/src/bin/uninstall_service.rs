@@ -8,8 +8,6 @@ mod shared;
 use anyhow::Error;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
-#[cfg(all(target_os = "macos", not(feature = "development-channel")))]
-use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
 
 /// Removes approved cores after service deletion. Locked files are left for a later retry.
@@ -106,6 +104,7 @@ fn poll_until<T>(
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Error> {
+    if clash_verge_service_ipc::print_identity_if_requested() { return Ok(()); }
     use std::env;
     use std::path::Path;
 
@@ -115,8 +114,6 @@ fn main() -> Result<(), Error> {
     let _gate = enter_repair_gate()?;
     let debug = env::args().any(|arg| arg == "--debug");
 
-    #[cfg(not(feature = "development-channel"))]
-    let _ = uninstall_old_service();
     let bundle_path = format!(
         "/Library/PrivilegedHelperTools/{}.bundle",
         clash_verge_service_ipc::MACOS_SERVICE_ID
@@ -168,7 +165,7 @@ fn main() -> Result<(), Error> {
     }
 
     let _ = run_command("systemctl", &["daemon-reload"], debug);
-    let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
+    let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("tez-service");
     if target.exists() {
         std::fs::remove_file(&target)
             .map_err(|error| anyhow::anyhow!("Failed to remove service binary {target:?}: {error}"))?;
@@ -255,7 +252,7 @@ fn main() -> anyhow::Result<()> {
         Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {}
         Err(error) => return Err(error.into()),
     }
-    let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service.exe");
+    let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("tez-service.exe");
     if target.exists() {
         std::fs::remove_file(&target)
             .map_err(|error| anyhow::anyhow!("Failed to remove service binary {target:?}: {error}"))?;
@@ -272,6 +269,42 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::poll_until;
     use std::cell::Cell;
+
+    #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
+    #[test]
+    fn macos_uninstallation_does_not_cleanup_other_products() {
+        assert_eq!(clash_verge_service_ipc::MACOS_SERVICE_ID, "app.tez.service");
+        let source = include_str!("uninstall_service.rs");
+        let (_, macos_main) = source
+            .split_once("#[cfg(target_os = \"macos\")]\nfn main() -> Result<(), Error> {")
+            .expect("the macOS uninstaller entry point must be present");
+        let (macos_main, _) = macos_main
+            .split_once("#[cfg(target_os = \"linux\")]\nfn main() -> Result<(), Error> {")
+            .expect("the Linux uninstaller must follow the macOS uninstaller");
+        let compact: String = macos_main.chars().filter(|character| !character.is_whitespace()).collect();
+        let own_service_calls = [
+            "run_command(\"launchctl\",&[\"stop\",service_id],debug);",
+            "run_command(\"launchctl\",&[\"disable\",&format!(\"system/{}\",service_id)],debug);",
+            "run_command(\"launchctl\",&[\"bootout\",&format!(\"system/{}\",service_id)],debug);",
+        ];
+        assert_eq!(compact.matches("run_command(").count(), own_service_calls.len());
+        for call in own_service_calls {
+            assert!(compact.contains(call), "missing expected Tez uninstaller call: {call}");
+        }
+        for deletion in [
+            "std::fs::remove_file(&plist_file)",
+            "std::fs::remove_dir_all(&bundle_path)",
+        ] {
+            assert!(compact.contains(deletion), "missing expected Tez deletion: {deletion}");
+        }
+        assert!(macos_main.contains("let service_id = clash_verge_service_ipc::MACOS_SERVICE_ID;"));
+        assert!(
+            !macos_main.contains("uninstall_old_service"),
+            "uninstalling Tez must not invoke another product's helper cleanup"
+        );
+        assert!(!macos_main.contains("io.github.clashverge.helper"));
+        assert!(!include_str!("shared/mod.rs").contains("io.github.clashverge.helper"));
+    }
 
     #[test]
     fn poll_until_retries_transient_state_before_success() -> anyhow::Result<()> {

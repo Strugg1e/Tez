@@ -2,8 +2,11 @@ use crate::core::notify::NoticeStatus;
 use crate::core::notify::{Refresh, announce};
 use crate::{
     cmd,
-    config::{Config, PrfItem, PrfOption, profiles::profiles_update_item_safe},
-    core::{CoreManager, handle, tray, validate::ValidationOutcome},
+    config::{Config, IProfiles, PrfItem, PrfOption, profiles::profiles_update_item_safe},
+    core::{
+        CoreManager, handle, tray,
+        validate::{CoreConfigValidator, ValidationOutcome},
+    },
     utils::help::{mask_err, mask_url},
 };
 use anyhow::{Result, bail};
@@ -180,7 +183,7 @@ async fn perform_profile_update(
     let last_err = match result {
         Ok((strategy, mut item)) => {
             // A persistence error must not replay a successful download with another transport.
-            profiles_update_item_safe(uid, &mut item).await?;
+            profiles_update_item_safe(uid, &mut item, validate_downloaded_profile).await?;
             if !matches!(strategy, Strategy::Configured) {
                 handle::Handle::notice(NoticeStatus::UpdateWithClashProxy, profile_name.as_str());
             }
@@ -197,6 +200,26 @@ async fn perform_profile_update(
         );
     }
     bail!(last_err)
+}
+
+async fn validate_downloaded_profile(candidate: IProfiles) -> Result<()> {
+    if handle::Handle::global().is_exiting() {
+        bail!("application is exiting");
+    }
+    let config_write = Config::lock_config_write().await;
+    let _update = CoreManager::global().claim_config_update(&config_write)?;
+    let runtime = Config::runtime().await;
+    let transaction = clash_verge_draft::DraftTransaction::begin(vec![&runtime])?;
+    Config::generate_with_profiles(&candidate).await?;
+    let yaml = Config::runtime_config_yaml().await?;
+    let outcome = CoreConfigValidator::global()
+        .validate_config_outcome_with(&yaml)
+        .await?;
+    transaction.rollback();
+    if !outcome.is_valid() {
+        bail!("Downloaded subscription failed validation: {outcome}");
+    }
+    Ok(())
 }
 
 #[tracing::instrument(skip_all, level = "info", fields(uid = %uid, manual = is_mannual_trigger))]

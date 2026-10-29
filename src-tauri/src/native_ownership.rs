@@ -1,5 +1,6 @@
 use crate::{
     cmd::{CmdResult, CommandFailure},
+    config::Config,
     core::{CoreManager, owner_identity::current_owner_credentials},
 };
 use anyhow::{Context as _, Result, ensure};
@@ -44,10 +45,14 @@ pub(crate) fn can_offer_service_install(inspection: &crate::native_lifecycle::In
     if inspection.reason == "client-already-running" || !service_install_target_available(inspection) {
         return false;
     }
+    service_tools_available()
+}
+
+pub(crate) fn service_tools_available() -> bool {
     let Ok(executable) = std::env::current_exe() else { return false; };
     if crate::native_managed::inspect_bundle(&executable).is_err() { return false; }
     let Some(helpers) = executable.parent() else { return false; };
-    ["clash-verge-service", "clash-verge-service-install", "clash-verge-service-uninstall"].iter().all(|name| {
+    ["tez-service", "tez-service-install", "tez-service-uninstall"].iter().all(|name| {
         std::fs::symlink_metadata(helpers.join(name)).is_ok_and(|metadata| {
             use std::os::unix::fs::PermissionsExt as _;
             metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o111 != 0
@@ -56,9 +61,12 @@ pub(crate) fn can_offer_service_install(inspection: &crate::native_lifecycle::In
 }
 
 fn service_install_target_available(inspection: &crate::native_lifecycle::Inspection) -> bool {
-    !inspection.service_control_available && (inspection.can_start
+    if inspection.service_control_available {
+        return inspection.can_start && inspection.state == "stopped" && inspection.source == "service";
+    }
+    inspection.can_start
         || (inspection.reason == "service-unavailable" && inspection.processes.is_empty())
-        || (inspection.state == "runningReadOnly" && inspection.source == "service"))
+        || (inspection.state == "runningReadOnly" && inspection.source == "service")
 }
 
 #[derive(Deserialize)]
@@ -66,6 +74,15 @@ fn service_install_target_available(inspection: &crate::native_lifecycle::Inspec
 struct InstallServiceParams {
     confirmed: bool,
     expected: Option<CoreIdentity>,
+}
+
+fn parse_install_request(params: Value) -> CmdResult<InstallServiceParams> {
+    let request: InstallServiceParams = serde_json::from_value(params)
+        .map_err(|_| CommandFailure::coded("INVALID_PARAMS", "Expected explicit installation confirmation and observed core identity"))?;
+    if !request.confirmed {
+        return Err(CommandFailure::coded("CORE_CONFIRMATION_REQUIRED", "Service installation requires explicit confirmation"));
+    }
+    Ok(request)
 }
 
 fn validate_install_identity(expected: Option<&CoreIdentity>, inspection: &crate::native_lifecycle::Inspection) -> Result<()> {
@@ -81,33 +98,69 @@ fn validate_install_identity(expected: Option<&CoreIdentity>, inspection: &crate
 }
 
 pub(crate) async fn install_service(params: Value) -> CmdResult<Value> {
-    let request: InstallServiceParams = serde_json::from_value(params)
-        .map_err(|_| CommandFailure::coded("INVALID_PARAMS", "Expected explicit installation confirmation and observed core identity"))?;
-    if !request.confirmed {
-        return Err(CommandFailure::coded("CORE_CONFIRMATION_REQUIRED", "Service installation requires explicit confirmation"));
-    }
+    let request = parse_install_request(params)?;
     let result: Result<Value> = async {
         let _instance = crate::utils::server::try_acquire_native_instance_lock()?;
         let inspection = crate::native_lifecycle::inspect().await;
         validate_install_identity(request.expected.as_ref(), &inspection)?;
         ensure!(can_offer_service_install(&inspection), "Required bundled service tools are unavailable");
-        let helpers = std::env::current_exe()?.parent().context("Missing helpers directory")?.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let cores = crate::config::IVerge::VALID_CLASH_CORES.iter().map(|name| service::management::CoreSource {
-                name: (*name).into(), path: helpers.join(name),
-            }).collect::<Vec<_>>();
-            service::management::install(&helpers.join("clash-verge-service-install"), &cores, false,
-                Some(unsafe { libc::getegid() }), "Tez needs administrator authorization to upgrade its background service. The current proxy may be interrupted.")
-        }).await??;
-        ensure!(supported().await, "Installed service did not confirm Tez lifecycle support");
+        install_service_tools().await?;
         Ok(json!({"installed":true,"reconnectRequired":true}))
     }.await;
-    result.map_err(|error| {
-        let cancelled = format!("{error:#}").contains("(-128)");
-        CommandFailure::coded(if cancelled { "SERVICE_INSTALL_CANCELLED" } else { "SERVICE_INSTALL_FAILED" },
-            if cancelled { "Administrator authorization was cancelled. Inspect the current core before retrying." }
-            else { "Service upgrade was not confirmed. Inspect the current core and retry explicitly; no automatic retry was scheduled." })
-    })
+    result.map_err(service_install_failure)
+}
+
+fn validate_managed_install_identity(
+    request: &InstallServiceParams,
+    inspection: &crate::native_lifecycle::Inspection,
+    mode: crate::core::manager::RunningMode,
+    core_busy: bool,
+) -> Result<()> {
+    ensure!(matches!(mode, crate::core::manager::RunningMode::NotRunning), "Stop the owned core before reinstalling the service");
+    ensure!(!core_busy, "Another or recovering core session prevents service reinstallation");
+    ensure!(inspection.service_control_available, "Managed reinstallation requires a compatible Tez service");
+    ensure!(request.expected.is_none(), "A running-core confirmation cannot authorize idle reinstallation");
+    validate_install_identity(None, inspection)
+}
+
+/// The managed command dispatcher retains the instance lock throughout this idle-only operation.
+pub(crate) async fn install_managed_service(params: Value) -> CmdResult<Value> {
+    let request = parse_install_request(params)?;
+    let result: Result<Value> = async {
+        let write = Config::lock_config_write().await;
+        let manager = CoreManager::global();
+        let _update = manager.claim_config_update(&write)?;
+        let inspection = crate::native_lifecycle::inspect().await;
+        let installation = service::inspect_installation(&[]).await?;
+        validate_managed_install_identity(&request, &inspection, *manager.get_running_mode(), installation.core_busy)?;
+        ensure!(service_tools_available(), "Required bundled service tools are unavailable");
+        let _execution = service::execution::CoreExecutionGuard::acquire()?;
+        let inspection = crate::native_lifecycle::inspect().await;
+        validate_managed_install_identity(&request, &inspection, *manager.get_running_mode(), false)?;
+        install_service_tools().await?;
+        Ok(json!({"installed":true,"reconnectRequired":false}))
+    }.await;
+    result.map_err(service_install_failure)
+}
+
+async fn install_service_tools() -> Result<()> {
+    let helpers = std::env::current_exe()?.parent().context("Missing helpers directory")?.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let cores = crate::config::IVerge::VALID_CLASH_CORES.iter().map(|name| service::management::CoreSource {
+            name: crate::core::service::native_core_name(name).into(), path: helpers.join(crate::core::service::native_core_name(name)),
+        }).collect::<Vec<_>>();
+        service::management::install(&helpers.join("tez-service-install"), &cores, false,
+            Some(unsafe { libc::getegid() }), "Tez needs administrator authorization to upgrade its background service. The current proxy may be interrupted.")
+    }).await??;
+    ensure!(supported().await, "Installed service did not confirm Tez lifecycle support");
+    Ok(())
+}
+
+fn service_install_failure(error: anyhow::Error) -> CommandFailure {
+    let cancelled = format!("{error:#}").contains("(-128)");
+    CommandFailure::coded(if cancelled { "SERVICE_INSTALL_CANCELLED" } else { "SERVICE_INSTALL_FAILED" },
+        if cancelled { "Administrator authorization was cancelled. Inspect the current core before retrying." }
+        else { "Service upgrade was not confirmed. Inspect the current core and retry explicitly; no automatic retry was scheduled." })
 }
 
 #[derive(Deserialize)]
@@ -280,6 +333,44 @@ pub(crate) async fn control_state(params: Value) -> CmdResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_compatible_idle_service_can_be_explicitly_reinstalled() {
+        let inspection = crate::native_lifecycle::Inspection {
+            state: "stopped", source: "service", can_start: true, reason: "idle-service",
+            core_pid: None, service_generation: None, service_started_at: None,
+            service_protocol: Some("2.6".into()), service_control_available: true, processes: vec![],
+        };
+        assert!(service_install_target_available(&inspection));
+        assert!(validate_install_identity(None, &inspection).is_ok());
+    }
+
+    #[test]
+    fn native_managed_reinstallation_requires_a_confirmed_idle_owned_runtime() {
+        use crate::core::manager::RunningMode;
+        let request = InstallServiceParams { confirmed: true, expected: None };
+        let mut inspection = crate::native_lifecycle::Inspection {
+            state: "stopped", source: "service", can_start: true, reason: "idle-service",
+            core_pid: None, service_generation: None, service_started_at: None,
+            service_protocol: Some("2.6".into()), service_control_available: true, processes: vec![],
+        };
+        assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, false).is_ok());
+        for mode in [RunningMode::Service, RunningMode::Sidecar] {
+            assert!(validate_managed_install_identity(&request, &inspection, mode, false).is_err());
+        }
+        assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, true).is_err());
+        let stale_request = InstallServiceParams { confirmed: true, expected: Some(CoreIdentity { generation: 1, pid: 2, started_at: 3 }) };
+        assert!(validate_managed_install_identity(&stale_request, &inspection, RunningMode::NotRunning, false).is_err());
+        inspection.processes.push(crate::native_lifecycle::CoreProcess { pid: 7, uid: 99, executable: "/tmp/mihomo".into(), started_at: "fixture".into() });
+        assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, false).is_err());
+        inspection.processes.clear();
+        inspection.source = "process";
+        assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, false).is_err());
+        inspection.source = "service";
+        inspection.can_start = false;
+        assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, false).is_err());
+    }
+
     #[tokio::test]
     async fn ownership_writes_reject_invalid_or_unconfirmed_requests_before_backend_access() {
         for value in [
@@ -289,6 +380,7 @@ mod tests {
         ] {
             assert!(claim(value.clone()).await.is_err());
             assert!(install_service(value.clone()).await.is_err());
+            assert!(install_managed_service(value.clone()).await.is_err());
             assert!(upgrade(value).await.is_err());
         }
         assert!(control_state(json!({"unexpected":true})).await.is_err());

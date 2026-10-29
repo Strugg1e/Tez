@@ -127,7 +127,7 @@ impl Staging {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos();
-            let root = std::env::temp_dir().join(format!("clash-verge-install-{}-{nonce}-{index}", std::process::id()));
+            let root = std::env::temp_dir().join(format!("tez-service-install-{}-{nonce}-{index}", std::process::id()));
             let builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             let mut builder = builder;
@@ -166,8 +166,8 @@ impl PreparedCores {
         for core in cores {
             anyhow::ensure!(
                 [
-                    format!("verge-mihomo{}", std::env::consts::EXE_SUFFIX),
-                    format!("verge-mihomo-alpha{}", std::env::consts::EXE_SUFFIX)
+                    format!("mihomo{}", std::env::consts::EXE_SUFFIX),
+                    format!("mihomo-alpha{}", std::env::consts::EXE_SUFFIX)
                 ]
                 .contains(&core.name) || core.name.strip_prefix("tez-").is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
                 "unsupported core name {}",
@@ -262,7 +262,7 @@ pub fn prepare_install_if_requested() -> Result<bool> {
         }
     }
     let installer = std::env::current_exe()?;
-    let service = installer.with_file_name(format!("clash-verge-service{}", std::env::consts::EXE_SUFFIX));
+    let service = installer.with_file_name(format!("tez-service{}", std::env::consts::EXE_SUFFIX));
     let PreparedCores {
         staging,
         requirements,
@@ -465,7 +465,7 @@ mod tests {
                 service_sha256: "service digest".into(),
                 protocol: crate::ProtocolInfo::current(),
                 cores: vec![crate::CoreInspection {
-                    name: "verge-mihomo.exe".into(),
+                    name: "mihomo.exe".into(),
                     availability: crate::CoreAvailability::Rejected { reason: reason.into() },
                 }],
                 core_busy: true,
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn preparation_attests_staged_bytes_before_elevation() -> Result<()> {
         let source = Staging::new()?;
-        let name = format!("verge-mihomo{}", std::env::consts::EXE_SUFFIX);
+        let name = format!("mihomo{}", std::env::consts::EXE_SUFFIX);
         let path = source.0.join("core with spaces and 'quotes'");
         std::fs::write(&path, b"abc")?;
         let plan = PreparedCores::new(

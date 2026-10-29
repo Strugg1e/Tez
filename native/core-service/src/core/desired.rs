@@ -215,8 +215,8 @@ async fn backup_legacy_desired_states() {
     let legacy_files = legacy_files
         .into_iter()
         .chain([
-            std::path::PathBuf::from("/var/lib/clash-verge-service/desired-state.json"),
-            std::path::PathBuf::from("/var/root/.local/state/clash-verge-service/desired-state.json"),
+            std::path::PathBuf::from("/var/lib/tez-service/desired-state.json"),
+            std::path::PathBuf::from("/var/root/.local/state/tez-service/desired-state.json"),
         ])
         .collect::<Vec<_>>();
 

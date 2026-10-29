@@ -17,7 +17,7 @@ const run = (args, env = {}) => spawnSync(process.execPath, [script, ...args], {
 try {
   fs.mkdirSync(path.join(contents, 'Helpers'), { recursive: true })
   fs.mkdirSync(path.join(contents, 'Resources/resources'), { recursive: true })
-  const names = ['Helpers/verge-mihomo', 'Helpers/verge-mihomo-alpha',
+  const names = ['Helpers/mihomo', 'Helpers/mihomo-alpha',
     ...['Country.mmdb', 'ASN.mmdb', 'geoip.dat', 'geosite.dat', 'set_dns.sh', 'unset_dns.sh'].map(name => `Resources/resources/${name}`),
     'Resources/native-core-manifest.json']
   for (const name of names) fs.writeFileSync(path.join(contents, name), 'fixture')
@@ -37,7 +37,7 @@ try {
   const missing = run(['--verify', app])
   assert.notEqual(missing.status, 0)
   assert.match(missing.stderr, /ENOENT/)
-  const firstCore = path.join(contents, 'Helpers/verge-mihomo')
+  const firstCore = path.join(contents, 'Helpers/mihomo')
   fs.writeFileSync(firstCore, 'tampered', { mode: 0o755 })
   const tampered = run(['--verify', app])
   assert.notEqual(tampered.status, 0)

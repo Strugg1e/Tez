@@ -111,6 +111,10 @@ struct NativeActivityConnection: Codable, Equatable, Sendable, Identifiable {
     var destinationLabel: String? {
         nonempty(destination).map { $0.hasPrefix(":") ? "端口 \($0.dropFirst())" : $0 }
     }
+    var ruleQuery: String? { nonempty(rule) }
+    var logQuery: String? {
+        nonempty(host) ?? nonempty(destination).flatMap { $0.hasPrefix(":") ? nil : $0 }
+    }
     func matches(_ query: String) -> Bool {
         query.isEmpty || [host, destination, network, type, process, rule]
             .compactMap { $0 }.joined(separator: " ").localizedCaseInsensitiveContains(query)
@@ -223,6 +227,173 @@ struct NativeActivityQuery: Equatable, Hashable, Sendable {
     }
 }
 
+enum ActivityTab: String, CaseIterable, Identifiable {
+    case connections, rules, providers
+    var id: Self { self }
+    var pageSize: UInt64 { switch self { case .connections: 128; case .rules: 256; case .providers: 64 } }
+    var title: String { switch self { case .connections: "连接"; case .rules: "规则"; case .providers: "规则源" } }
+    var symbol: String { switch self { case .connections: "network"; case .rules: "line.3.horizontal.decrease"; case .providers: "shippingbox" } }
+    var searchPrompt: String { switch self { case .connections: "搜索连接"; case .rules: "搜索规则"; case .providers: "搜索规则源" } }
+    var emptyTitle: String { switch self { case .connections: "暂无活动连接"; case .rules: "暂无规则"; case .providers: "暂无规则源" } }
+    var unavailableTitle: String { switch self { case .connections: "连接数据不可用"; case .rules: "规则数据不可用"; case .providers: "规则源数据不可用" } }
+}
+
+struct NativeActivityContext {
+    private var queries: [ActivityTab: NativeActivityQuery] = [:]
+    var connectionID: String?
+    var ruleID: UInt64?
+    var providerID: String?
+
+    func request(for tab: ActivityTab) -> NativeActivityQuery {
+        queries[tab] ?? NativeActivityQuery(section: tab.rawValue, limit: tab.pageSize)
+    }
+
+    mutating func search(_ query: String, in tab: ActivityTab) {
+        guard request(for: tab).query != query else { return }
+        queries[tab] = NativeActivityQuery(section: tab.rawValue, query: query, limit: tab.pageSize)
+        clearSelection(in: tab)
+    }
+
+    mutating func move(to offset: UInt64, in tab: ActivityTab) {
+        var query = request(for: tab)
+        guard query.offset != offset else { return }
+        query.offset = offset
+        queries[tab] = query
+        clearSelection(in: tab)
+    }
+
+    mutating func clearSelection(in tab: ActivityTab) {
+        switch tab {
+        case .connections: connectionID = nil
+        case .rules: ruleID = nil
+        case .providers: providerID = nil
+        }
+    }
+
+    mutating func reconcileSelection(in snapshot: NativeActivity, for tab: ActivityTab) {
+        switch tab {
+        case .connections:
+            if !snapshot.connections.items.contains(where: { $0.id == connectionID }) { connectionID = nil }
+        case .rules:
+            if !snapshot.rules.items.contains(where: { $0.index == ruleID }) { ruleID = nil }
+        case .providers:
+            if !snapshot.providers.items.contains(where: { $0.name == providerID }) { providerID = nil }
+        }
+    }
+}
+
+@MainActor @Observable
+final class NativeActivitySession {
+    var tab = ActivityTab.connections
+    var showsLogs = false
+    var context = NativeActivityContext()
+    var paused = false
+    let logs = NativeLogSession()
+    private let models: [ActivityTab: NativeActivityModel] = Dictionary(
+        uniqueKeysWithValues: ActivityTab.allCases.map { ($0, NativeActivityModel()) })
+
+    func model(for tab: ActivityTab) -> NativeActivityModel { models[tab]! }
+
+    func showRules(for connection: NativeActivityConnection) {
+        guard let query = connection.ruleQuery else { return }
+        context.search(query, in: .rules)
+        context.move(to: 0, in: .rules)
+        context.clearSelection(in: .rules)
+        tab = .rules
+        showsLogs = false
+    }
+
+    func showLogs(for connection: NativeActivityConnection) {
+        guard let query = connection.logQuery else { return }
+        logs.query = query
+        logs.level = "all"
+        logs.relatedTarget = query
+        showsLogs = true
+    }
+}
+
+struct NativeLogPayload: Decodable {
+    var lines: [String]
+    var gap: Bool?
+    var truncated: Bool?
+    var streaming: Bool?
+}
+
+struct NativeLogEntry: Equatable {
+    let text: String
+    let level: String?
+
+    init(_ text: String) {
+        self.text = text
+        let lower = text.lowercased()
+        let header = lower.components(separatedBy: " msg=")[0]
+        let tokens = header.split(whereSeparator: \.isWhitespace)
+        func normalized(_ token: Substring) -> String? {
+            switch token.trimmingCharacters(in: CharacterSet(charactersIn: "\"'[]:")) {
+            case "warning", "warn": "warn"
+            case "error", "fatal": "error"
+            case "info": "info"
+            case "debug": "debug"
+            case "trace": "trace"
+            default: nil
+            }
+        }
+        if let token = tokens.first(where: { $0.hasPrefix("level=") }) {
+            level = normalized(token.dropFirst(6))
+        } else {
+            level = tokens.filter { $0.hasPrefix("[") }.compactMap(normalized).first
+                ?? lower.split(whereSeparator: \.isWhitespace).first.flatMap(normalized)
+        }
+    }
+
+    func matches(query: String, level: String) -> Bool {
+        (level == "all" || self.level == level) && (query.isEmpty || text.lowercased().contains(query.lowercased()))
+    }
+}
+
+struct NativeLogSnapshot {
+    let entries: [NativeLogEntry]
+    let gap: Bool
+    let truncated: Bool
+    let streaming: Bool
+    let acquiredAt: Date
+
+    init(_ payload: NativeLogPayload, acquiredAt: Date = Date()) {
+        entries = payload.lines.map(NativeLogEntry.init)
+        gap = payload.gap ?? false
+        truncated = payload.truncated ?? false
+        streaming = payload.streaming ?? false
+        self.acquiredAt = acquiredAt
+    }
+}
+
+@MainActor @Observable
+final class NativeLogSession {
+    static let limit = 1000
+    var query = "" {
+        didSet { if query != relatedTarget { relatedTarget = nil } }
+    }
+    var level = "all"
+    var paused = false {
+        didSet { if paused { stop() } }
+    }
+    var followsTail = true
+    var relatedTarget: String?
+    private(set) var snapshot: NativeLogSnapshot?
+    @ObservationIgnored private(set) var generation = UUID()
+
+    var lines: [String] {
+        snapshot?.entries.filter { $0.matches(query: query, level: level) }.map(\.text) ?? []
+    }
+
+    func stop() { generation = UUID() }
+
+    func accept(_ payload: NativeLogPayload, generation token: UUID) {
+        guard token == generation else { return }
+        snapshot = NativeLogSnapshot(payload)
+    }
+}
+
 enum NativeActivityFormat {
     static func issue(_ code: String?) -> String {
         switch code {
@@ -261,7 +432,10 @@ final class NativeActivityModel {
     @ObservationIgnored private var desiredQuery: NativeActivityQuery?
     @ObservationIgnored private var activeGeneration: UUID?
 
-    func stop() { generation = UUID(); rates.reset() }
+    func stop(preservingRates: Bool = false) {
+        generation = UUID()
+        if !preservingRates { rates.reset() }
+    }
 
     func select(_ query: NativeActivityQuery?) {
         guard desiredQuery != query else { return }
@@ -302,7 +476,7 @@ final class NativeActivityModel {
     }
 
     func close(id: String, request: @MainActor () async throws -> BackendJSON) async -> Bool {
-        guard closingID == nil else { return false }
+        guard closingID == nil, snapshotQuery == desiredQuery else { return false }
         guard snapshot?.connections.items.contains(where: { $0.id == id && $0.closeable == true }) == true else {
             closeError = false
             closeMessage = "连接已结束或不能关闭，请刷新确认。"

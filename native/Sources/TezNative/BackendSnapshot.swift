@@ -24,6 +24,14 @@ struct NativeNetworkSnapshot: Codable, Equatable, Sendable {
     let pac: NativeObservedSwitch
     let tun: NativeObservedSwitch
     let mode: NativeObservedMode
+
+    var systemProxyControl: NativeObservedSwitch {
+        let system = systemProxy.state == "ready" ? systemProxy.enabled : nil
+        let automatic = pac.state == "ready" ? pac.enabled : nil
+        if system == true || automatic == true { return NativeObservedSwitch(state: "ready", enabled: true) }
+        if system == false && automatic == false { return NativeObservedSwitch(state: "ready", enabled: false) }
+        return NativeObservedSwitch(state: "unavailable", enabled: nil)
+    }
 }
 
 struct NativeObservedSwitch: Codable, Equatable, Sendable {

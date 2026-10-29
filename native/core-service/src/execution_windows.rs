@@ -13,7 +13,7 @@ use windows_sys::Win32::{
 };
 
 pub(super) fn require_no_registered_services() -> Result<()> {
-    require_services_absent(&["clash_verge_service", "clash_verge_service_dev"])
+    require_services_absent(&["tez_service", "tez_service_dev"])
 }
 
 fn require_services_absent(names: &[&str]) -> Result<()> {
@@ -59,7 +59,7 @@ pub(super) fn require_stopped_service() -> Result<()> {
 
 pub(super) fn require_no_core_process(include_service: bool) -> Result<()> {
     #[cfg(not(feature = "test"))]
-    const CORE_NAMES: &[&str] = &["verge-mihomo.exe", "verge-mihomo-alpha.exe"];
+    const CORE_NAMES: &[&str] = &["mihomo.exe", "mihomo-alpha.exe", "verge-mihomo.exe", "verge-mihomo-alpha.exe"];
     #[cfg(feature = "test")]
     const CORE_NAMES: &[&str] = &["mock_binary.exe", "crash_binary.exe"];
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -81,7 +81,7 @@ pub(super) fn require_no_core_process(include_service: bool) -> Result<()> {
         let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
         // SCM can be stopped while a core from an earlier service process remains alive.
         if CORE_NAMES.iter().any(|core| name.eq_ignore_ascii_case(core))
-            || (include_service && name.eq_ignore_ascii_case("clash-verge-service.exe"))
+            || (include_service && name.eq_ignore_ascii_case("tez-service.exe"))
         {
             bail!(
                 "process {name} (PID {}) is still running; refusing a second core",

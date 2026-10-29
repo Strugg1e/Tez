@@ -2,6 +2,13 @@ import AppKit
 import Observation
 import SwiftUI
 
+struct NativeRecentRoute: Codable, Hashable, Identifiable {
+    let profileID: String?
+    let group: String
+    let name: String
+    var id: Self { self }
+}
+
 @Observable
 @MainActor
 final class TezPreviewPreferences {
@@ -11,6 +18,7 @@ final class TezPreviewPreferences {
     var reduceTransparency: Bool { didSet { defaults.set(reduceTransparency, forKey: "tez.reduceTransparency") } }
     var increaseContrast: Bool { didSet { defaults.set(increaseContrast, forKey: "tez.increaseContrast") } }
     var showProtocol: Bool { didSet { defaults.set(showProtocol, forKey: "tez.showProtocol") } }
+    private(set) var recentRoutes: [NativeRecentRoute]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -19,6 +27,19 @@ final class TezPreviewPreferences {
         reduceTransparency = defaults.bool(forKey: "tez.reduceTransparency")
         increaseContrast = defaults.bool(forKey: "tez.increaseContrast")
         showProtocol = defaults.object(forKey: "tez.showProtocol") as? Bool ?? true
+        recentRoutes = defaults.data(forKey: "tez.recentRoutes")
+            .flatMap { try? JSONDecoder().decode([NativeRecentRoute].self, from: $0) }
+            .map { Array($0.prefix(5)) } ?? []
+    }
+
+    func recordRoute(profileID: String?, group: String, name: String) {
+        let route = NativeRecentRoute(profileID: profileID, group: group, name: name)
+        recentRoutes.removeAll { $0 == route }
+        recentRoutes.insert(route, at: 0)
+        recentRoutes = Array(recentRoutes.prefix(5))
+        if let data = try? JSONEncoder().encode(recentRoutes) {
+            defaults.set(data, forKey: "tez.recentRoutes")
+        }
     }
 }
 

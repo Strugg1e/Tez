@@ -17,6 +17,8 @@ const CAPACITY: usize = 1000;
 
 struct Buffer {
     lines: VecDeque<String>,
+    // Reseeding replaces this prefix but keeps the current connection's live suffix.
+    history_len: usize,
     last_read: Instant,
     gap: bool,
     truncated: bool,
@@ -33,6 +35,7 @@ impl NativeLogStream {
         Self {
             buffer: Arc::new(Mutex::new(Buffer {
                 lines: VecDeque::new(),
+                history_len: 0,
                 last_read: Instant::now(),
                 gap: false,
                 truncated: false,
@@ -62,9 +65,10 @@ impl NativeLogStream {
         self.socket = Some(socket.to_owned());
         {
             let mut buffer = self.buffer.lock().unwrap();
-            if reconnect {
-                buffer.gap = true;
-            }
+            buffer.lines.clear();
+            buffer.history_len = 0;
+            buffer.gap = reconnect;
+            buffer.truncated = false;
             buffer.last_read = Instant::now();
         }
         let buffer = self.buffer.clone();
@@ -80,7 +84,11 @@ impl NativeLogStream {
                                     let line = format!("{} [{}] {}", chrono::Local::now().format("%m-%d %H:%M:%S"), level, payload.chars().take(4096).collect::<String>());
                                     let mut state = buffer.lock().unwrap();
                                     if payload.chars().count() > 4096 { state.truncated = true; }
-                                    if state.lines.len() == CAPACITY { state.lines.pop_front(); state.truncated = true; }
+                                    if state.lines.len() == CAPACITY {
+                                        state.lines.pop_front();
+                                        state.history_len = state.history_len.saturating_sub(1);
+                                        state.truncated = true;
+                                    }
                                     state.lines.push_back(line);
                                 } else {
                                     buffer.lock().unwrap().gap = true;
@@ -103,6 +111,8 @@ impl NativeLogStream {
 
     pub fn seed(&mut self, lines: Vec<String>) {
         let mut buffer = self.buffer.lock().unwrap();
+        let previous_history_len = buffer.history_len;
+        buffer.lines.drain(..previous_history_len);
         if lines.iter().any(|line| line.chars().count() > 4096) {
             buffer.truncated = true;
         }
@@ -110,12 +120,15 @@ impl NativeLogStream {
             .into_iter()
             .map(|line| line.chars().take(4096).collect())
             .collect();
+        let mut history_len = combined.len();
         combined.append(&mut buffer.lines);
         while combined.len() > CAPACITY {
             combined.pop_front();
+            history_len = history_len.saturating_sub(1);
             buffer.truncated = true;
         }
         buffer.lines = combined;
+        buffer.history_len = history_len;
     }
 
     pub fn read(&self, limit: usize, level: &str, query: &str) -> Value {
@@ -137,6 +150,7 @@ impl NativeLogStream {
         self.socket = None;
         let mut buffer = self.buffer.lock().unwrap();
         buffer.lines.clear();
+        buffer.history_len = 0;
         buffer.gap = false;
         buffer.truncated = false;
     }
@@ -204,6 +218,29 @@ mod tests {
         assert!(serde_json::to_vec(&logs.read(1000, "all", "")).unwrap().len() < 8 * 1024 * 1024);
     }
 
+    #[test]
+    fn native_log_stream_replaces_seed_without_deduplicating_repeated_lines() {
+        let mut logs = NativeLogStream::new();
+        let history = vec!["[info] repeated".into(), "[info] repeated".into()];
+        logs.seed(history.clone());
+        logs.seed(history);
+        assert_eq!(
+            logs.read(1000, "all", "")["lines"],
+            json!(["[info] repeated", "[info] repeated"])
+        );
+    }
+
+    #[test]
+    fn native_log_stream_new_seed_replaces_a_full_history_buffer() {
+        let mut logs = NativeLogStream::new();
+        logs.seed((0..1000).map(|index| format!("[info] old-{index}")).collect());
+        logs.seed(vec!["[info] newly-read-history".into()]);
+        let result = logs.read(1000, "all", "");
+        assert_eq!(result["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(result["lines"], json!(["[info] newly-read-history"]));
+        assert_eq!(result["truncated"], false);
+    }
+
     #[tokio::test]
     async fn native_log_stream_marks_interrupted_connection_after_reconnect() -> Result<()> {
         let path = std::env::temp_dir().join(format!("tez-log-reconnect-{}.sock", nanoid::nanoid!()));
@@ -232,12 +269,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(logs.worker.as_ref().is_some_and(|worker| worker.is_finished()));
+        assert_eq!(logs.read(1000, "all", "")["lines"].as_array().unwrap().len(), 1);
         assert_eq!(logs.read(1000, "all", "")["streaming"], false);
         assert_eq!(logs.read(1000, "all", "")["gap"], true);
         assert!(logs.connect(&path).await?);
         let result = logs.read(1000, "all", "");
         assert_eq!(result["gap"], true);
-        assert_eq!(result["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(result["lines"].as_array().unwrap().len(), 0);
         logs.reset();
         let _ = release.send(());
         server.await?;

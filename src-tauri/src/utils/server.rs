@@ -162,6 +162,70 @@ fn instance_auth(token: String) -> impl warp::Filter<Extract = (), Error = warp:
         .untuple_one()
 }
 
+fn pac_route() -> impl warp::Filter<Extract = (warp::http::Response<String>,), Error = warp::Rejection> + Clone {
+    warp::path!("commands" / "pac").and_then(|| async move {
+        if !PAC_AVAILABLE.load(Ordering::Acquire) {
+            return Ok::<_, warp::Rejection>(
+                warp::http::Response::builder()
+                    .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body("PAC endpoint is inactive".to_string())
+                    .unwrap_or_default(),
+            );
+        }
+        let verge_config = Config::verge().await;
+        let verge_data = verge_config.data_arc();
+        let pac_content = verge_data.pac_file_content.as_deref().unwrap_or(DEFAULT_PAC);
+        // Port changes disable PAC, so the draft port avoids per-request Core queries.
+        let pac_port = MixedPort::desired().await;
+        let processed_content = pac_content.replace("%mixed-port%", &format!("{pac_port}"));
+        Ok::<_, warp::Rejection>(
+            warp::http::Response::builder()
+                .header("Content-Type", "application/x-ns-proxy-autoconfig")
+                .body(processed_content)
+                .unwrap_or_default(),
+        )
+    })
+}
+
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+pub(crate) struct NativePacServer {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+impl NativePacServer {
+    pub(crate) async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.await.context("native PAC server shutdown failed")?;
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+pub(crate) async fn start_native_pac_server() -> Result<NativePacServer> {
+    let record_path = instance_record_path()?;
+    let preferred = read_instance_record(&record_path).ok().map(|record| record.port);
+    let listener = bind_primary_listener(preferred).await.context("failed to reserve native PAC server port")?;
+    let port = listener.local_addr()?.port();
+    anyhow::ensure!(preferred.is_none_or(|previous| previous == port), "previous PAC listener port is unavailable; the saved PAC URL was not replaced");
+    EMBEDDED_PORT
+        .set(port)
+        .map_err(|_| anyhow::anyhow!("native PAC server port is already initialized"))?;
+    write_instance_record(&record_path, &InstanceRecord { port, token: random_token()? })?;
+    let (shutdown, stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        warp::serve(warp::get().and(pac_route()))
+            .incoming(listener)
+            .graceful(async { let _ = stopped.await; })
+            .run()
+            .await;
+    });
+    Ok(NativePacServer { shutdown: Some(shutdown), task })
+}
+
 fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let _ = SHUTDOWN_SENDER.set(Mutex::new(Some(shutdown_tx)));
@@ -194,28 +258,7 @@ fn start_embedded_server(listener: tokio::net::TcpListener, token: String) {
         Ok(warp::reply::with_status("ok".to_string(), warp::http::StatusCode::OK))
     });
 
-    let pac = warp::path!("commands" / "pac").and_then(|| async move {
-        if !PAC_AVAILABLE.load(Ordering::Acquire) {
-            return Ok::<_, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(warp::http::StatusCode::SERVICE_UNAVAILABLE)
-                    .body("PAC endpoint is inactive".to_string())
-                    .unwrap_or_default(),
-            );
-        }
-        let verge_config = Config::verge().await;
-        let verge_data = verge_config.data_arc();
-        let pac_content = verge_data.pac_file_content.as_deref().unwrap_or(DEFAULT_PAC);
-        // Port changes disable PAC, so the draft port avoids per-request Core queries.
-        let pac_port = MixedPort::desired().await;
-        let processed_content = pac_content.replace("%mixed-port%", &format!("{pac_port}"));
-        Ok::<_, warp::Rejection>(
-            warp::http::Response::builder()
-                .header("Content-Type", "application/x-ns-proxy-autoconfig")
-                .body(processed_content)
-                .unwrap_or_default(),
-        )
-    });
+    let pac = pac_route();
 
     let scheme = warp::path!("commands" / "scheme")
         .and(warp::query::<QueryParam>())
@@ -409,4 +452,80 @@ fn write_instance_record(path: &Path, record: &InstanceRecord) -> Result<()> {
     drop(file);
     std::fs::rename(&temporary, path).context("failed to replace singleton record")?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "native-host", target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_pac_http_uses_private_config_and_closes() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("tez-native-pac-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir(&home)?;
+        let home = home.canonicalize()?;
+        let root = home.join("Library/Application Support").join(dirs::APP_ID);
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("config.yaml"), "mixed-port: 17897\n")?;
+        std::fs::write(root.join("profiles.yaml"), "current: null\nitems: []\n")?;
+        std::fs::write(root.join("tez.yaml"), "verge_mixed_port: 17897\npac_file_content: 'function FindProxyForURL(url, host) { return \"PROXY 127.0.0.1:%mixed-port%\"; }'\n")?;
+        let result = (|| -> Result<()> {
+            let child = || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "utils::server::tests::native_pac_http_child", "--ignored", "--nocapture", "--test-threads=1"])
+                    .env("HOME", &home).env("TEZ_PAC_TEST_HOME", &home);
+                command
+            };
+            let mut port = None;
+            for _ in 0..2 {
+                let mut command = child();
+                if let Some(port) = port { command.env("TEZ_PAC_TEST_PORT", format!("{port}")); }
+                let result = command.output()?;
+                anyhow::ensure!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+                let record = read_instance_record(&root.join(INSTANCE_RECORD_FILE)).context("native PAC listener must persist its port for recovery")?;
+                if let Some(port) = port { assert_eq!(record.port, port); }
+                port = Some(record.port);
+            }
+            let port = port.unwrap();
+            let _occupied = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+            let result = child().env("TEZ_PAC_TEST_EXPECT_REFUSED", "1").output()?;
+            anyhow::ensure!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            assert_eq!(read_instance_record(&root.join(INSTANCE_RECORD_FILE))?.port, port);
+            Ok(())
+        })();
+        std::fs::remove_dir_all(home)?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "run by native_pac_http_uses_private_config_and_closes with a private HOME"]
+    async fn native_pac_http_child() -> Result<()> {
+        let home = PathBuf::from(std::env::var_os("TEZ_PAC_TEST_HOME").context("private PAC test HOME is required")?);
+        anyhow::ensure!(dirs::app_home_dir()?.starts_with(home), "PAC fixture must not read the user's configuration");
+        let started = start_native_pac_server().await;
+        if std::env::var_os("TEZ_PAC_TEST_EXPECT_REFUSED").is_some() {
+            let error = started.err().context("an occupied PAC recovery port must not silently change")?;
+            assert!(error.to_string().contains("previous PAC listener port is unavailable"));
+            return Ok(());
+        }
+        let server = started?;
+        let port = embedded_server_port()?;
+        assert_ne!(port, 0);
+        if let Ok(expected) = std::env::var("TEZ_PAC_TEST_PORT") { assert_eq!(port, expected.parse::<u16>()?); }
+        let client = ClientBuilder::new().no_proxy().timeout(Duration::from_secs(3)).build()?;
+        let base = format!("http://127.0.0.1:{port}");
+        assert_eq!(client.get(format!("{base}/commands/pac")).send().await?.status(), 503);
+        set_pac_available(true);
+        let response = client.get(format!("{base}/commands/pac")).send().await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "application/x-ns-proxy-autoconfig");
+        assert_eq!(response.text().await?, "function FindProxyForURL(url, host) { return \"PROXY 127.0.0.1:17897\"; }");
+        for route in ["visible", "scheme?param=tez://fixture"] {
+            assert_eq!(client.get(format!("{base}/commands/{route}")).send().await?.status(), 404);
+        }
+        set_pac_available(false);
+        assert_eq!(client.get(format!("{base}/commands/pac")).send().await?.status(), 503);
+        server.shutdown().await?;
+        assert!(tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.is_err());
+        Ok(())
+    }
 }

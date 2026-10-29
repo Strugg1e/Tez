@@ -13,8 +13,6 @@ use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
-#[cfg(all(target_os = "macos", not(feature = "development-channel")))]
-use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
@@ -25,9 +23,9 @@ use std::time::{Duration, Instant};
 
 fn bundled_service_binary() -> Result<PathBuf, Error> {
     let source = std::env::current_exe()?.with_file_name(if cfg!(windows) {
-        "clash-verge-service.exe"
+        "tez-service.exe"
     } else {
-        "clash-verge-service"
+        "tez-service"
     });
     let metadata = std::fs::symlink_metadata(&source)
         .with_context(|| format!("failed to inspect bundled service binary {source:?}"))?;
@@ -120,7 +118,7 @@ fn stage_binary(source: &Path, target: &Path) -> Result<PathBuf, Error> {
 }
 
 /// Allowlist for auto-staging; excludes other executables shipped beside the installer.
-const BUNDLED_CORE_NAMES: [&str; 2] = ["verge-mihomo", "verge-mihomo-alpha"];
+const BUNDLED_CORE_NAMES: [&str; 2] = ["mihomo", "mihomo-alpha"];
 
 fn core_file_name(stem: &str) -> String {
     if cfg!(windows) {
@@ -743,6 +741,7 @@ fn set_macos_permissions(path: &Path, mode: u32) -> Result<(), Error> {
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Error> {
+    if clash_verge_service_ipc::print_identity_if_requested() { return Ok(()); }
     if clash_verge_service_ipc::management::prepare_install_if_requested()? {
         return Ok(());
     }
@@ -767,7 +766,7 @@ fn main() -> Result<(), Error> {
 
     std::fs::create_dir_all(&macos_path).map_err(|e| anyhow::anyhow!("Failed to create bundle directories: {}", e))?;
 
-    let target_binary_path = macos_path.join("clash-verge-service");
+    let target_binary_path = macos_path.join("tez-service");
     let staged = stage_binary(&service_binary_path, &target_binary_path)?;
 
     let info_plist_path = contents_path.join("Info.plist");
@@ -823,8 +822,6 @@ fn main() -> Result<(), Error> {
         debug,
     )?;
     wait_for_service_ready()?;
-    #[cfg(not(feature = "development-channel"))]
-    let _ = uninstall_old_service();
 
     Ok(())
 }
@@ -847,7 +844,7 @@ fn main() -> Result<(), Error> {
     let debug = options.debug;
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
-    let target = install_dir.join("clash-verge-service");
+    let target = install_dir.join("tez-service");
     let staged = stage_binary(&source, &target)?;
     let unit_name = format!("{}.service", clash_verge_service_ipc::SERVICE_SLUG);
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
@@ -912,7 +909,7 @@ fn main() -> anyhow::Result<()> {
     }
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
-    let target = install_dir.join("clash-verge-service.exe");
+    let target = install_dir.join("tez-service.exe");
     let staged = stage_binary(&source, &target)?;
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
@@ -1006,7 +1003,7 @@ fn main() -> anyhow::Result<()> {
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let service = service_manager.create_service(&service_info, start_access)?;
 
-    service.set_description("Clash Verge Service helps to launch Clash Core")?;
+    service.set_description("Tez Service manages the Mihomo core")?;
     configure_windows_service_recovery(&service)?;
     service.start(&Vec::<&OsStr>::new())?;
     wait_for_service_ready()?;
@@ -1091,7 +1088,7 @@ mod install_core_tests {
         let root = scratch("ensure payload")?;
         let source = root.join("bundled-service");
         let target = root.join("installed-service");
-        let core = root.join(super::core_file_name("verge-mihomo"));
+        let core = root.join(super::core_file_name("mihomo"));
         std::fs::write(&source, b"service")?;
         std::fs::write(&target, b"service")?;
         std::fs::write(&core, b"core")?;
@@ -1124,8 +1121,8 @@ mod install_core_tests {
     #[test]
     fn combined_install_publishes_both_attested_cores_from_a_writable_directory() -> anyhow::Result<()> {
         let root = scratch("scoop install")?;
-        let stable = root.join(super::core_file_name("verge-mihomo"));
-        let alpha = root.join(super::core_file_name("verge-mihomo-alpha"));
+        let stable = root.join(super::core_file_name("mihomo"));
+        let alpha = root.join(super::core_file_name("mihomo-alpha"));
         std::fs::write(&stable, b"stable core")?;
         std::fs::write(&alpha, b"alpha core")?;
         let mut options = combined_options(&[stable, alpha])?;
@@ -1142,8 +1139,8 @@ mod install_core_tests {
     #[test]
     fn combined_install_preflight_rejects_a_missing_or_mismatched_second_core() -> anyhow::Result<()> {
         let root = scratch("preflight")?;
-        let stable = root.join(super::core_file_name("verge-mihomo"));
-        let alpha = root.join(super::core_file_name("verge-mihomo-alpha"));
+        let stable = root.join(super::core_file_name("mihomo"));
+        let alpha = root.join(super::core_file_name("mihomo-alpha"));
         std::fs::write(&stable, b"stable core")?;
         std::fs::write(&alpha, b"alpha core")?;
         let mut options = combined_options(&[stable, alpha.clone()])?;
@@ -1161,7 +1158,7 @@ mod install_core_tests {
     #[test]
     fn explicit_core_failure_after_preflight_does_not_accept_the_previous_copy() -> anyhow::Result<()> {
         let root = scratch("changed-after-preflight")?;
-        let source = root.join(super::core_file_name("verge-mihomo"));
+        let source = root.join(super::core_file_name("mihomo"));
         let previous = root.join("cores").join(source.file_name().unwrap());
         std::fs::write(&source, b"new core")?;
         std::fs::write(&previous, b"old core")?;
@@ -1179,7 +1176,7 @@ mod install_core_tests {
     #[test]
     fn publishes_the_bytes_and_stamps_the_source_modified_time() -> anyhow::Result<()> {
         let root = scratch("stamp")?;
-        let source = root.join("verge-mihomo");
+        let source = root.join("mihomo");
         std::fs::write(&source, b"core bytes")?;
         std::fs::OpenOptions::new()
             .write(true)
@@ -1206,7 +1203,7 @@ mod install_core_tests {
     #[test]
     fn a_wrong_attestation_publishes_nothing() -> anyhow::Result<()> {
         let root = scratch("attestation")?;
-        let source = root.join("verge-mihomo");
+        let source = root.join("mihomo");
         std::fs::write(&source, b"core bytes")?;
 
         let error = install_core(
@@ -1229,7 +1226,7 @@ mod install_core_tests {
     #[test]
     fn an_unchanged_core_is_recognized_without_republishing() -> anyhow::Result<()> {
         let root = scratch("idempotent")?;
-        let source = root.join("verge-mihomo");
+        let source = root.join("mihomo");
         std::fs::write(&source, b"core bytes")?;
         let cores = root.join("cores");
 
@@ -1267,7 +1264,7 @@ mod install_core_tests {
     #[test]
     fn a_core_named_like_a_bookkeeping_leftover_is_refused() -> anyhow::Result<()> {
         let root = scratch("bookkeeping-name")?;
-        for name in ["verge-mihomo.next", "verge-mihomo.old"] {
+        for name in ["mihomo.next", "mihomo.old"] {
             let source = root.join(name);
             std::fs::write(&source, b"core bytes")?;
 
@@ -1296,7 +1293,7 @@ mod core_install_argument_tests {
             [
                 "--install-service",
                 "--install-core",
-                "/dl/verge-mihomo",
+                "/dl/mihomo",
                 "--sha256",
                 &"ab".repeat(32),
             ]
@@ -1332,7 +1329,7 @@ mod core_install_argument_tests {
         let digest = "ab".repeat(32);
         let requests = parse(&[
             "--install-core",
-            "/dl/verge-mihomo",
+            "/dl/mihomo",
             "--sha256",
             &digest,
             "--install-core",
@@ -1340,7 +1337,7 @@ mod core_install_argument_tests {
         ])?;
 
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].source, std::path::Path::new("/dl/verge-mihomo"));
+        assert_eq!(requests[0].source, std::path::Path::new("/dl/mihomo"));
         assert_eq!(requests[0].sha256, Some([0xab; 32]));
         assert_eq!(requests[1].sha256, None);
         Ok(())
@@ -1377,11 +1374,49 @@ mod core_install_argument_tests {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
+    #[test]
+    fn macos_installation_does_not_cleanup_other_products() -> anyhow::Result<()> {
+        let options = parse_install_arguments(["--install-service"].into_iter().map(std::ffi::OsString::from))?;
+        assert!(options.install_service);
+        assert_eq!(
+            classify_launchd_service_probe(Some(0), "")?,
+            LaunchdInstallPlan::Bootout
+        );
+        assert_eq!(launchd_service_target(), "system/app.tez.service");
+
+        let source = include_str!("install_service.rs");
+        let (_, macos_main) = source
+            .split_once("#[cfg(target_os = \"macos\")]\nfn main() -> Result<(), Error> {")
+            .expect("the macOS installer entry point must be present");
+        let (macos_main, _) = macos_main
+            .split_once("#[cfg(target_os = \"linux\")]\nfn main() -> Result<(), Error> {")
+            .expect("the Linux installer must follow the macOS installer");
+        let compact: String = macos_main.chars().filter(|character| !character.is_whitespace()).collect();
+        let own_service_calls = [
+            "run_command(\"launchctl\",&[\"bootout\",&launchd_service_target()],debug)?;",
+            "run_command(\"launchctl\",&[\"enable\",&launchd_target],debug)?;",
+            "run_command(\"launchctl\",&[\"bootstrap\",\"system\",&plist_path],debug)?;",
+            "run_command(\"launchctl\",&[\"start\",clash_verge_service_ipc::MACOS_SERVICE_ID],debug,)?;",
+        ];
+        assert_eq!(compact.matches("run_command(").count(), own_service_calls.len());
+        for call in own_service_calls {
+            assert!(compact.contains(call), "missing expected Tez installer call: {call}");
+        }
+        assert!(macos_main.contains("wait_for_service_ready()?;"));
+        assert!(
+            !macos_main.contains("uninstall_old_service"),
+            "installing Tez must not invoke another product's helper cleanup"
+        );
+        assert!(!macos_main.contains("io.github.clashverge.helper"));
+        Ok(())
+    }
+
     #[test]
     fn missing_launchd_service_skips_bootout() {
         let plan = classify_launchd_service_probe(
             Some(113),
-            "Could not find service \"io.github.clash-verge-rev.clash-verge-rev.service\" in domain for system",
+            "Could not find service \"app.tez.service\" in domain for system",
         )
         .unwrap();
 

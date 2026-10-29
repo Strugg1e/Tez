@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri_plugin_mihomo::models::ProxyType;
 
@@ -135,6 +135,73 @@ where
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ConnectionCleanup {
+    requested: bool,
+    completed: bool,
+    closed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<CommandFailure>,
+}
+
+async fn apply_route_selection<Guard>(
+    client: &tauri_plugin_mihomo::Mihomo,
+    route: &RouteParams,
+    previous_proxy: Option<&str>,
+    auto_close: bool,
+    ensure_ready: Guard,
+) -> CmdResult<ConnectionCleanup>
+where
+    Guard: Fn() -> CmdResult<()>,
+{
+    ensure_ready()?;
+    client
+        .select_node_for_group(&route.group, &route.name)
+        .await
+        .map_err(|error| CommandFailure::coded("ROUTE_SELECT_FAILED", format_args!("{error:#}")))?;
+    let previous_proxy = previous_proxy.filter(|previous| !previous.is_empty() && *previous != route.name);
+    let mut cleanup = ConnectionCleanup {
+        requested: auto_close && previous_proxy.is_some(),
+        completed: false,
+        closed: 0,
+        failure: None,
+    };
+    if !cleanup.requested {
+        return Ok(cleanup);
+    }
+    let connections = async {
+        ensure_ready()?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), client.get_connections()).await
+            .map_err(|_| CommandFailure::coded("CONNECTION_CLEANUP_FAILED", "Reading connections timed out"))?
+            .map_err(|_| CommandFailure::coded("CONNECTION_CLEANUP_FAILED", "Cannot read connections after route selection"))
+    }.await;
+    let connections = match connections {
+        Ok(connections) => connections,
+        Err(failure) => {
+            cleanup.failure = Some(failure);
+            return Ok(cleanup);
+        }
+    };
+    for connection in connections.connections.unwrap_or_default() {
+        // Chains run from the exit to outer groups; match this group's direct choice.
+        if !connection.chains.windows(2).any(|pair| {
+            Some(pair[0].as_str()) == previous_proxy && pair[1] == route.group
+        }) {
+            continue;
+        }
+        if let Err(failure) = ensure_ready() {
+            cleanup.failure.get_or_insert(failure);
+            break;
+        }
+        match close_connection(client, &connection.id).await {
+            Ok(_) => cleanup.closed += 1,
+            Err(failure) => { cleanup.failure.get_or_insert(failure); }
+        }
+    }
+    cleanup.completed = cleanup.failure.is_none();
+    Ok(cleanup)
+}
+
 async fn select_route(route: RouteParams) -> CmdResult<Value> {
     let manager = CoreManager::global();
     let generation = manager.current_core_readiness_generation();
@@ -147,23 +214,25 @@ async fn select_route(route: RouteParams) -> CmdResult<Value> {
         generation.is_some(),
     )?;
     let view = crate::cmd::get_proxy_view().await?;
-    validate_route(&view, &route)?;
-    if manager.current_core_readiness_generation() != generation
-        || matches!(*manager.get_running_mode(), RunningMode::NotRunning)
-    {
-        return Err(CommandFailure::coded(
-            "CORE_NOT_READY",
-            "Owned core changed while reading proxy groups",
-        ));
-    }
+    let previous_proxy = validate_route(&view, &route)?.now.as_deref();
+    let auto_close = Config::verge().await.latest_arc().auto_close_connection.unwrap_or(false);
+    let ensure_ready = || {
+        if manager.current_core_readiness_generation() != generation
+            || matches!(*manager.get_running_mode(), RunningMode::NotRunning)
+        {
+            return Err(CommandFailure::coded(
+                "CORE_NOT_READY",
+                "Owned core changed while selecting a route",
+            ));
+        }
+        Ok(())
+    };
+    ensure_ready()?;
     // A background profile activation must not overwrite this newer runtime choice.
     crate::config::profiles::supersede_selected_activation();
-    Handle::mihomo()
-        .select_node_for_group(&route.group, &route.name)
-        .await
-        .map_err(|error| CommandFailure::coded("ROUTE_SELECT_FAILED", format_args!("{error:#}")))?;
+    let cleanup = apply_route_selection(&Handle::mihomo(), &route, previous_proxy, auto_close, ensure_ready).await?;
     Handle::refresh_clash();
-    Ok(finish_selection(&route.name, || async {
+    let mut result = finish_selection(&route.name, || async {
         crate::config::profiles::record_selected_node(&route.group, &route.name)
             .await
             .map_err(|error| CommandFailure::plain(format_args!("{error:#}")))?;
@@ -190,7 +259,9 @@ async fn select_route(route: RouteParams) -> CmdResult<Value> {
         }
         Ok(())
     })
-    .await)
+    .await;
+    result["connectionCleanup"] = json!(cleanup);
+    Ok(result)
 }
 
 /// Called only by the exclusively owned, initialized managed backend, never attach mode.
@@ -226,7 +297,10 @@ fn ownership_guard(request: &Request, mode: RunningMode, ready: bool) -> CmdResu
         }
         Request::Select(_) | Request::CloseConnection(_) if !ready => Err(CommandFailure::coded("CORE_NOT_READY", "Owned core is not ready")),
         Request::Stop if !running => Ok(false),
-        Request::Start if running => Ok(false),
+        Request::Start if running => {
+            verify_started(mode, ready)?;
+            Ok(false)
+        },
         _ => Ok(true),
     }
 }
@@ -270,10 +344,18 @@ async fn dispatch_owned_request(request: Request) -> CmdResult<Value> {
     let state = runtime().await;
     result.map_err(|error| proxy_aware_coded_error(&error, code))?;
     if code == "CORE_START_FAILED" || code == "CORE_RESTART_FAILED" {
+        verify_started(*CoreManager::global().get_running_mode(), CoreManager::global().current_core_readiness_generation().is_some())?;
         crate::core::timer::Timer::global().init().await
             .map_err(|_| CommandFailure::coded("SUBSCRIPTION_TIMER_FAILED", "Core is running, but subscription scheduling failed"))?;
     }
     state
+}
+
+fn verify_started(mode: RunningMode, ready: bool) -> CmdResult<()> {
+    if !matches!(mode, RunningMode::NotRunning) && ready {
+        return Ok(());
+    }
+    Err(CommandFailure::coded("CORE_START_NOT_READY", "The owned core did not become ready. Check service availability and configuration before retrying."))
 }
 
 async fn prepare_runtime() -> anyhow::Result<()> {
@@ -314,6 +396,16 @@ async fn runtime() -> CmdResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_start_requires_confirmed_owned_readiness() {
+        for (mode, ready) in [(RunningMode::NotRunning, false), (RunningMode::NotRunning, true), (RunningMode::Service, false)] {
+            assert_eq!(verify_started(mode, ready).unwrap_err().code.as_deref(), Some("CORE_START_NOT_READY"));
+        }
+        assert!(verify_started(RunningMode::Service, true).is_ok());
+        assert!(verify_started(RunningMode::Sidecar, true).is_ok());
+        assert!(ownership_guard(&Request::Start, RunningMode::Service, false).is_err());
+    }
 
     #[test]
     fn control_parameters_are_strict_before_backend_access() {
@@ -453,6 +545,181 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    struct RouteController {
+        client: tauri_plugin_mihomo::Mihomo,
+        path: std::path::PathBuf,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl RouteController {
+        fn new(select_status: u16, close_status: u16) -> Self {
+            Self::with_connections(select_status, close_status, json!({"connections":[
+                {"id":"target-1","chains":["Old","Group"]},
+                {"id":"other-group","chains":["Old","Other"]},
+                {"id":"new-route","chains":["New","Group"]},
+                {"id":"new-nested-route","chains":["Old","New","Group"]},
+                {"id":"unrelated","chains":["DIRECT"]}
+            ]}))
+        }
+
+        fn with_connections(select_status: u16, close_status: u16, connections: Value) -> Self {
+            use tauri_plugin_mihomo::{Mihomo, MihomoContext, models::Protocol};
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let path = std::env::temp_dir().join(format!("tez-route-{}.sock", nanoid::nanoid!(8)));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = requests.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut headers = Vec::new();
+                    let mut byte = [0];
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        assert_eq!(socket.read(&mut byte).await.unwrap(), 1);
+                        headers.push(byte[0]);
+                        assert!(headers.len() < 4096);
+                    }
+                    let headers = std::str::from_utf8(&headers).unwrap();
+                    let request = headers.lines().next().unwrap();
+                    observed.lock().unwrap().push(request.to_owned());
+                    let length = headers.lines().find_map(|line| {
+                        line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    }).unwrap_or(0);
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let (status, body) = if request.starts_with("PUT /proxies/Group ") {
+                        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"name":"New"}));
+                        (select_status, json!({"message":"selection failed"}).to_string())
+                    } else if request == "GET /connections HTTP/1.1" {
+                        (200, connections.to_string())
+                    } else {
+                        (close_status, json!({"message":"close failed"}).to_string())
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let socket = path.to_string_lossy().to_string();
+            let http = MihomoContext::build_client(&Protocol::LocalSocket, Some(&socket)).unwrap();
+            let client = Mihomo::new(MihomoContext::new(Protocol::LocalSocket, None, None, None, Some(socket), std::time::Duration::from_secs(3), http));
+            Self { client, path, requests, task }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RouteController {
+        fn drop(&mut self) {
+            self.task.abort();
+            std::fs::remove_file(&self.path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn route_switch_closes_only_connections_using_the_previous_route_in_its_group() {
+        let controller = RouteController::new(204, 204);
+        let route = RouteParams { group: "Group".into(), name: "New".into() };
+        let cleanup = apply_route_selection(&controller.client, &route, Some("Old"), true, || Ok(())).await.unwrap();
+        assert_eq!(json!(cleanup), json!({"requested":true,"completed":true,"closed":1}));
+        assert_eq!(controller.requests(), [
+            "PUT /proxies/Group HTTP/1.1",
+            "GET /connections HTTP/1.1",
+            "DELETE /connections/target-1 HTTP/1.1",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn route_switch_matches_the_previous_selected_group_inside_outer_chains() {
+        let controller = RouteController::with_connections(204, 204, json!({"connections":[
+            {"id":"target-1","chains":["Exit","OldGroup","Group","Outer"]},
+            {"id":"other-group","chains":["Exit","OldGroup","Other","Outer"]},
+            {"id":"new-nested-route","chains":["Exit","OldGroup","New","Group","Outer"]}
+        ]}));
+        let route = RouteParams { group: "Group".into(), name: "New".into() };
+        let cleanup = apply_route_selection(&controller.client, &route, Some("OldGroup"), true, || Ok(())).await.unwrap();
+        assert_eq!(json!(cleanup), json!({"requested":true,"completed":true,"closed":1}));
+        assert_eq!(controller.requests(), [
+            "PUT /proxies/Group HTTP/1.1",
+            "GET /connections HTTP/1.1",
+            "DELETE /connections/target-1 HTTP/1.1",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn route_switch_preserves_connections_when_cleanup_is_disabled_or_no_route_changed() {
+        for (auto_close, previous) in [(false, Some("Old")), (true, Some("New")), (true, None)] {
+            let controller = RouteController::new(204, 204);
+            let route = RouteParams { group: "Group".into(), name: "New".into() };
+            let cleanup = apply_route_selection(&controller.client, &route, previous, auto_close, || Ok(())).await.unwrap();
+            assert_eq!(json!(cleanup), json!({"requested":false,"completed":false,"closed":0}));
+            assert_eq!(controller.requests(), ["PUT /proxies/Group HTTP/1.1"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_route_switch_never_reads_or_closes_connections() {
+        let controller = RouteController::new(500, 204);
+        let route = RouteParams { group: "Group".into(), name: "New".into() };
+        let failure = apply_route_selection(&controller.client, &route, Some("Old"), true, || Ok(())).await.unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("ROUTE_SELECT_FAILED"));
+        assert_eq!(controller.requests(), ["PUT /proxies/Group HTTP/1.1"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_connection_cleanup_preserves_the_applied_route_switch() {
+        let controller = RouteController::new(204, 500);
+        let route = RouteParams { group: "Group".into(), name: "New".into() };
+        let cleanup = apply_route_selection(&controller.client, &route, Some("Old"), true, || Ok(())).await.unwrap();
+        assert_eq!(json!(cleanup), json!({
+            "requested":true,"completed":false,"closed":0,
+            "failure":{"code":"CONNECTION_CLOSE_FAILED","detail":"Cannot close the selected connection"}
+        }));
+        assert_eq!(controller.requests(), [
+            "PUT /proxies/Group HTTP/1.1",
+            "GET /connections HTTP/1.1",
+            "DELETE /connections/target-1 HTTP/1.1",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn route_switch_and_cleanup_require_owned_core_readiness() {
+        let route = RouteParams { group: "Group".into(), name: "New".into() };
+        for (mode, ready, code) in [
+            (RunningMode::NotRunning, false, "CORE_NOT_RUNNING"),
+            (RunningMode::Service, false, "CORE_NOT_READY"),
+        ] {
+            let controller = RouteController::new(204, 204);
+            let failure = apply_route_selection(&controller.client, &route, Some("Old"), true, || {
+                ownership_guard(&Request::CloseConnection("target-1".into()), mode, ready).map(|_| ())
+            }).await.unwrap_err();
+            assert_eq!(failure.code.as_deref(), Some(code));
+            assert!(controller.requests().is_empty());
+        }
+        let controller = RouteController::new(204, 204);
+        let checks = std::cell::Cell::new(0);
+        let cleanup = apply_route_selection(&controller.client, &route, Some("Old"), true, || {
+            checks.set(checks.get() + 1);
+            ownership_guard(&Request::CloseConnection("target-1".into()), RunningMode::Service, checks.get() < 3).map(|_| ())
+        }).await.unwrap();
+        assert_eq!(cleanup.failure.unwrap().code.as_deref(), Some("CORE_NOT_READY"));
+        assert!(!cleanup.completed);
+        assert_eq!(cleanup.closed, 0);
+        assert_eq!(controller.requests(), ["PUT /proxies/Group HTTP/1.1", "GET /connections HTTP/1.1"]);
     }
 
     #[cfg(unix)]

@@ -52,7 +52,9 @@ struct FixtureConfig {
     geo_auto_update: bool,
     profile: FixtureProfile,
     dns: Disabled,
-    tun: Disabled,
+    tun: FixtureTun,
+    #[serde(default,rename="unified-delay")]
+    _unified_delay: Option<bool>,
     proxies: Vec<Value>,
     proxy_groups: Vec<FixtureGroup>,
     rules: Vec<String>,
@@ -62,6 +64,13 @@ struct FixtureConfig {
 #[serde(deny_unknown_fields)]
 struct Disabled {
     enable: bool,
+}
+
+#[derive(Deserialize)]
+struct FixtureTun {
+    enable: bool,
+    #[serde(flatten)]
+    options: serde_json::Map<String,Value>,
 }
 
 #[derive(Deserialize)]
@@ -102,12 +111,20 @@ fn validate_fixture(content: &str) -> Result<()> {
     );
     ensure!(
         config.external_controller.is_empty()
-            && config.proxies.is_empty()
             && !config.geo_auto_update
             && !config.profile.store_selected
             && !config.profile.store_fake_ip,
         "fixture cannot expose endpoints"
     );
+    if !config.tun.options.is_empty(){crate::native_proxy::validate_values(&serde_json::from_value(json!({"tun":config.tun.options}))?).map_err(|_|anyhow::anyhow!("unsupported fixture TUN fields"))?;}
+    let chain_nodes=config.proxies.len()==2&&config.proxies.iter().enumerate().all(|(index,proxy)|{
+        let Some(mut fields)=proxy.as_object().cloned() else{return false};
+        let dialer=fields.remove("dialer-proxy");
+        let name=if index==0{"Entry"}else{"Exit"};
+        fields==json!({"name":name,"type":"socks5","server":"127.0.0.1","port":1}).as_object().unwrap().clone()
+            &&dialer.as_ref().is_none_or(|v|v.as_str().is_some_and(|v|["Entry","Exit"].contains(&v)&&v!=name))
+    });
+    ensure!(config.proxies.is_empty()||chain_nodes,"fixture nodes can only use fixed loopback destinations");
     ensure!(
         ["info", "warning", "debug", "error", "silent"].contains(&config.log_level.as_str()),
         "unsupported fixture log level"
@@ -120,7 +137,8 @@ fn validate_fixture(content: &str) -> Result<()> {
     ensure!(
         group.name == "Fixture"
             && group.kind == "select"
-            && (group.proxies == ["DIRECT", "REJECT"] || group.proxies == ["REJECT", "DIRECT"]),
+            && (group.proxies == ["DIRECT", "REJECT"] || group.proxies == ["REJECT", "DIRECT"]
+                || (chain_nodes&&group.proxies==["DIRECT","REJECT","Entry","Exit"])),
         "fixture can only select builtin actions"
     );
     Ok(())
@@ -253,7 +271,7 @@ impl Session {
         let core = executable
             .parent()
             .context("missing helpers directory")?
-            .join("verge-mihomo");
+            .join("mihomo");
         validate_fixture(FIXTURE)?;
         create_root(&root)?;
         fs::write(root.join("profile.yaml"), FIXTURE)?;
@@ -355,7 +373,7 @@ impl Session {
             });
             validate_route(&view, &route).map_err(|_| anyhow::anyhow!("invalid fixture route"))?;
             ensure!(
-                route.group == "Fixture" && ["DIRECT", "REJECT"].contains(&route.name.as_str()),
+                route.group == "Fixture" && ["DIRECT", "REJECT", "Entry", "Exit"].contains(&route.name.as_str()),
                 "unsupported fixture route"
             );
             self.request(
@@ -419,7 +437,7 @@ impl Session {
             anyhow::bail!("fixture core did not become ready");
         }
         let name: String = serde_json::from_slice(&fs::read(self.root.join("selection.json"))?)?;
-        if !["DIRECT", "REJECT"].contains(&name.as_str()) {
+        if !["DIRECT", "REJECT", "Entry", "Exit"].contains(&name.as_str()) {
             self.stop().await?;
             anyhow::bail!("invalid saved fixture selection");
         }
@@ -525,7 +543,7 @@ impl Session {
     async fn restore_selection(&mut self) -> Result<()> {
         let name: String = serde_json::from_slice(&fs::read(self.root.join("selection.json"))?)?;
         ensure!(
-            ["DIRECT", "REJECT"].contains(&name.as_str()),
+            ["DIRECT", "REJECT", "Entry", "Exit"].contains(&name.as_str()),
             "invalid saved fixture selection"
         );
         self.select(
@@ -540,6 +558,42 @@ impl Session {
         Ok(())
     }
 
+    async fn chain_command(&mut self,command:&str,params:Value)->CmdResult<Value>{
+        use crate::native_chain::{Store,Active};
+        crate::native_chain::validate(command,params.clone())?;
+        let mut store=Store::load(&self.root)?;
+        let original=fs::read_to_string(self.root.join("profile.yaml")).map_err(isolated_io_error)?;
+        let config:serde_yaml_ng::Mapping=serde_yaml_ng::from_str(&original).map_err(isolated_io_error)?;
+        let applied=store.active.as_ref().is_some_and(|a|crate::native_chain::links_match(&config,&a.chain));
+        if command=="native_get_proxy_chains"{return Ok(json!({"chains":store.chains,"activeId":store.active.as_ref().map(|a|&a.id),"applied":applied,"available":crate::native_chain::available(&config),"groups":["Fixture"]}));}
+        if matches!(command,"native_save_proxy_chain"|"native_delete_proxy_chain"){return store.edit(&self.root,command,params,applied);}
+        if self.runtime().map_err(isolated_io_error)?["running"]!=true{return Err(CommandFailure::coded("CORE_NOT_RUNNING","No isolated core is running"));}
+        let (chain,enable)=if command=="native_activate_proxy_chain"{
+            if applied{return Err(CommandFailure::coded("CHAIN_ACTIVE","Disable the active fixture chain first"));}
+            let chain=store.chains.iter().find(|c|Some(c.id.as_str())==params["id"].as_str()).cloned().ok_or_else(||isolated_io_error("missing chain"))?;
+            if chain.group!="Fixture"{return Err(CommandFailure::coded("INVALID_CHAIN","Only the isolated fixture group is available"));}
+            (chain,true)
+        }else{(store.active.as_ref().ok_or_else(||isolated_io_error("no active chain"))?.chain.clone(),false)};
+        let next=crate::native_chain::change_links(&config,&chain,enable)?;
+        let result=self.save(ProfileRequest{uid:"fixture".into(),content:serde_yaml_ng::to_string(&next).map_err(isolated_io_error)?,expected_revision:profile_revision(&original)}).await?;
+        if result["saved"]!=true{return Err(CommandFailure::coded("ISOLATED_APPLY_FAILED",result));}
+        if enable{
+            let previous=serde_json::from_slice::<String>(&fs::read(self.root.join("selection.json")).map_err(isolated_io_error)?).map_err(isolated_io_error)?;
+            if self.select(RouteParams{group:"Fixture".into(),name:chain.nodes.last().unwrap().clone()},true).await.is_err(){
+                let current=fs::read_to_string(self.root.join("profile.yaml")).map_err(isolated_io_error)?;
+                let rollback=self.save(ProfileRequest{uid:"fixture".into(),content:original,expected_revision:profile_revision(&current)}).await?;
+                return Err(CommandFailure::coded("CHAIN_SELECT_FAILED",rollback));
+            }
+            store.active=Some(Active{id:chain.id.clone(),profile:"fixture".into(),chain,previous:Some(previous)});
+        }else{
+            if let Some(previous)=store.active.as_ref().and_then(|a|a.previous.clone()){
+                self.select(RouteParams{group:"Fixture".into(),name:previous},true).await?;
+            }
+            store.active=None;
+        }
+        store.save(&self.root)?;Ok(json!({"applied":true,"persisted":true,"selectionRestored":true}))
+    }
+
     async fn dispatch(&mut self, command: &str, params: Value) -> CmdResult<Value> {
         if self.closing && !["native_get_runtime", "native_prepare_shutdown"].contains(&command) {
             return Err(CommandFailure::coded(
@@ -547,6 +601,18 @@ impl Session {
                 "Session is closing",
             ));
         }
+        if crate::native_proxy::COMMANDS.contains(&command) {
+            let patch=crate::native_proxy::parse(command,params)?;
+            let original=fs::read_to_string(self.root.join("profile.yaml")).map_err(isolated_io_error)?;
+            let mut config:serde_yaml_ng::Mapping=serde_yaml_ng::from_str(&original).map_err(isolated_io_error)?;
+            let Some(values)=patch else{return Ok(crate::native_proxy::project(&config));};
+            let mapping=crate::native_proxy::preserve_tun_fields(&config,crate::native_proxy::yaml_mapping(values)?);
+            config.extend(mapping);
+            let result=self.save(ProfileRequest{uid:"fixture".into(),content:serde_yaml_ng::to_string(&config).map_err(isolated_io_error)?,expected_revision:profile_revision(&original)}).await?;
+            if result["saved"]!=true{return Err(CommandFailure::coded("ISOLATED_APPLY_FAILED",result));}
+            return Ok(json!({"saved":true,"applied":true}));
+        }
+        if crate::native_chain::COMMANDS.contains(&command) {return self.chain_command(command,params).await;}
         match command {
             "native_close_connection" => {
                 let id = crate::native_control::parse_connection_id(params)?;

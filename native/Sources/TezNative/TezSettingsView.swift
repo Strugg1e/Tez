@@ -17,16 +17,16 @@ struct TezSettingsView: View {
         VStack(spacing: 0) {
             TabView(selection: $selectedTab) {
                 generalSettings
-                    .tabItem { Label("通用", systemImage: "gearshape") }
+                    .tabItem { Label("外观与显示", systemImage: "paintpalette") }
                     .tag(TezSettingsTab.general)
 
                 if let store {
                     NativeNetworkSettingsView(store: store)
-                        .tabItem { Label("网络", systemImage: "network") }.tag(TezSettingsTab.connection)
+                        .tabItem { Label("网络代理", systemImage: "network") }.tag(TezSettingsTab.connection)
                     NativeDNSSettingsView(store: store)
                         .tabItem { Label("DNS", systemImage: "server.rack") }.tag(TezSettingsTab.dns)
                     NativeLocalBackupsView(store: store)
-                        .tabItem { Label("备份", systemImage: "archivebox") }.tag(TezSettingsTab.backups)
+                        .tabItem { Label("备份与恢复", systemImage: "archivebox") }.tag(TezSettingsTab.backups)
                 }
 
                 if allowsBackendExamples {
@@ -40,24 +40,8 @@ struct TezSettingsView: View {
                 }
             }
 
-            Divider()
-
-            HStack(spacing: 12) {
-                Label(allowsBackendExamples ? "示例设置" : "Tez 设置", systemImage: "gearshape")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Button("恢复默认值…") {
-                    confirmsReset = true
-                }
-                .disabled(isDefault)
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 14)
         }
-        .frame(width: 680, height: 620)
+        .frame(width: 740, height: 660)
         .onChange(of: allowsBackendExamples) { _, _ in selectedTab = .general }
         .alert(allowsBackendExamples ? "恢复示例设置？" : "恢复界面设置？", isPresented: $confirmsReset) {
             Button("取消", role: .cancel) {}
@@ -71,52 +55,51 @@ struct TezSettingsView: View {
 
     private var generalSettings: some View {
         @Bindable var preferences = preferences
-        return Form {
-            Section("外观") {
-                Picker("外观", selection: $preferences.appearance) {
-                    ForEach(TezAppearance.allCases) { option in
-                        Text(option.rawValue).tag(option)
+        return VStack(spacing: 0) {
+            TezSettingsPage(title: "外观与显示", summary: "界面偏好即时生效，不改变代理或配置。") {
+                TezSettingsSection(title: "外观") {
+                    TezSettingRow(title: "主题") {
+                        Picker("主题", selection: $preferences.appearance) {
+                            ForEach(TezAppearance.allCases) { Text($0.rawValue).tag($0) }
+                        }.pickerStyle(.segmented).labelsHidden().frame(width: 250)
                     }
                 }
-                .pickerStyle(.segmented)
-            }
-
-            Section("界面") {
-                Toggle("显示线路协议", isOn: $preferences.showProtocol)
-                Toggle("减少动态效果", isOn: $preferences.reduceMotion)
-                Toggle("减少透明度", isOn: $preferences.reduceTransparency)
-                Toggle("增加对比度", isOn: $preferences.increaseContrast)
-                LabeledContent("系统透明度", value: systemReduceTransparency ? "已降低" : "标准")
-                    .foregroundStyle(.secondary)
-
-                if systemReduceMotion {
-                    LabeledContent("系统偏好", value: "减少动态效果已开启")
-                        .foregroundStyle(.secondary)
+                TezSettingsSection(title: "线路显示") {
+                    TezSettingToggle(title: "显示线路协议", detail: "在线路名称旁显示协议类型。", isOn: $preferences.showProtocol)
                 }
-            }
-
-            if allowsBackendExamples {
-                Section("示例线路") {
-                    HStack(spacing: 10) {
-                        Image(systemName: "network")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 20)
-                        Text("东京 01")
-                        Spacer()
-                        if preferences.showProtocol {
-                            Text("Hysteria 2")
-                                .foregroundStyle(.secondary)
-                                .transition(.opacity)
+                TezSettingsSection(title: "辅助显示") {
+                    TezSettingToggle(title: "减少动态效果", detail: "减少界面过渡与状态动画。", isOn: $preferences.reduceMotion)
+                    TezSettingToggle(title: "减少透明度", detail: "使用不透明背景，提高内容辨识度。", isOn: $preferences.reduceTransparency)
+                    TezSettingToggle(title: "增加对比度", detail: "加深内容与背景的区分，同时减少透明效果。", isOn: $preferences.increaseContrast)
+                    if systemReduceMotion || systemReduceTransparency {
+                        TezStatusLabel(title: systemReduceMotion && systemReduceTransparency ? "macOS 已开启减少动态效果与透明度"
+                                       : systemReduceMotion ? "macOS 已开启减少动态效果" : "macOS 已开启减少透明度", symbol: "accessibility")
+                    }
+                }
+                if allowsBackendExamples {
+                    TezSettingsSection(title: "示例线路") {
+                        HStack(spacing: 10) {
+                            Image(systemName: "network").foregroundStyle(.secondary)
+                            Text("东京 01")
+                            Spacer()
+                            if preferences.showProtocol {
+                                Text("Hysteria 2").foregroundStyle(.secondary).transition(.opacity)
+                            }
+                            Text("52 ms").monospacedDigit().foregroundStyle(.secondary)
                         }
-                        Text("52 ms")
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                        .animation(TezMotion(reduced: reducesMotion).feedback, value: preferences.showProtocol)
                     }
-                    .animation(reducesMotion ? nil : .easeInOut(duration: 0.16), value: preferences.showProtocol)
                 }
             }
+            Divider()
+            HStack {
+                TezStatusLabel(title: allowsBackendExamples ? "仅修改示例界面" : "界面偏好即时生效", symbol: "checkmark.circle")
+                Spacer()
+                Button("恢复界面默认值…", systemImage: "arrow.counterclockwise") { confirmsReset = true }
+                    .disabled(isDefault)
+            }.padding(16)
         }
-        .formStyle(.grouped)
     }
 
     private var connectionSettings: some View {

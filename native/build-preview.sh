@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+SWIFT_SCRATCH="${TEZ_NATIVE_SWIFT_SCRATCH:-$ROOT/.build}"
 cd "$ROOT"
 HELPER="${TEZ_NATIVE_HOST:-}"
 WITH_CORE="${TEZ_NATIVE_BUNDLE_CORE:-0}"
@@ -60,8 +61,8 @@ fi
 if [[ "$WITH_SERVICE" == 1 ]]; then
     node "$ROOT/package-service.mjs" --source-check
 fi
-swift build --configuration release --scratch-path "$ROOT/.build"
-BIN_DIR="$(swift build --configuration release --scratch-path "$ROOT/.build" --show-bin-path)"
+swift build --configuration release --scratch-path "$SWIFT_SCRATCH"
+BIN_DIR="$(swift build --configuration release --scratch-path "$SWIFT_SCRATCH" --show-bin-path)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 EXECUTABLE=TezNativePreview
 if [[ "$STANDALONE" == 1 ]]; then EXECUTABLE=Tez; fi

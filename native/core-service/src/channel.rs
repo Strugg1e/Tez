@@ -11,21 +11,21 @@ pub struct ChannelIdentity {
 #[cfg(not(feature = "development-channel"))]
 pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
     id: "production",
-    service_slug: "clash-verge-service",
-    windows_service_name: "clash_verge_service",
-    service_display_name: "Clash Verge Service",
-    macos_app_bundle_id: "io.github.clash-verge-rev.clash-verge-rev",
-    macos_service_id: "io.github.clash-verge-rev.clash-verge-rev.service",
+    service_slug: "tez-service",
+    windows_service_name: "tez_service",
+    service_display_name: "Tez Service",
+    macos_app_bundle_id: "app.tez",
+    macos_service_id: "app.tez.service",
 };
 
 #[cfg(all(feature = "development-channel", not(feature = "acceptance-channel")))]
 pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
     id: "development",
-    service_slug: "clash-verge-service-dev",
-    windows_service_name: "clash_verge_service_dev",
-    service_display_name: "Clash Verge Development Service",
-    macos_app_bundle_id: "io.github.clash-verge-rev.clash-verge-rev.dev",
-    macos_service_id: "io.github.clash-verge-rev.clash-verge-rev.dev.service",
+    service_slug: "tez-service-dev",
+    windows_service_name: "tez_service_dev",
+    service_display_name: "Tez Development Service",
+    macos_app_bundle_id: "app.tez.dev",
+    macos_service_id: "app.tez.dev.service",
 };
 
 #[cfg(feature = "acceptance-channel")]
@@ -56,8 +56,8 @@ mod tests {
             assert_eq!(CHANNEL_IDENTITY.macos_service_id, "app.tez.acceptance.service");
             return;
         }
-        assert!(CHANNEL_IDENTITY.service_slug.starts_with("clash-verge-service"));
-        assert!(CHANNEL_IDENTITY.windows_service_name.starts_with("clash_verge_service"));
+        assert!(CHANNEL_IDENTITY.service_slug.starts_with("tez-service"));
+        assert!(CHANNEL_IDENTITY.windows_service_name.starts_with("tez_service"));
         assert!(
             CHANNEL_IDENTITY
                 .macos_service_id

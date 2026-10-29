@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
-const cores = ['verge-mihomo', 'verge-mihomo-alpha']
+const cores = ['mihomo', 'mihomo-alpha']
 const databases = ['Country.mmdb', 'ASN.mmdb', 'geoip.dat', 'geosite.dat']
 const dnsScripts = ['set_dns.sh', 'unset_dns.sh']
 const architecture = { arm64: 'arm64', x64: 'x86_64' }[os.arch()]
@@ -36,7 +36,7 @@ function sources() {
   const sidecars = path.resolve(process.env.TEZ_NATIVE_SIDECAR_DIR ?? path.join(root, '../src-tauri/sidecar'))
   const resources = path.resolve(process.env.TEZ_NATIVE_RESOURCE_DIR ?? path.join(root, '../src-tauri/resources'))
   const files = [
-    ...cores.map(name => ({ name, executable: true, source: path.join(sidecars, `${name}-${target}`), destination: `Helpers/${name}` })),
+    ...cores.map(name => ({ name, executable: true, source: path.join(sidecars, `verge-${name}-${target}`), destination: `Helpers/${name}` })),
     ...databases.map(name => ({ name, executable: false, source: path.join(resources, name), destination: `Resources/resources/${name}` })),
     ...dnsScripts.map(name => ({ name, executable: false, script: true, source: path.join(resources, name), destination: `Resources/resources/${name}` })),
   ]

@@ -49,8 +49,8 @@ pub(super) async fn inspect(
 
 fn inspect_core(directory: &Path, required: &CoreRequirement) -> CoreAvailability {
     let allowed = [
-        format!("verge-mihomo{}", std::env::consts::EXE_SUFFIX),
-        format!("verge-mihomo-alpha{}", std::env::consts::EXE_SUFFIX),
+        format!("mihomo{}", std::env::consts::EXE_SUFFIX),
+        format!("mihomo-alpha{}", std::env::consts::EXE_SUFFIX),
     ];
     if !allowed.contains(&required.name) {
         return CoreAvailability::Rejected {
@@ -78,4 +78,22 @@ fn inspect_core(directory: &Path, required: &CoreRequirement) -> CoreAvailabilit
     result.unwrap_or_else(|error| CoreAvailability::Rejected {
         reason: error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tez_bundled_core_names_are_inspectable() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("tez-inspection-{}-{nonce}", std::process::id()));
+        for name in ["mihomo", "mihomo-alpha"] {
+            let required = CoreRequirement {
+                name: format!("{name}{}", std::env::consts::EXE_SUFFIX),
+                sha256: None,
+            };
+            assert!(matches!(inspect_core(&root, &required), CoreAvailability::Missing));
+        }
+    }
 }
