@@ -37,6 +37,8 @@ enum TezAppearance: String, CaseIterable, Identifiable {
 }
 
 enum TezStyle {
+    static let pageInset: CGFloat = 24
+    static let footerHeight: CGFloat = 34
     static let success = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(srgbRed: 0.35, green: 0.80, blue: 0.62, alpha: 1)
@@ -46,6 +48,11 @@ enum TezStyle {
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(srgbRed: 0.43, green: 0.64, blue: 1, alpha: 1)
             : NSColor(srgbRed: 0.141, green: 0.353, blue: 0.769, alpha: 1)
+    })
+    static let warning = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.96, green: 0.70, blue: 0.28, alpha: 1)
+            : NSColor(srgbRed: 0.55, green: 0.30, blue: 0.04, alpha: 1)
     })
 }
 

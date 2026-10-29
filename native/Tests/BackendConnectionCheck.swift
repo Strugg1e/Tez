@@ -48,7 +48,13 @@ struct BackendConnectionCheck {
         exit(9)
     }
 
-    static func fixture(_ mode: String) throws {
+    static func fixture(_ requestedMode: String) throws {
+        let claimedFile = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent(".automatic-claim-ready")
+        let installedFile = claimedFile.deletingLastPathComponent().appendingPathComponent(".automatic-install-ready")
+        let mode: String
+        if requestedMode == "automatic-claim" { mode = FileManager.default.fileExists(atPath: claimedFile.path) ? "prepared-normal" : "automatic-readonly" }
+        else if requestedMode.hasPrefix("automatic-install") { mode = FileManager.default.fileExists(atPath: installedFile.path) ? "prepared-normal" : "automatic-readonly" }
+        else { mode = requestedMode }
         if mode == "activation-busy" { exit(73) }
         if mode == "activation-refused" { exit(78) }
         if mode == "activation-unknown" { exit(3) }
@@ -67,6 +73,10 @@ struct BackendConnectionCheck {
             try emit(.hello(sessionID: String(getpid()), capabilities: capabilities))
         } else if mode.hasPrefix("prepared-") || mode.hasPrefix("recovery-") {
             try emit(.hello(sessionID: "fixture", capabilities: ["native_subscribe", "native_get_snapshot", "native_prepare_shutdown"]))
+        } else if mode == "automatic-readonly" {
+            try emit(.hello(sessionID: "fixture", capabilities: ["native_continuous_session", "native_subscribe", "native_get_snapshot", "native_inspect_core", "native_claim_core", "native_install_service"]))
+        } else if mode == "automatic-unsafe" {
+            try emit(.hello(sessionID: "fixture", capabilities: ["native_subscribe", "native_get_snapshot", "native_core_start"]))
         } else {
             try emit(.hello(sessionID: "fixture", capabilities: ["native_subscribe", "native_get_snapshot", "fixture-only"]))
         }
@@ -75,7 +85,8 @@ struct BackendConnectionCheck {
         var prepareAttempts = 0
         var prepared = false
         while let line = readLine() {
-            guard case .request(let id, let command, _) = try BackendWire.decode(Data(line.utf8)) else { exit(2) }
+            guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { exit(2) }
+            if mode == "automatic-readonly", command.hasPrefix("native_core_") || command == "native_prepare_shutdown" { exit(88) }
             if command == "native_subscribe" {
                 if mode == "no-subscribe" { continue }
                 try emit(.response(id: id, outcome: .result(mode.hasPrefix("renewal") ? renewalSnapshot() : snapshot)))
@@ -84,6 +95,19 @@ struct BackendConnectionCheck {
                 }
                 if mode == "corrupt" { try FileHandle.standardOutput.write(contentsOf: Data("not-json\n".utf8)) }
                 if mode == "eof" { return }
+            } else if command == "native_claim_core" && requestedMode == "automatic-claim" {
+                guard params["confirmed"] == .bool(true) else { exit(2) }
+                try Data("claimed".utf8).write(to: claimedFile)
+                try emit(.response(id: id, outcome: .result(.object(["claimed": .bool(true), "reconnectRequired": .bool(true)]))))
+            } else if command == "native_install_service" && requestedMode.hasPrefix("automatic-install") {
+                guard params["confirmed"] == .bool(true) else { exit(2) }
+                Thread.sleep(forTimeInterval: requestedMode == "automatic-install-cancel" ? 1.5 : 0.25)
+                if requestedMode == "automatic-install-cancel" {
+                    try emit(.response(id: id, outcome: .error(.init(detail: "Administrator authorization cancelled", code: .string("SERVICE_INSTALL_CANCELLED"), operation: nil))))
+                } else {
+                    try Data("installed".utf8).write(to: installedFile)
+                    try emit(.response(id: id, outcome: .result(.object(["installed": .bool(true), "reconnectRequired": .bool(true)]))))
+                }
             } else if command == "break-main" {
                 try FileHandle.standardOutput.close()
             } else if command == "recovery-directory" {
@@ -137,6 +161,7 @@ struct BackendConnectionCheck {
         }
         if mode == "prepared-eof-delay" { Thread.sleep(forTimeInterval: 0.3) }
         if mode == "prepared-failed" { exit(3) }
+        if mode == "automatic-unsafe" { exit(3) }
         if mode == "renewal-slow-exit" { Thread.sleep(forTimeInterval: 0.4) }
     }
 
@@ -150,8 +175,8 @@ struct BackendConnectionCheck {
     }
 
     @MainActor
-    static func wait(_ predicate: () -> Bool) async throws {
-        for _ in 0..<300 {
+    static func wait(attempts: Int = 300, _ predicate: () -> Bool) async throws {
+        for _ in 0..<attempts {
             if predicate() { return }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -168,6 +193,17 @@ struct BackendConnectionCheck {
             try fixture(name.contains("unsafe") ? "renewal-unsafe" : name.contains("slow") ? "renewal-slow-exit" : "renewal")
             return
         }
+        let legacySnapshot = try NativeSnapshot.decode(snapshot)
+        precondition(legacySnapshot.network == nil)
+        for enabled in [true, false] {
+            precondition(NativeObservedSwitch(state: "ready", enabled: enabled).label == (enabled ? "开启" : "关闭"))
+        }
+        precondition(NativeObservedSwitch(state: "unavailable", enabled: false).label == "未确认")
+        precondition(NativeObservedSwitch(state: "ready", enabled: nil).label == "未确认")
+        precondition(NativeObservedMode(state: "ready", value: "global").label == "全局")
+        precondition(NativeObservedMode(state: "ready", value: "rule").label == "规则")
+        precondition(NativeObservedMode(state: "ready", value: "unexpected").label == "未确认")
+        precondition(NativeObservedMode(state: "unavailable", value: "rule").label == "未确认")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -176,6 +212,110 @@ struct BackendConnectionCheck {
         func store(_ mode: String) -> NativeBackendStore {
             NativeBackendStore(helperURL: helper, arguments: ["--fixture", mode], timeout: .milliseconds(200), mode: .attach)
         }
+        let automaticRead = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-readonly"],
+            timeout: .seconds(1), mode: .automatic)
+        automaticRead.connect()
+        try await wait { automaticRead.state == .connected }
+        precondition(automaticRead.isReadOnlyConnection && !automaticRead.requiresManagedShutdown)
+        precondition(automaticRead.supports("native_inspect_core") && !automaticRead.supports("native_core_start"))
+        guard case .integer(let observerPID) = try await automaticRead.request("pid"),
+              case .string(let observerRecovery) = try await automaticRead.request("recovery-directory") else { fatalError() }
+        let observerClosed = await automaticRead.shutdownForTermination()
+        precondition(observerClosed && automaticRead.state == .disconnected)
+        try await wait { kill(pid_t(observerPID), 0) == -1 && errno == ESRCH }
+        try await wait { !FileManager.default.fileExists(atPath: observerRecovery) }
+
+        let automaticReconnect = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-readonly"],
+            timeout: .seconds(1), mode: .automatic)
+        automaticReconnect.connect()
+        try await wait { automaticReconnect.state == .connected }
+        for attempt in 1...3 {
+            guard case .integer(let before) = try await automaticReconnect.request("pid") else { fatalError() }
+            do { _ = try await automaticReconnect.request("exit"); fatalError("Exited helper returned a result") } catch {}
+            try await wait { automaticReconnect.state == .failed }
+            try await wait(attempts: 800) { automaticReconnect.state == .connected }
+            guard case .integer(let after) = try await automaticReconnect.request("pid") else { fatalError() }
+            precondition(before != after && automaticReconnect.isReadOnlyConnection, "Reconnect attempt \(attempt)")
+        }
+        do { _ = try await automaticReconnect.request("exit"); fatalError("Exited helper returned a result") } catch {}
+        try await wait { automaticReconnect.state == .failed }
+        try await Task.sleep(for: .milliseconds(1200))
+        precondition(automaticReconnect.state == .failed && !automaticReconnect.requiresManagedShutdown)
+        automaticReconnect.connect()
+        try await wait { automaticReconnect.state == .connected }
+        do { _ = try await automaticReconnect.request("exit"); fatalError("Exited helper returned a result") } catch {}
+        try await wait { automaticReconnect.state == .failed }
+        automaticReconnect.disconnect()
+        try await Task.sleep(for: .milliseconds(1200))
+        precondition(automaticReconnect.state == .disconnected && automaticReconnect.capabilities.isEmpty)
+
+        let automaticManaged = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "prepared-normal"],
+            timeout: .seconds(1), mode: .automatic)
+        automaticManaged.connect()
+        try await wait { automaticManaged.state == .connected }
+        precondition(automaticManaged.requiresManagedShutdown && !automaticManaged.isReadOnlyConnection)
+        let managedAutomaticClosed = await automaticManaged.shutdownForTermination()
+        precondition(managedAutomaticClosed && automaticManaged.state == .disconnected)
+        let claimedAutomatic = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-claim"],
+            timeout: .seconds(1), mode: .automatic)
+        claimedAutomatic.connect()
+        try await wait { claimedAutomatic.state == .connected }
+        precondition(claimedAutomatic.isReadOnlyConnection && claimedAutomatic.supports("native_claim_core"))
+        guard case .integer(let beforeClaimPID) = try await claimedAutomatic.request("pid") else { fatalError() }
+        _ = try await claimedAutomatic.request("native_claim_core", params: ["confirmed": .bool(true)], serialWorkspace: true)
+        claimedAutomatic.reconnectAfterClaim()
+        try await wait { claimedAutomatic.state == .connected && claimedAutomatic.requiresManagedShutdown }
+        precondition(!claimedAutomatic.isReadOnlyConnection)
+        try await wait { kill(pid_t(beforeClaimPID), 0) == -1 && errno == ESRCH }
+        let claimClosed = await claimedAutomatic.shutdownForTermination()
+        precondition(claimClosed && claimedAutomatic.state == .disconnected)
+        let cancelledInstall = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-install-cancel"],
+            timeout: .seconds(1), mode: .automatic)
+        cancelledInstall.connect()
+        try FileHandle.standardError.write(contentsOf: Data("Checking cancelled service installation\n".utf8))
+        try await wait { cancelledInstall.state == .connected }
+        let installing = Task { try await cancelledInstall.installService(params: ["confirmed": .bool(true), "expected": .null]) }
+        try await wait { cancelledInstall.serviceSetupInProgress && cancelledInstall.workspaceBusy }
+        precondition(cancelledInstall.blocksTermination && !cancelledInstall.requiresManagedShutdown)
+        let quitDuringInstall = await cancelledInstall.shutdownForTermination()
+        precondition(!quitDuringInstall)
+        cancelledInstall.disconnect()
+        try FileHandle.standardError.write(contentsOf: Data("Checking successful service installation\n".utf8))
+        precondition(cancelledInstall.state == .connected)
+        try await Task.sleep(for: .milliseconds(1100))
+        precondition(cancelledInstall.serviceSetupInProgress)
+        do { _ = try await installing.value; fatalError("Cancelled installation returned success") }
+        catch NativeBackendError.remote(let remote) { precondition(remote.code == .string("SERVICE_INSTALL_CANCELLED")) }
+        precondition(!cancelledInstall.serviceSetupInProgress && !cancelledInstall.workspaceBusy && cancelledInstall.isReadOnlyConnection)
+        cancelledInstall.disconnect()
+        let installedAutomatic = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-install"],
+            timeout: .seconds(1), mode: .automatic)
+        installedAutomatic.connect()
+        try await wait { installedAutomatic.state == .connected }
+        let installed = try await installedAutomatic.installService(params: ["confirmed": .bool(true), "expected": .null])
+        guard case .object(let installFields) = installed else { fatalError() }
+        precondition(installFields["installed"] == .bool(true) && !installedAutomatic.serviceSetupInProgress)
+        installedAutomatic.reconnectAfterClaim()
+        try await wait { installedAutomatic.state == .connected && installedAutomatic.requiresManagedShutdown }
+        let installClosed = await installedAutomatic.shutdownForTermination()
+        precondition(installClosed && installedAutomatic.state == .disconnected)
+        let delayedAutomatic = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "prepared-eof-delay"],
+            timeout: .seconds(1), mode: .automatic, shutdownTimeout: .milliseconds(50))
+        delayedAutomatic.connect()
+        try await wait { delayedAutomatic.state == .connected }
+        let delayedAutomaticClosed = await delayedAutomatic.shutdownForTermination()
+        precondition(!delayedAutomaticClosed && delayedAutomatic.state == .shutdownFailed)
+        precondition(delayedAutomatic.requiresManagedShutdown && !delayedAutomatic.isReadOnlyConnection)
+        precondition(delayedAutomatic.capabilities.isEmpty)
+        try await Task.sleep(for: .milliseconds(350))
+        let retriedAutomaticClosed = await delayedAutomatic.shutdownForTermination()
+        precondition(retriedAutomaticClosed && delayedAutomatic.state == .disconnected)
+        let unsafeAutomatic = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-unsafe"],
+            timeout: .seconds(1), mode: .automatic, shutdownTimeout: .milliseconds(100))
+        unsafeAutomatic.connect()
+        try await wait { unsafeAutomatic.state == .shutdownFailed }
+        precondition(!unsafeAutomatic.isReadOnlyConnection && !unsafeAutomatic.supports("native_core_start"))
+        precondition(unsafeAutomatic.requiresManagedShutdown)
         let backend = store("normal")
         precondition(backend.state == .disconnected && backend.snapshot == nil)
         precondition(backend.capabilities.isEmpty && !backend.supports("native_get_snapshot"))
@@ -541,6 +681,6 @@ struct BackendConnectionCheck {
                 preconditionFailure("Forged revision accepted")
             } catch {}
         }
-        print("Backend connection checks passed: handshake, capability gating and reset, FIFO events, correlation, timeout, EOF, corruption, sequence gap, generation, child cleanup, attach renewal/drain/cancellation/safety/timeout, startup refusal/retry/safe close and unknown-exit protection, managed prepare/retry/drain/late-response/EOF confirmation, private broken-pipe recovery/token/sequence/permissions, legacy graceful/timeout/failed shutdown, offline snapshot, structured errors, canonical revisions, DTO projection")
+        print("Backend connection checks passed: automatic observer cleanup, bounded reconnect/cancellation/manual retry, managed automatic shutdown; handshake, capability gating and reset, FIFO events, correlation, timeout, EOF, corruption, sequence gap, generation, child cleanup, attach renewal/drain/cancellation/safety/timeout, startup refusal/retry/safe close and unknown-exit protection, managed prepare/retry/drain/late-response/EOF confirmation, private broken-pipe recovery/token/sequence/permissions, legacy graceful/timeout/failed shutdown, offline snapshot, structured errors, canonical revisions, DTO projection")
     }
 }

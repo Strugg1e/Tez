@@ -20,7 +20,7 @@ struct ActivityCheck {
                 "uploadTotal": .integer(1024), "downloadTotal": .integer(2048), "memory": .integer(4096),
                 "message": .null,
                 "items": .array([.object([
-                    "id": .string("a"), "host": .string(host), "destination": .string("192.0.2.1:443"),
+                    "id": .string("a"), "closeable": .bool(true), "host": .string(host), "destination": .string("192.0.2.1:443"),
                     "network": .string("tcp"), "type": .string("HTTPS"), "process": .string("Browser"),
                     "rule": .string("MATCH"), "chains": .array([.string("DIRECT")]),
                     "upload": .integer(1024), "download": .integer(2048), "start": .string("2026-10-27T00:00:00Z")
@@ -43,6 +43,25 @@ struct ActivityCheck {
         precondition(projected.connections.items[0].matches("BROWSER"))
         precondition(projected.connections.items[0].matches("192.0.2"))
         precondition(!projected.connections.items[0].matches("missing"))
+        var rates = NativeActivityRates()
+        rates.sample(projected.connections, at: 10)
+        precondition(rates.connections["a"]?.upload == nil)
+        rates.sample(projected.connections, at: 12)
+        precondition(rates.connections["a"]?.status == "空闲" && rates.total.upload == 0)
+        guard case .object(var traffic) = fixture(), case .object(var counters) = traffic["connections"],
+              case .array(var trafficRows) = counters["items"], case .object(var trafficRow) = trafficRows[0] else { fatalError() }
+        trafficRow["upload"] = .integer(3072); trafficRow["download"] = .integer(6144)
+        trafficRows[0] = .object(trafficRow); counters["items"] = .array(trafficRows)
+        counters["uploadTotal"] = .integer(3072); counters["downloadTotal"] = .integer(6144)
+        traffic["connections"] = .object(counters)
+        rates.sample(try NativeActivity.decode(.object(traffic)).connections, at: 14)
+        precondition(rates.connections["a"]?.upload == 1024 && rates.connections["a"]?.download == 2048)
+        precondition(rates.connections["a"]?.status == "传输中" && rates.total.download == 2048)
+        rates.sample(projected.connections, at: 16)
+        precondition(rates.connections["a"]?.upload == nil, "Counter resets must not underflow")
+        rates.reset()
+        precondition(rates.connections.isEmpty && rates.total.upload == nil)
+        precondition(NativeConnectionRate.label(nil) == "—" && NativeConnectionRate.label(1024).hasSuffix("/s"))
         let portOnly = NativeActivityConnection(id: "port", host: nil, destination: ":443", network: "tcp",
             type: nil, process: nil, rule: nil, chains: [], upload: 0, download: 0, start: nil)
         precondition(portOnly.title == "未知目标" && portOnly.destinationLabel == "端口 443")
@@ -107,6 +126,18 @@ struct ActivityCheck {
         let model = NativeActivityModel()
         await model.refresh { fixture() }
         precondition(model.snapshot == projected && model.updatedAt != nil && !model.isLoading)
+        var closedIDs: [String] = []
+        let closed = await model.close(id: "a") {
+            closedIDs.append("a")
+            return .object(["closed": .bool(true), "id": .string("a")])
+        }
+        precondition(closed && closedIDs == ["a"] && !model.closeError && model.closingID == nil)
+        let invalid = await model.close(id: "other") { closedIDs.append("other"); return .null }
+        precondition(!invalid && closedIDs == ["a"])
+        let failedClose = await model.close(id: "a") { throw BackendWireError.invalid("injected close error") }
+        precondition(!failedClose && model.closeError && model.closeMessage != nil && model.snapshot == projected)
+        let wrongClose = await model.close(id: "a") { .object(["closed": .bool(true), "id": .string("other")]) }
+        precondition(!wrongClose && model.closeError)
         await model.refresh { throw BackendWireError.invalid("fixture error") }
         precondition(model.snapshot == projected && model.errorMessage != nil)
 
@@ -166,7 +197,7 @@ struct ActivityCheck {
         serialProbe.continuation?.resume(returning: fixture("outdated-page"))
         await serial.value
         precondition(secondCalls == 1 && model.snapshot?.connections.items[0].host == "second-page" && !model.isLoading)
-        print("Activity checks passed: typed projection, full-query parameters, paging bounds, stale-query rejection, serialized refresh and cancellation")
+        print("Activity checks passed: typed projection, paging, stale-query rejection, measured transfer rates and resets, exact single-connection close, error preservation and cancellation")
     }
 
     private static func projectedConnection() -> BackendJSON {

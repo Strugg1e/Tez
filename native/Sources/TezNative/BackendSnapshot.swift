@@ -5,6 +5,7 @@ struct NativeSnapshot: Codable, Equatable, Sendable {
     let profiles: NativeProfilesSnapshot
     let proxyView: NativeProxyView?
     let core: NativeCoreSnapshot
+    var network: NativeNetworkSnapshot? = nil
 
     static func decode(_ value: BackendJSON) throws -> Self {
         let result = try JSONDecoder().decode(Self.self, from: JSONEncoder().encode(value))
@@ -15,6 +16,31 @@ struct NativeSnapshot: Codable, Equatable, Sendable {
             throw BackendWireError.invalid("Unsupported proxy view schema version")
         }
         return result
+    }
+}
+
+struct NativeNetworkSnapshot: Codable, Equatable, Sendable {
+    let systemProxy: NativeObservedSwitch
+    let pac: NativeObservedSwitch
+    let tun: NativeObservedSwitch
+    let mode: NativeObservedMode
+}
+
+struct NativeObservedSwitch: Codable, Equatable, Sendable {
+    let state: String
+    let enabled: Bool?
+    var label: String {
+        guard state == "ready", let enabled else { return "未确认" }
+        return enabled ? "开启" : "关闭"
+    }
+}
+
+struct NativeObservedMode: Codable, Equatable, Sendable {
+    let state: String
+    let value: String?
+    var label: String {
+        guard state == "ready" else { return "未确认" }
+        return switch value { case "rule": "规则"; case "global": "全局"; case "direct": "直连"; default: "未确认" }
     }
 }
 
@@ -36,6 +62,8 @@ struct NativeProfileItem: Codable, Equatable, Sendable, Identifiable {
 struct NativeCoreSnapshot: Codable, Equatable, Sendable {
     let state: String
     let message: String?
+    var source: String? = nil
+    var lifecycle: NativeCoreInspection? = nil
 }
 
 struct NativeProxyView: Codable, Equatable, Sendable {

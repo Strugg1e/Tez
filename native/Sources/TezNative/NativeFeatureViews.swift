@@ -460,16 +460,27 @@ struct NativeLogPayload: Decodable { var lines: [String]; var gap: Bool?; var tr
 struct NativeActivityWorkspace: View {
     let store: NativeBackendStore
     @State private var showsLogs = false
+    @State private var tab = ActivityTab.connections
     var body: some View {
         VStack(spacing: 0) {
-            Picker("活动视图", selection: $showsLogs) {
-                Text("网络活动").tag(false)
-                Text("内核日志").tag(true)
-            }.pickerStyle(.segmented).frame(width: 240).padding(12)
+            HStack {
+                Picker("活动视图", selection: Binding(get: { showsLogs ? "logs" : tab.rawValue }, set: { value in
+                    if let next = ActivityTab(rawValue: value) { tab = next; showsLogs = false }
+                    else { showsLogs = true }
+                })) {
+                    ForEach(ActivityTab.allCases) { Label($0.title, systemImage: $0.symbol).tag($0.rawValue) }
+                    Label("日志", systemImage: "text.alignleft").tag("logs")
+                }.pickerStyle(.segmented).labelsHidden().fixedSize()
+                    .accessibilityLabel("活动视图").accessibilityIdentifier("live.activity.tabs")
+                Spacer(minLength: 0)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, TezStyle.pageInset).frame(height: 48)
             Divider()
             if showsLogs { NativeLogsView(store: store) }
-            else { NativeActivityView(store: store) }
+            else { NativeActivityView(store: store, tab: $tab) }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 struct NativeLogDocument: FileDocument {
@@ -482,6 +493,8 @@ struct NativeLogDocument: FileDocument {
 
 struct NativeLogsView: View {
     @Bindable var store: NativeBackendStore
+    @Environment(TezPreviewPreferences.self) private var preferences
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var operation = NativeFeatureOperation()
     @State private var lines: [String] = []
     @State private var logGap = false
@@ -494,38 +507,64 @@ struct NativeLogsView: View {
     @State private var exports = false
     @State private var exportDocument = NativeLogDocument(content: "")
     private var pollKey: String { "\(store.state)-\(level)-\(query)-\(paused)" }
+    private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Picker("级别", selection: $level) { ForEach(["all", "error", "warn", "info", "debug", "trace"], id: \.self) { Text($0 == "all" ? "全部级别" : $0).tag($0) } }.frame(width: 140)
-                TextField("搜索日志", text: $query).textFieldStyle(.roundedBorder)
+            HStack(spacing: 10) {
+                Picker("级别", selection: $level) { ForEach(["all", "error", "warn", "info", "debug", "trace"], id: \.self) { Text($0 == "all" ? "全部级别" : $0).tag($0) } }
+                    .labelsHidden().frame(width: 102).help("日志级别")
+                    .accessibilityIdentifier("live.logs.level")
+                TezSearchField(prompt: "搜索日志", text: $query, identifier: "live.logs.search", surface: Color(nsColor: .textBackgroundColor))
                 Toggle("跟随", isOn: $followsTail).toggleStyle(.checkbox)
-                Button(paused ? "继续" : "暂停", systemImage: paused ? "play.fill" : "pause.fill") { paused.toggle() }.labelStyle(.iconOnly)
-                Button("刷新", systemImage: "arrow.clockwise") { Task { await load() } }.labelStyle(.iconOnly)
-                    .disabled(operation.busy || store.workspaceBusy || !store.supports("native_get_logs"))
-                Button("导出", systemImage: "square.and.arrow.up") { exportDocument = .init(content: lines.joined(separator: "\n")); exports = true }
-                    .labelStyle(.iconOnly).disabled(lines.isEmpty)
-            }.padding(14)
+                    .fixedSize().help("滚动到最新日志")
+                TezToolButton(title: paused ? "继续日志" : "暂停日志", symbol: paused ? "play.fill" : "pause.fill",
+                              enabled: store.supports("native_get_logs"), motion: motion) { paused.toggle() }
+                    .accessibilityIdentifier("live.logs.pause")
+                TezToolButton(title: "刷新日志", symbol: "arrow.clockwise", enabled: !operation.busy && !store.workspaceBusy && store.supports("native_get_logs")) {
+                    Task { await load() }
+                }
+                TezToolButton(title: "导出日志", symbol: "square.and.arrow.up", enabled: !lines.isEmpty) {
+                    exportDocument = .init(content: lines.joined(separator: "\n")); exports = true
+                }
+            }.padding(.horizontal, TezStyle.pageInset).frame(height: 48)
+                .background(Color(nsColor: .controlBackgroundColor))
             Divider()
-            if let error = operation.error { Text(error).font(.caption).foregroundStyle(.red).padding(10).textSelection(.enabled) }
+            if let error = operation.error {
+                TezOperationFeedback(message: error, tone: .error).padding(.horizontal, TezStyle.pageInset).padding(.vertical, 10)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in Text(line).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    LazyVStack(alignment: .leading, spacing: 7) {
+                        ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                            HStack(alignment: .top, spacing: 14) {
+                                Text((index + 1).formatted()).foregroundStyle(.secondary)
+                                    .frame(width: 34, alignment: .trailing).accessibilityHidden(true)
+                                Text(line).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
                         Color.clear.frame(height: 1).id("log-tail")
-                    }.font(.system(size: 11, design: .monospaced)).padding(14)
+                    }.font(.system(size: 12, design: .monospaced))
+                        .padding(.horizontal, TezStyle.pageInset).padding(.vertical, 14)
                 }
                 .onChange(of: lines) { _, _ in if followsTail { proxy.scrollTo("log-tail", anchor: .bottom) } }
                 .overlay {
                     if lines.isEmpty {
-                        ContentUnavailableView(store.supports("native_get_logs") ? "没有匹配的日志" : "日志读取不可用", systemImage: "text.alignleft")
+                        TezEmptyState(title: !store.supports("native_get_logs") ? "日志读取不可用" : query.isEmpty && level == "all" ? "暂无日志" : "没有匹配的日志", symbol: "text.alignleft")
                     }
                 }
             }
             Divider()
-            HStack { Text(logGap ? "日志连接曾中断，期间记录可能缺失" : logTruncated ? "日志达到显示上限" : "\(lines.count) 行 · 内核日志"); Spacer(); Text(!store.supports("native_get_logs") ? "未连接" : paused ? "已暂停" : operation.error != nil ? "读取失败" : streaming ? "实时日志" : "定时读取") }.font(.caption).foregroundStyle(.secondary).padding(12)
+            HStack(spacing: 12) {
+                Text(logGap ? "日志连接曾中断，期间记录可能缺失" : logTruncated ? "日志达到显示上限" : "\(lines.count) 行")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                TezStatusLabel(title: !store.supports("native_get_logs") ? "未连接" : paused ? "已暂停" : operation.error != nil ? "读取失败" : streaming ? "实时日志" : "定时读取",
+                               tone: logGap || logTruncated ? .warning : .neutral,
+                               symbol: paused ? "pause.circle" : "text.alignleft", motion: motion)
+            }.padding(.horizontal, TezStyle.pageInset).frame(height: 28)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor))
         .task(id: pollKey) {
             guard store.supports("native_get_logs") else { return }

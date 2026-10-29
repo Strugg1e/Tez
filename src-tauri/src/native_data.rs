@@ -26,6 +26,7 @@ pub struct NativeData {
     socket_path: PathBuf,
     mihomo: Arc<Mihomo>,
     discover_service: bool,
+    observe_system: bool,
 }
 
 impl NativeData {
@@ -36,6 +37,7 @@ impl NativeData {
             socket_path,
             mihomo,
             discover_service: false,
+            observe_system: false,
         })
     }
 
@@ -46,6 +48,7 @@ impl NativeData {
             .unwrap_or_else(crate::utils::dirs::sidecar_ipc_path)?;
         let mut data = Self::new(data_dir, socket_path)?;
         data.discover_service = discover_service;
+        data.observe_system = true;
         Ok(data)
     }
 
@@ -71,14 +74,18 @@ impl NativeData {
 
     pub async fn snapshot(&self) -> Value {
         // Independent deadlines preserve readable profiles when the controller stalls.
-        let (profiles, core) = tokio::join!(
+        let (profiles, core, network) = tokio::join!(
             tokio::time::timeout(SNAPSHOT_TIMEOUT, self.profiles()),
             tokio::time::timeout(SNAPSHOT_TIMEOUT, self.proxy_view()),
+            async {
+                let controller = self.controller().await.ok();
+                crate::native_network::read(controller.as_ref().map(|(_, client, _)| client.as_ref()), self.observe_system).await
+            },
         );
         let profiles = profiles.unwrap_or_else(|_| profile_state("error", "Profile read deadline exceeded"));
         let (proxy_view, core) =
             core.unwrap_or_else(|_| core_failure("error", "controller_timeout", "Controller read deadline exceeded"));
-        json!({"profiles": profiles, "proxyView": proxy_view, "core": core})
+        json!({"profiles": profiles, "proxyView": proxy_view, "core": core, "network": network})
     }
 
     pub(crate) async fn activity_query(&self, query: crate::native_activity::ActivityQuery) -> Value {

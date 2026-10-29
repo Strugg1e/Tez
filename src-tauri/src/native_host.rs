@@ -19,6 +19,21 @@ const ATTACH_CAPABILITIES: [&str; 5] = [
 ];
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+#[cfg(target_os = "macos")]
+fn inspection_capabilities() -> Vec<&'static str> {
+    let mut capabilities = ATTACH_CAPABILITIES.to_vec();
+    capabilities.extend(["native_continuous_session", "native_inspect_core"]);
+    capabilities
+}
+
+#[cfg(target_os = "macos")]
+fn validate_inspection(command: &str, params: &Value) -> CmdResult<()> {
+    if command != "native_inspect_core" || !params.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Err(CommandFailure::coded("NATIVE_PARAMS_UNSUPPORTED", "Read-only core inspection requires empty params"));
+    }
+    Ok(())
+}
+
 pub(crate) fn serve_managed_with_activity(
     provider: impl FnMut() -> anyhow::Result<Value>,
     mut activity: impl FnMut(ActivityQuery) -> anyhow::Result<Value>,
@@ -76,6 +91,45 @@ pub fn run_attach(data_dir: Option<PathBuf>, socket_path: Option<PathBuf>) -> an
     }
     #[cfg(not(unix))]
     anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_inspection_attach(initial: crate::native_lifecycle::Inspection, allow_claim: bool) -> anyhow::Result<()> {
+    use std::{cell::RefCell, rc::Rc};
+    require_inherited_pipes()?;
+    let data = crate::native_data::NativeData::new_attach(crate::utils::dirs::app_home_dir()?, None)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let claim_capable = allow_claim && initial.reason != "client-already-running" && runtime.block_on(crate::native_ownership::supported()) && crate::native_ownership::can_offer_claim();
+    let install_capable = allow_claim && crate::native_ownership::can_offer_service_install(&initial);
+    let cached = Rc::new(RefCell::new((Instant::now(), initial)));
+    let snapshot_cache = cached.clone();
+    let mut provider = || {
+        runtime.block_on(async {
+            if snapshot_cache.borrow().0.elapsed() >= Duration::from_secs(5) {
+                let next = crate::native_lifecycle::inspect().await;
+                *snapshot_cache.borrow_mut() = (Instant::now(), next);
+            }
+            let mut snapshot = data.snapshot().await;
+            crate::native_lifecycle::attach_to_snapshot(&mut snapshot, &snapshot_cache.borrow().1);
+            Ok(snapshot)
+        })
+    };
+    let mut handler = |command: &str, params: Value| {
+        if command == "native_claim_core" && claim_capable { return runtime.block_on(crate::native_ownership::claim(params)); }
+        if command == "native_install_service" && install_capable { return runtime.block_on(crate::native_ownership::install_service(params)); }
+        validate_inspection(command, &params)?;
+        let next = runtime.block_on(crate::native_lifecycle::inspect());
+        let value = serde_json::to_value(&next).map_err(CommandFailure::plain)?;
+        *cached.borrow_mut() = (Instant::now(), next);
+        Ok(value)
+    };
+    let mut activity = |query| Ok(runtime.block_on(data.activity_query(query)));
+    let mut capabilities = inspection_capabilities();
+    if claim_capable { capabilities.push("native_claim_core"); }
+    if install_capable { capabilities.push("native_install_service"); }
+    let mut output = PipeWriter::new()?;
+    serve_workspace_with_activity(io::stdin().lock(), &mut output, &nanoid::nanoid!(),
+        &mut provider, wait_for_input, Some(&mut handler), Some(&mut activity), Some(&capabilities))
 }
 
 #[cfg(unix)]
@@ -546,7 +600,9 @@ mod tests {
         }
     }
 
-    const MANAGED_COMMANDS: [&str; 20] = [
+    const LIFECYCLE_COMMANDS: [&str; 5] = ["native_claim_core", "native_prepare_core_upgrade", "native_upgrade_core", "native_get_core_control", "native_install_service"];
+    const MANAGED_COMMANDS: [&str; 21] = [
+        "native_close_connection",
         "native_read_profile",
         "native_save_profile",
         "native_select_route",
@@ -640,6 +696,7 @@ mod tests {
         let input = Chunks(
             MANAGED_COMMANDS
                 .iter()
+                .chain(LIFECYCLE_COMMANDS.iter())
                 .enumerate()
                 .map(|(index, command)| request(&index.to_string(), command, json!({})))
                 .collect(),
@@ -655,11 +712,35 @@ mod tests {
         .unwrap();
         let result = frames(&output);
         assert_eq!(result[0]["capabilities"], json!(ATTACH_CAPABILITIES));
-        assert_eq!(result.len(), MANAGED_COMMANDS.len() + 1);
+        assert_eq!(result.len(), MANAGED_COMMANDS.len() + LIFECYCLE_COMMANDS.len() + 1);
         for response in result.iter().skip(1) {
             assert_eq!(response["error"]["code"], "NATIVE_COMMAND_UNAVAILABLE");
             assert!(response.get("result").is_none());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inspection_workspace_does_not_inherit_mutation_or_shutdown_capabilities() {
+        let input = Chunks(crate::native_managed::CAPABILITIES.iter().chain(LIFECYCLE_COMMANDS.iter())
+            .filter(|command| !ATTACH_CAPABILITIES.contains(command) && **command != "native_continuous_session")
+            .enumerate().map(|(index, command)| request(&format!("seq:{}", index + 1), command, json!({}))).collect());
+        let mut output = Vec::new();
+        serve_workspace_with_activity(input, &mut output, "inspection-test",
+            &mut || panic!("rejected writes must not refresh"), |_| Ok(true),
+            Some(&mut |_, _| panic!("rejected writes must not dispatch")), None,
+            Some(&inspection_capabilities())).unwrap();
+        let result = frames(&output);
+        assert_eq!(result[0]["capabilities"], json!(inspection_capabilities()));
+        assert!(result.len() > 20);
+        for response in result.iter().skip(1) {
+            assert_eq!(response["error"]["code"], "NATIVE_COMMAND_UNAVAILABLE");
+        }
+        assert!(validate_inspection("native_inspect_core", &json!({})).is_ok());
+        for params in [json!({"takeover":true}), json!(null), json!([])] {
+            assert!(validate_inspection("native_inspect_core", &params).is_err());
+        }
+        assert!(validate_inspection("native_core_stop", &json!({})).is_err());
     }
 
     #[test]

@@ -65,6 +65,17 @@ impl Config {
         Self::global().await.runtime_config.clone()
     }
 
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    pub(crate) async fn restore_native_runtime(yaml: &str) -> Result<()> {
+        anyhow::ensure!(yaml.len() <= 4 * 1024 * 1024, "recovered runtime exceeds limit");
+        let config: Mapping = serde_yaml_ng::from_str(yaml)?;
+        let exists_keys = config.keys().filter_map(Value::as_str).map(String::from).collect();
+        let runtime = Self::runtime().await;
+        runtime.edit_draft(|draft| *draft = IRuntime { config: Some(config), exists_keys, ..Default::default() });
+        runtime.apply();
+        Ok(())
+    }
+
     /// Serializes transactions sharing configuration draft layers.
     pub(crate) async fn lock_config_write() -> MutexGuard<'static, ()> {
         CONFIG_WRITE_LOCK.lock().await

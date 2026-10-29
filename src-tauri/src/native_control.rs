@@ -24,6 +24,7 @@ pub(crate) struct RouteParams {
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
     Select(RouteParams),
+    CloseConnection(String),
     Start,
     Stop,
     Restart,
@@ -31,6 +32,9 @@ enum Request {
 }
 
 fn parse_request(command: &str, params: Value) -> CmdResult<Request> {
+    if command == "native_close_connection" {
+        return parse_connection_id(params).map(Request::CloseConnection);
+    }
     if command == "native_select_route" {
         let route: RouteParams =
             serde_json::from_value(params).map_err(|error| CommandFailure::coded("INVALID_PARAMS", error))?;
@@ -61,6 +65,26 @@ fn parse_request(command: &str, params: Value) -> CmdResult<Request> {
         ));
     }
     Ok(request)
+}
+
+pub(crate) fn parse_connection_id(params: Value) -> CmdResult<String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Close { id: String }
+    let request: Close = serde_json::from_value(params)
+        .map_err(|_| CommandFailure::coded("INVALID_PARAMS", "Expected a single connection ID"))?;
+    if request.id.is_empty() || request.id.len() > 128
+        || !request.id.bytes().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_')) {
+        return Err(CommandFailure::coded("INVALID_PARAMS", "Invalid connection ID"));
+    }
+    Ok(request.id)
+}
+
+pub(crate) async fn close_connection(client: &tauri_plugin_mihomo::Mihomo, id: &str) -> CmdResult<Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(3), client.close_connection(id)).await
+        .map_err(|_| CommandFailure::coded("CONNECTION_CLOSE_FAILED", "Connection close timed out"))?
+        .map_err(|_| CommandFailure::coded("CONNECTION_CLOSE_FAILED", "Cannot close the selected connection"))?;
+    Ok(json!({"closed": true, "id": id}))
 }
 
 pub(crate) fn validate_route<'a>(view: &'a ProxyViewV1, route: &RouteParams) -> CmdResult<&'a ProxyGroupView> {
@@ -197,10 +221,10 @@ async fn dispatch_request(request: Request) -> CmdResult<Value> {
 fn ownership_guard(request: &Request, mode: RunningMode, ready: bool) -> CmdResult<bool> {
     let running = !matches!(mode, RunningMode::NotRunning);
     match request {
-        Request::Select(_) | Request::Restart if !running => {
+        Request::Select(_) | Request::CloseConnection(_) | Request::Restart if !running => {
             Err(CommandFailure::coded("CORE_NOT_RUNNING", "No owned core is running"))
         }
-        Request::Select(_) if !ready => Err(CommandFailure::coded("CORE_NOT_READY", "Owned core is not ready")),
+        Request::Select(_) | Request::CloseConnection(_) if !ready => Err(CommandFailure::coded("CORE_NOT_READY", "Owned core is not ready")),
         Request::Stop if !running => Ok(false),
         Request::Start if running => Ok(false),
         _ => Ok(true),
@@ -230,6 +254,7 @@ where
 async fn dispatch_owned_request(request: Request) -> CmdResult<Value> {
     let (result, code) = match request {
         Request::Select(route) => return select_route(route).await,
+        Request::CloseConnection(id) => return close_connection(&Handle::mihomo(), &id).await,
         Request::Runtime => return runtime().await,
         Request::Start => (
             run_prepared(prepare_runtime, || CoreManager::global().start_core()).await,
@@ -292,6 +317,12 @@ mod tests {
 
     #[test]
     fn control_parameters_are_strict_before_backend_access() {
+        for id in ["", "..", "a/b", "a?all=true", "a#b", "a%2fb", "a b", "*"] {
+            assert!(parse_request("native_close_connection", json!({"id":id})).is_err());
+        }
+        assert!(parse_request("native_close_connection", json!({"id":"connection-1","all":true})).is_err());
+        assert_eq!(parse_request("native_close_connection", json!({"id":"connection-1"})).unwrap(),
+            Request::CloseConnection("connection-1".into()));
         for command in [
             "native_core_start",
             "native_core_stop",
@@ -387,6 +418,7 @@ mod tests {
         for request in [
             Request::Stop,
             Request::Restart,
+            Request::CloseConnection("connection-1".into()),
             Request::Select(RouteParams {
                 group: "g".into(),
                 name: "n".into(),
@@ -409,6 +441,7 @@ mod tests {
             assert_eq!(result.is_ok(), is_stop);
         }
         assert_eq!(ownership_guard(&Request::Start, RunningMode::Sidecar, true), Ok(false));
+        assert!(ownership_guard(&Request::CloseConnection("connection-1".into()), RunningMode::Sidecar, false).is_err());
         assert!(
             ownership_guard(
                 &Request::Select(RouteParams {
@@ -420,6 +453,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closes_only_the_requested_connection_on_an_isolated_controller() {
+        use tauri_plugin_mihomo::{Mihomo, MihomoContext, models::Protocol};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for status in [204, 404] {
+            let path = std::env::temp_dir().join(format!("tez-close-{}.sock", nanoid::nanoid!(8)));
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                let mut byte = [0];
+                while !headers.ends_with(b"\r\n\r\n") {
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 1);
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 4096);
+                }
+                assert!(std::str::from_utf8(&headers).unwrap().starts_with("DELETE /connections/connection-1 HTTP/1.1\r\n"));
+                let body = if status == 204 { "" } else { "{\"message\":\"Already ended\"}" };
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let socket = path.to_string_lossy().to_string();
+            let http = MihomoContext::build_client(&Protocol::LocalSocket, Some(&socket)).unwrap();
+            let client = Mihomo::new(MihomoContext::new(Protocol::LocalSocket, None, None, None, Some(socket), std::time::Duration::from_secs(3), http));
+            let result = close_connection(&client, "connection-1").await;
+            if status == 204 {
+                assert_eq!(result.unwrap(), json!({"closed":true,"id":"connection-1"}));
+            } else {
+                assert_eq!(result.unwrap_err().code.as_deref(), Some("CONNECTION_CLOSE_FAILED"));
+            }
+            server.await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

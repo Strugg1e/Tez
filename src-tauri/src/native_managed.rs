@@ -31,6 +31,7 @@ pub const CAPABILITIES: &[&str] = &[
     "native_read_profile",
     "native_save_profile",
     "native_select_route",
+    "native_close_connection",
     "native_core_start",
     "native_core_stop",
     "native_core_restart",
@@ -54,7 +55,7 @@ const DATABASES: [&str; 4] = ["Country.mmdb", "ASN.mmdb", "geoip.dat", "geosite.
 const DNS_SCRIPTS: [&str; 2] = ["set_dns.sh", "unset_dns.sh"];
 
 #[derive(Debug)]
-enum ActivationRefused {
+pub(crate) enum ActivationRefused {
     InstanceUnavailable,
     Preflight,
 }
@@ -250,6 +251,7 @@ fn dispatch_with(
             save(request.uid, request.content, request.expected_revision)
         }
         "native_select_route"
+        | "native_close_connection"
         | "native_core_start"
         | "native_core_stop"
         | "native_core_restart"
@@ -262,6 +264,18 @@ fn dispatch_with(
 }
 
 fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
+    #[cfg(target_os = "macos")]
+    if command == "native_upgrade_core" {
+        return tauri::async_runtime::block_on(crate::native_ownership::upgrade(params));
+    }
+    #[cfg(target_os = "macos")]
+    if command == "native_get_core_control" {
+        return tauri::async_runtime::block_on(crate::native_ownership::control_state(params));
+    }
+    #[cfg(target_os = "macos")]
+    if command == "native_prepare_core_upgrade" {
+        return tauri::async_runtime::block_on(crate::native_ownership::prepare_upgrade(params));
+    }
     if crate::native_workspace::COMMANDS.contains(&command) {
         return tauri::async_runtime::block_on(crate::native_workspace::dispatch(command, params));
     }
@@ -404,6 +418,15 @@ fn shutdown_outcome(served: Result<()>, stopped: Result<()>) -> Result<()> {
 }
 
 pub fn run_stdio() -> Result<()> {
+    run_stdio_with(None)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_restored(proof: clash_verge_service_ipc::OwnerSessionProof) -> Result<()> {
+    run_stdio_with(Some(proof))
+}
+
+fn run_stdio_with(restored: Option<clash_verge_service_ipc::OwnerSessionProof>) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     anyhow::bail!("managed native runtime is supported only on macOS");
 
@@ -416,9 +439,16 @@ pub fn run_stdio() -> Result<()> {
         // Only these pre-command checks can certify a refusal without Core or network effects.
         let (socket, bundle, mut recovery_channel, data) = (|| -> Result<_> {
             let data_dir = crate::utils::dirs::app_home_dir()?;
-            tauri::async_runtime::block_on(check_service_ownership(&data_dir))?;
+            if let Some(proof) = &restored {
+                let credentials = crate::core::owner_identity::current_owner_credentials_for_root(&data_dir)?;
+                let response = tauri::async_runtime::block_on(clash_verge_service_ipc::recover_core_session(&credentials, proof))?;
+                ensure!(response.code == 0 && response.data.is_some(), "Service refused restored owner session");
+            } else {
+                tauri::async_runtime::block_on(check_service_ownership(&data_dir))?;
+            }
             let socket = crate::utils::dirs::sidecar_ipc_path()?;
             tauri::async_runtime::block_on(check_sidecar_ownership(&socket))?;
+            if restored.is_none() { tauri::async_runtime::block_on(crate::native_lifecycle::require_start_admission())?; }
             let bundle = inspect_bundle(&std::env::current_exe()?)?;
             let recovery = crate::native_recovery::RecoveryChannel::from_env()?;
             let data = NativeData::new_attach(data_dir, None)?;
@@ -454,10 +484,32 @@ pub fn run_stdio() -> Result<()> {
                         let recovery = Rc::new(RefCell::new(ManagedRecovery::default()));
                         let commands = recovery.clone();
                         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Some(proof) = restored {
+                                tauri::async_runtime::block_on(CoreManager::global().restore_native_service(proof))?;
+                                // A recovered core does not execute the normal start callback.
+                                // Scheduler failure must not stop that already-running core.
+                                if tauri::async_runtime::block_on(crate::core::timer::Timer::global().init()).is_err() {
+                                    eprintln!("{{\"version\":1,\"kind\":\"diagnostic\",\"code\":\"NATIVE_TIMER_RECOVERY_FAILED\",\"message\":\"Core control recovered; subscription scheduling initialization failed\"}}");
+                                }
+                            }
+                            let mut capabilities = CAPABILITIES.to_vec();
+                            if tauri::async_runtime::block_on(crate::native_ownership::supported()) { capabilities.extend(["native_upgrade_core", "native_prepare_core_upgrade", "native_get_core_control"]); }
                             crate::native_host::serve_managed_with_activity(
                                 || Ok(tauri::async_runtime::block_on(data.snapshot())),
                                 |query| Ok(tauri::async_runtime::block_on(activity_data.activity_query(query))),
                                 move |command, params| {
+                                    #[cfg(feature = "native-lifecycle-acceptance")]
+                                    if command == "native_core_restart" || (command == "native_core_start" && matches!(*CoreManager::global().get_running_mode(), RunningMode::NotRunning)) {
+                                        return Err(CommandFailure::coded("ACCEPTANCE_START_REFUSED", "Acceptance package only recovers its isolated running core"));
+                                    }
+                                    if command == "native_core_start"
+                                        && params.as_object().is_some_and(serde_json::Map::is_empty)
+                                        && matches!(*CoreManager::global().get_running_mode(), RunningMode::NotRunning)
+                                    {
+                                        // Refusal here precedes cleanup obligations and all startup effects.
+                                        tauri::async_runtime::block_on(crate::native_lifecycle::require_start_admission())
+                                            .map_err(|error| CommandFailure::coded("CORE_START_ADMISSION_REFUSED", error))?;
+                                    }
                                     let mut recovery = commands.borrow_mut();
                                     recovery.observe_owned_core(!matches!(
                                         *CoreManager::global().get_running_mode(),
@@ -467,7 +519,7 @@ pub fn run_stdio() -> Result<()> {
                                         tauri::async_runtime::block_on(stop_owned_core(owed))
                                     })
                                 },
-                                None,
+                                Some(&capabilities),
                             )
                         }))
                         .unwrap_or_else(|_| Err(anyhow!("managed pipe worker panicked")));
@@ -930,6 +982,16 @@ mod tests {
 
     #[test]
     fn dispatch_preserves_profile_and_control_results() {
+        let closed = dispatch_with(
+            "native_close_connection", json!({"id":"connection-1"}),
+            |_| unreachable!(), |_, _, _| unreachable!(),
+            |command, params| {
+                assert_eq!(command, "native_close_connection");
+                assert_eq!(params["id"], "connection-1");
+                Ok(json!({"closed":true,"id":"connection-1"}))
+            },
+        );
+        assert_eq!(closed.unwrap()["closed"], true);
         let read = dispatch_with(
             "native_read_profile",
             json!({"uid": "fixture"}),

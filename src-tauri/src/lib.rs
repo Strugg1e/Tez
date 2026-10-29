@@ -15,11 +15,17 @@ mod native_control;
 #[cfg(feature = "native-host")]
 pub mod native_managed;
 #[cfg(all(feature = "native-host", target_os = "macos"))]
+pub mod native_lifecycle;
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+mod native_ownership;
+#[cfg(all(feature = "native-host", target_os = "macos"))]
 pub mod native_isolated;
 #[cfg(feature = "native-host")]
 mod native_data;
 #[cfg(feature = "native-host")]
 mod native_activity;
+#[cfg(feature = "native-host")]
+mod native_network;
 #[cfg(feature = "native-host")]
 mod native_workspace;
 #[cfg(feature = "native-host")]

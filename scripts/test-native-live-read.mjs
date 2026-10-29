@@ -3,13 +3,13 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import path from 'node:path'
 
-const [binary, confirmation] = process.argv.slice(2)
-assert.ok(binary && path.isAbsolute(binary) && confirmation === '--read-only',
-  'Usage: test-native-live-read.mjs <absolute packaged helper> --read-only')
+const [binary, confirmation, mode = '--attach'] = process.argv.slice(2)
+assert.ok(binary && path.isAbsolute(binary) && confirmation === '--read-only' && ['--attach', '--inspect'].includes(mode),
+  'Usage: test-native-live-read.mjs <absolute helper> --read-only [--attach|--inspect]')
 
 // Attach owns no Core and has no write commands. Never log returned private data.
-const child = spawn('/bin/bash', ['-o', 'pipefail', '-c', 'cat | "$1" --stdio --attach | cat',
-  'tez-live-read', binary], { stdio: ['pipe', 'pipe', 'pipe'] })
+const child = spawn('/bin/bash', ['-o', 'pipefail', '-c', 'cat | "$1" --stdio "$2" | cat',
+  'tez-live-read', binary, mode], { stdio: ['pipe', 'pipe', 'pipe'] })
 child.stderr.resume()
 let buffer = ''
 const queue = []
@@ -63,12 +63,40 @@ try {
   assert.equal(snapshot.profiles.state, 'ready')
   assert.equal(snapshot.core.state, 'ready')
   assert.ok(snapshot.proxyView && Array.isArray(snapshot.proxyView.groups))
+  let detection
+  if (mode === '--inspect') {
+    assert.ok(hello.capabilities.includes('native_inspect_core'))
+    assert.ok(hello.capabilities.includes('native_continuous_session'))
+    assert.ok(!hello.capabilities.includes('native_prepare_shutdown'))
+    assert.equal(snapshot.core.lifecycle.state, 'runningReadOnly', `Discovery reason: ${snapshot.core.lifecycle.reason}`)
+    assert.equal(snapshot.core.lifecycle.canStart, false)
+    const inspection = await request('read-inspection', 'native_inspect_core')
+    assert.equal(inspection.corePid, snapshot.core.lifecycle.corePid)
+    assert.equal(inspection.serviceGeneration, snapshot.core.lifecycle.serviceGeneration)
+    assert.ok(inspection.processes.some(process => process.pid === inspection.corePid))
+    assert.ok(!JSON.stringify(inspection).includes('token'))
+    detection = { state: inspection.state, source: inspection.source, pid: inspection.corePid,
+      serviceGeneration: inspection.serviceGeneration, processes: inspection.processes.length }
+  }
   const activity = await request('read-activity', 'native_get_activity')
   assert.equal(activity.connections.state, 'ready')
+  let network
+  if (snapshot.network) {
+    for (const key of ['systemProxy', 'pac', 'tun']) {
+      const state = snapshot.network[key]
+      assert.ok(['ready', 'unavailable'].includes(state.state))
+      assert.equal(state.state === 'ready', typeof state.enabled === 'boolean')
+    }
+    const routing = snapshot.network.mode
+    assert.ok(['ready', 'unavailable'].includes(routing.state))
+    if (routing.state === 'ready') assert.ok(['rule', 'global', 'direct'].includes(routing.value))
+    else assert.equal(routing.value, null)
+    network = snapshot.network
+  }
   summary = { result: 'PASS', profiles: snapshot.profiles.items.length,
     groups: snapshot.proxyView.groups.length, nodes: Object.keys(snapshot.proxyView.records).length,
     activeConnections: activity.connections.total,
-    rulesState: activity.rules.state, providersState: activity.providers.state }
+    rulesState: activity.rules.state, providersState: activity.providers.state, detection, network }
   accepted = true
 } finally {
   child.stdin.end()

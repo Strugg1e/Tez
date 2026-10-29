@@ -13,7 +13,10 @@ struct MaterialHierarchyCheck {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 700),
                               styleMask: [.titled, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
-        let preferences = TezPreviewPreferences()
+        let suite = "tez.material-check.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = TezPreviewPreferences(defaults: defaults)
         let host = NSHostingView(rootView: WorkspaceView(selection: .constant(.routes))
             .environment(preferences))
         window.contentView = host

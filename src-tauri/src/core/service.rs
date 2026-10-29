@@ -39,6 +39,8 @@ use std::{
 
 static OWNER_MONITOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SERVICE_SESSION: Mutex<Option<ActiveServiceSession>> = Mutex::new(None);
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+static NATIVE_CORE_SELECTION: Mutex<Option<PathBuf>> = Mutex::new(None);
 static PENDING_SERVICE_FALLBACK_NOTICE: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_SERVICE_REPAIR_NOTICE: AtomicBool = AtomicBool::new(false);
 static PENDING_SERVICE_OWNER_NOTICE: Mutex<Option<String>> = Mutex::new(None);
@@ -134,6 +136,18 @@ pub(crate) fn active_service_supports_runtime_file_read() -> bool {
 
 pub(crate) fn clear_active_service_session() {
     ACTIVE_SERVICE_SESSION.lock().take();
+}
+
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+pub(crate) fn adopt_native_service_session(proof: OwnerSessionProof) {
+    *ACTIVE_SERVICE_SESSION.lock() = Some(ActiveServiceSession { proof, supports_runtime_staging: true, supports_runtime_file_read: true });
+    start_owner_monitor();
+}
+
+#[cfg(all(feature = "native-host", target_os = "macos"))]
+pub(crate) fn select_native_core(path: &str) {
+    *NATIVE_CORE_SELECTION.lock() = Path::new(path).file_name().and_then(|name| name.to_str())
+        .filter(|name| name.starts_with("tez-")).map(|_| PathBuf::from(path));
 }
 
 #[derive(Clone, Copy, Default)]
@@ -814,7 +828,15 @@ async fn collect_service_runtime_bundle(config_file: &Path) -> Result<RuntimeBun
     drop(verge_config);
 
     let bin_ext = if cfg!(windows) { ".exe" } else { "" };
-    let bin_path = service_core_path(&clash_core, bin_ext)?;
+    let mut bin_path = service_core_path(&clash_core, bin_ext)?;
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    if crate::native_ownership::supported().await {
+        let remembered = NATIVE_CORE_SELECTION.lock().clone();
+        let selected = match remembered { Some(path) => Some(path), None => clash_verge_service_ipc::load_owner_core(&current_owner_credentials()?)? };
+        if let Some(selected) = selected {
+            bin_path = selected;
+        }
+    }
     collect_runtime_bundle(config_file, &bin_path).await
 }
 
@@ -899,13 +921,22 @@ pub(super) async fn start_with_existing_service(config_file: &Path) -> Result<()
     let credentials = current_owner_credentials()?;
     let runtime = collect_service_runtime_bundle(config_file).await?;
     let proposed_session_token = generate_service_session_token()?;
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    let persist_native = crate::native_ownership::supported().await;
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    if persist_native { clash_verge_service_ipc::save_owner_session(&credentials, &proposed_session_token, None)?; }
     let request = StartClashRequest {
         runtime,
         proposed_session_token: proposed_session_token.clone(),
         macos_proxy: None,
     };
 
-    let response = match clash_verge_service_ipc::start_clash(&credentials, &request).await {
+    let response_result = async {
+        #[cfg(all(feature = "native-host", target_os = "macos"))]
+        if persist_native { return clash_verge_service_ipc::start_idle_core(&credentials, &request).await; }
+        clash_verge_service_ipc::start_clash(&credentials, &request).await
+    }.await;
+    let response = match response_result {
         Ok(response) => response,
         Err(error) => {
             tracing::Span::current().record("outcome", "ipc-unreachable");
@@ -946,6 +977,11 @@ pub(super) async fn start_with_existing_service(config_file: &Path) -> Result<()
     }
 
     let result = response.data.context("Tez Service 未返回会话信息")?;
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    if persist_native {
+        // A pending token remains recoverable if the confirmation write fails after service commit.
+        let _ = clash_verge_service_ipc::save_owner_session(&credentials, &proposed_session_token, Some(result.session.generation));
+    }
     tracing::Span::current().record("generation", result.session.generation);
     let capabilities = probe_service_capabilities().await;
     tracing::Span::current().record("staging", capabilities.runtime_staging);
@@ -1521,6 +1557,8 @@ pub(super) async fn stop_core_by_service() -> Result<()> {
 
     clear_active_service_session();
     tracing::Span::current().record("outcome", "stopped");
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    let _ = clash_verge_service_ipc::forget_owner_session(&credentials);
     logging!(info, Type::Service, "服务成功停止核心");
     Ok(())
 }

@@ -5,8 +5,10 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 HELPER="${TEZ_NATIVE_HOST:-}"
 WITH_CORE="${TEZ_NATIVE_BUNDLE_CORE:-0}"
+WITH_SERVICE="${TEZ_NATIVE_BUNDLE_SERVICE:-$WITH_CORE}"
 UI_ONLY="${TEZ_NATIVE_UI_ONLY:-0}"
 STANDALONE="${TEZ_NATIVE_STANDALONE:-0}"
+ACCEPTANCE_HOME="${TEZ_NATIVE_ACCEPTANCE_HOME:-}"
 APP="${TEZ_NATIVE_APP_PATH:-$ROOT/output.noindex/Tez Preview.app}"
 if [[ "$UI_ONLY" != 0 && "$UI_ONLY" != 1 ]]; then
     printf 'TEZ_NATIVE_UI_ONLY must be 0 or 1.\n' >&2
@@ -14,6 +16,10 @@ if [[ "$UI_ONLY" != 0 && "$UI_ONLY" != 1 ]]; then
 fi
 if [[ "$WITH_CORE" != 0 && "$WITH_CORE" != 1 ]]; then
     printf 'TEZ_NATIVE_BUNDLE_CORE must be 0 or 1.\n' >&2
+    exit 1
+fi
+if [[ "$WITH_SERVICE" != 0 && "$WITH_SERVICE" != 1 ]]; then
+    printf 'TEZ_NATIVE_BUNDLE_SERVICE must be 0 or 1.\n' >&2
     exit 1
 fi
 if [[ "$STANDALONE" != 0 && "$STANDALONE" != 1 ]]; then
@@ -25,12 +31,18 @@ if [[ "$APP" != /* || "$APP" != *.app ]]; then
     exit 1
 fi
 if [[ "$STANDALONE" == 1 ]]; then
-    if [[ "$UI_ONLY" != 0 || "$WITH_CORE" != 1 || -z "$HELPER" ]]; then
-        printf 'Standalone packaging requires a managed host and bundled core.\n' >&2
+    if [[ "$UI_ONLY" != 0 || "$WITH_CORE" != 1 || "$WITH_SERVICE" != 1 || -z "$HELPER" ]]; then
+        printf 'Standalone packaging requires a managed host, bundled cores and service tools.\n' >&2
         exit 1
     fi
     if [[ -e "$APP" || -L "$APP" ]]; then
         printf 'Standalone output must not already exist; refusing to overwrite it.\n' >&2
+        exit 1
+    fi
+fi
+if [[ -n "$ACCEPTANCE_HOME" ]]; then
+    if [[ "$ACCEPTANCE_HOME" != /private/tmp/tez-package-acceptance-*/home || ! -d "$ACCEPTANCE_HOME" || "$WITH_SERVICE" != 1 ]]; then
+        printf 'Acceptance packaging requires its prepared private HOME and service tools.\n' >&2
         exit 1
     fi
 fi
@@ -45,6 +57,9 @@ if [[ "$WITH_CORE" == 1 ]]; then
     fi
     node "$ROOT/package-core.mjs" --source-check
 fi
+if [[ "$WITH_SERVICE" == 1 ]]; then
+    node "$ROOT/package-service.mjs" --source-check
+fi
 swift build --configuration release --scratch-path "$ROOT/.build"
 BIN_DIR="$(swift build --configuration release --scratch-path "$ROOT/.build" --show-bin-path)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -57,6 +72,12 @@ if [[ "$STANDALONE" == 1 ]]; then
     /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier app.tez.native' "$APP/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleName Tez' "$APP/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Tez' "$APP/Contents/Info.plist"
+fi
+if [[ -n "$ACCEPTANCE_HOME" ]]; then
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier app.tez.acceptance' "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleName Tez Acceptance' "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Tez Acceptance' "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :TezAcceptanceHome string $ACCEPTANCE_HOME" "$APP/Contents/Info.plist"
 fi
 if [[ "$UI_ONLY" == 1 ]]; then
     /usr/libexec/PlistBuddy -c 'Add :TezInterfaceOnly bool true' "$APP/Contents/Info.plist"
@@ -77,12 +98,20 @@ if [[ "$WITH_CORE" == 1 ]]; then
 else
     node "$ROOT/package-core.mjs" --remove "$APP"
 fi
+if [[ "$WITH_SERVICE" == 1 ]]; then
+    node "$ROOT/package-service.mjs" --copy "$APP"
+else
+    node "$ROOT/package-service.mjs" --remove "$APP"
+fi
 swift "$ROOT/Resources/generate-icon.swift" "$ROOT/.build/Tez.iconset"
 iconutil -c icns "$ROOT/.build/Tez.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 if [[ "$WITH_CORE" == 1 ]]; then
     node "$ROOT/package-core.mjs" --verify "$APP"
+fi
+if [[ "$WITH_SERVICE" == 1 ]]; then
+    node "$ROOT/package-service.mjs" --verify "$APP"
 fi
 if [[ "$STANDALONE" == 1 ]]; then
     printf '\nStandalone Tez built without launching or registering it:\n%s\n' "$APP"

@@ -8,7 +8,7 @@ struct TezNativeApp: App {
     @Environment(\.openWindow) private var openWindow
     @State private var selection: WorkspaceSection? = .connection
     @State private var preferences = TezPreviewPreferences()
-    @State private var backend = NativeBackendStore(mode: TezNativeApp.interfaceOnly ? .attach : .managed)
+    @State private var backend = NativeBackendStore(mode: TezNativeApp.interfaceOnly ? .attach : .automatic)
     @State private var startupAttempted = false
     @State private var coreOperationInProgress = false
     @State private var operationError: String?
@@ -56,17 +56,17 @@ struct TezNativeApp: App {
         }
 
         MenuBarExtra(Self.interfaceOnly ? "Tez 界面检查" : "Tez", systemImage: "network") {
-            Label(backend.state == .connected && backend.snapshot?.core.state == "ready" ? "代理运行中" : backend.statusText,
+            Label(backend.state == .connected && backend.snapshot?.core.state == "ready" ? "内核运行中" : backend.statusText,
                   systemImage: backend.state == .connected ? "checkmark.circle" : "exclamationmark.circle")
             Button("显示 Tez", systemImage: "macwindow") { showWorkspace() }
             Divider()
             if backend.state == .connected {
                 Button("启动内核", systemImage: "play.fill") { performCoreCommand("native_core_start") }
-                    .disabled(coreOperationInProgress || !backend.supports("native_core_start"))
+                    .disabled(coreOperationInProgress || backend.workspaceBusy || !backend.supports("native_core_start") || backend.snapshot?.core.state == "ready")
                 Button("重启内核", systemImage: "arrow.clockwise") { performCoreCommand("native_core_restart") }
-                    .disabled(coreOperationInProgress || !backend.supports("native_core_restart"))
+                    .disabled(coreOperationInProgress || backend.workspaceBusy || !backend.supports("native_core_restart"))
                 Button("停止内核", systemImage: "stop.fill") { performCoreCommand("native_core_stop") }
-                    .disabled(coreOperationInProgress || !backend.supports("native_core_stop"))
+                    .disabled(coreOperationInProgress || backend.workspaceBusy || !backend.supports("native_core_stop"))
             } else if backend.state == .shutdownFailed {
                 Button("重试安全退出", systemImage: "arrow.clockwise") { backend.disconnect() }
             } else {
@@ -105,12 +105,13 @@ struct TezNativeApp: App {
             operationError = backend.errorMessage ?? "后台尚未连接。请检查连接页面。"
             return
         }
+        guard backend.supports("native_core_start") else { return }
         await executeCoreCommand("native_core_start")
     }
 
     @MainActor
     private func performCoreCommand(_ command: String) {
-        guard !coreOperationInProgress, backend.supports(command) else { return }
+        guard !coreOperationInProgress, !backend.workspaceBusy, backend.supports(command) else { return }
         coreOperationInProgress = true
         Task { @MainActor in
             defer { coreOperationInProgress = false }
@@ -121,7 +122,7 @@ struct TezNativeApp: App {
     @MainActor
     private func executeCoreCommand(_ command: String) async {
         do {
-            _ = try await backend.request(command)
+            _ = try await backend.request(command, serialWorkspace: true)
             let runtime = try await backend.request("native_get_runtime")
             let expectedModes = command == "native_core_stop" ? ["NotRunning"] : ["Service", "Sidecar"]
             guard case .object(let fields) = runtime, let value = fields["mode"], case .string(let mode) = value, expectedModes.contains(mode) else {
@@ -155,7 +156,7 @@ final class PreviewAppDelegate: NSObject, NSApplicationDelegate {
     private var terminationPending = false
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let backend, backend.requiresManagedShutdown else {
+        guard let backend, backend.blocksTermination else {
             backend?.disconnect()
             return .terminateNow
         }

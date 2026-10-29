@@ -6,7 +6,7 @@ enum NativeBackendState: Equatable {
 }
 
 enum NativeBackendMode {
-    case attach, managed
+    case attach, managed, automatic
 }
 
 enum NativeBackendError: Error, CustomStringConvertible {
@@ -31,10 +31,12 @@ private final class BackendProcess: @unchecked Sendable {
     var started = false
     private let stopLock = NSLock()
     private var stopRequested = false
+    private var readOnly: Bool
 
     init(url: URL, arguments: [String], mode: NativeBackendMode) throws {
         self.mode = mode
-        recovery = mode == .managed ? try NativeRecoveryChannel() : nil
+        readOnly = mode == .attach
+        recovery = mode != .attach ? try NativeRecoveryChannel() : nil
         process.executableURL = url
         process.arguments = arguments
         process.standardInput = input
@@ -43,15 +45,27 @@ private final class BackendProcess: @unchecked Sendable {
         if let recovery {
             process.environment = ProcessInfo.processInfo.environment.merging(recovery.environment) { _, value in value }
         }
+        if Bundle.main.bundleIdentifier == "app.tez.acceptance",
+           let home = Bundle.main.object(forInfoDictionaryKey: "TezAcceptanceHome") as? String {
+            var environment = process.environment ?? ProcessInfo.processInfo.environment
+            environment["HOME"] = home
+            process.environment = environment
+        }
     }
 
     func stop() {
         stopLock.lock()
         guard !stopRequested else { stopLock.unlock(); return }
         stopRequested = true
+        let terminate = readOnly
         stopLock.unlock()
-        if mode == .attach, process.isRunning { process.terminate() }
+        if terminate, process.isRunning { process.terminate() }
         writes.async { [input] in try? input.fileHandleForWriting.close() }
+    }
+
+    func confirmReadOnly() {
+        stopLock.lock(); defer { stopLock.unlock() }
+        if mode == .automatic { readOnly = true }
     }
 
     deinit { stop() }
@@ -88,14 +102,24 @@ final class NativeBackendStore {
     @ObservationIgnored private var managedInputClosed = false
     @ObservationIgnored private var managedMainChannelBroken = false
     @ObservationIgnored private var receivedManagedHello = false
+    @ObservationIgnored private var observerSession = false
+    @ObservationIgnored private var automaticRecoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var automaticRecoveryAttempts = 0
+    private(set) var serviceSetupInProgress = false
 
-    var requiresManagedShutdown: Bool { mode == .managed && (child != nil || state == .shutdownFailed) }
-    var isReadOnlyConnection: Bool { mode == .attach }
+    var requiresManagedShutdown: Bool {
+        let managed = mode == .managed || (mode == .automatic && !observerSession)
+        return managed && (child != nil || state == .shutdownFailed)
+    }
+    var blocksTermination: Bool { serviceSetupInProgress || requiresManagedShutdown }
+    var isReadOnlyConnection: Bool {
+        mode == .attach || (mode == .automatic && observerSession)
+    }
 
     init(mode: NativeBackendMode = .attach) {
         helperURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/tez-native-host")
-        arguments = ["--stdio", mode == .managed ? "--managed" : "--attach"]
-        timeout = mode == .managed ? .seconds(30) : .seconds(8)
+        arguments = ["--stdio", mode == .automatic ? "--automatic" : mode == .managed ? "--managed" : "--attach"]
+        timeout = mode != .attach ? .seconds(30) : .seconds(8)
         self.mode = mode
         shutdownTimeout = .seconds(30)
         renewalRequestLimit = 3500
@@ -113,7 +137,10 @@ final class NativeBackendStore {
     }
 
     func connect() {
-        if mode == .attach, state == .failed, child?.process.isRunning == false { child = nil }
+        automaticRecoveryTask?.cancel()
+        automaticRecoveryTask = nil
+        automaticRecoveryAttempts = 0
+        if (mode == .attach || mode == .automatic), state == .failed, child?.process.isRunning == false { child = nil }
         guard child == nil, state == .disconnected || state == .failed else { return }
         disconnect()
         startConnection()
@@ -121,6 +148,7 @@ final class NativeBackendStore {
 
     private func startConnection() {
         receivedManagedHello = false
+        observerSession = false
         state = .connecting
         statusText = "连接中"
         errorMessage = nil
@@ -168,6 +196,12 @@ final class NativeBackendStore {
     }
 
     func disconnect() {
+        guard !serviceSetupInProgress else {
+            errorMessage = "后台服务更新正在进行，请等待系统授权结果。"
+            return
+        }
+        automaticRecoveryTask?.cancel()
+        automaticRecoveryTask = nil
         renewalTask?.cancel()
         renewalTask = nil
         renewalRequested = false
@@ -176,7 +210,8 @@ final class NativeBackendStore {
             return
         }
         resetSession()
-        child?.process.terminationHandler = nil
+        let cleanup = child?.recovery
+        child?.process.terminationHandler = { _ in cleanup?.removeAfterConfirmedExit() }
         child?.stop()
         child = nil
         managedShutdownRequested = false
@@ -188,7 +223,26 @@ final class NativeBackendStore {
         statusText = "未连接"
     }
 
+    func reconnectAfterClaim() {
+        guard mode == .automatic, observerSession, !workspaceBusy, state == .connected else { return }
+        disconnect()
+        connect()
+    }
+
+    func installService(params: [String: BackendJSON]) async throws -> BackendJSON {
+        guard mode == .automatic, observerSession, supports("native_install_service"), !serviceSetupInProgress else {
+            throw NativeBackendError.unavailable("当前连接未开放后台服务更新")
+        }
+        serviceSetupInProgress = true
+        defer { serviceSetupInProgress = false }
+        return try await request("native_install_service", params: params, serialWorkspace: true)
+    }
+
     func shutdownForTermination() async -> Bool {
+        guard !serviceSetupInProgress else {
+            errorMessage = "后台服务更新正在进行，等待授权结果后才能退出。"
+            return false
+        }
         guard requiresManagedShutdown else { disconnect(); return true }
         return await beginManagedShutdown().value
     }
@@ -416,11 +470,14 @@ final class NativeBackendStore {
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             requestCount += 1
-            timers[id] = Task { [weak self, timeout = requestTimeout ?? timeout] in
-                try? await Task.sleep(for: timeout)
-                guard !Task.isCancelled, let self, token == generation else { return }
-                timers.removeValue(forKey: id)
-                pending.removeValue(forKey: id)?.resume(throwing: NativeBackendError.unavailable("请求超时"))
+            // Administrator authorization is human-paced; a request timeout must not detach its installer.
+            if command != "native_install_service" {
+                timers[id] = Task { [weak self, timeout = requestTimeout ?? timeout] in
+                    try? await Task.sleep(for: timeout)
+                    guard !Task.isCancelled, let self, token == generation else { return }
+                    timers.removeValue(forKey: id)
+                    pending.removeValue(forKey: id)?.resume(throwing: NativeBackendError.unavailable("请求超时"))
+                }
             }
             child.writes.async { [weak self] in
                 do { try child.input.fileHandleForWriting.write(contentsOf: data) }
@@ -434,12 +491,23 @@ final class NativeBackendStore {
         guard token == generation else { return }
         switch message {
         case .hello(let id, let advertisedCapabilities):
-            receivedManagedHello = true
             let advertised = Set(advertisedCapabilities)
             guard sessionID == nil, advertised.isSuperset(of: ["native_subscribe", "native_get_snapshot"]) else {
                 fail("后台握手不兼容", generation: token); return
             }
+            if mode == .automatic && !advertised.contains("native_prepare_shutdown") {
+                let observerCommands: Set<String> = ["get_app_dir", "get_system_hostname", "native_get_snapshot",
+                    "native_subscribe", "native_unsubscribe", "native_get_activity", "native_continuous_session", "native_inspect_core", "native_claim_core", "native_install_service"]
+                guard advertised.isSubset(of: observerCommands), advertised.contains("native_inspect_core") else {
+                    fail("自动发现后台未声明安全的只读能力", generation: token); return
+                }
+            }
+            receivedManagedHello = true
             capabilities = advertised
+            if mode == .automatic && !advertised.contains("native_prepare_shutdown") {
+                observerSession = true
+                child?.confirmReadOnly()
+            }
             sessionID = id
             helloTimer?.cancel()
             helloTimer = nil
@@ -499,12 +567,16 @@ final class NativeBackendStore {
 
     private func fail(_ message: String, generation token: UUID, channelBroken: Bool = false) {
         guard generation == token else { return }
-        if mode == .managed && channelBroken { managedMainChannelBroken = true }
-        if mode == .managed && managedShutdownRequested {
+        if mode != .attach && channelBroken { managedMainChannelBroken = true }
+        if mode != .attach && managedShutdownRequested {
             finishPending("后台控制通道异常，请求结果未确认")
             return
         }
-        if mode == .managed, let child {
+        if mode == .automatic, let child, child.started, !child.process.isRunning {
+            child.recovery?.removeAfterConfirmedExit()
+            self.child = nil
+        }
+        if requiresManagedShutdown, let child {
             let refusal = startupRefusal(child)
             if refusal != nil || !child.started || (!child.process.isRunning && child.process.terminationReason == .exit && child.process.terminationStatus == 0) {
                 child.recovery?.removeAfterConfirmedExit()
@@ -527,6 +599,22 @@ final class NativeBackendStore {
         state = .failed
         statusText = "连接失败"
         errorMessage = message
+        scheduleAutomaticRecovery()
+    }
+
+    private func scheduleAutomaticRecovery() {
+        guard mode == .automatic, child == nil, !managedShutdownRequested, automaticRecoveryAttempts < 3 else { return }
+        automaticRecoveryAttempts += 1
+        let delay = 1 << (automaticRecoveryAttempts - 1)
+        let token = generation
+        statusText = "后台连接中断，正在重新检测（\(automaticRecoveryAttempts)/3）"
+        automaticRecoveryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, token == generation, child == nil, state == .failed else { return }
+            automaticRecoveryTask = nil
+            resetSession()
+            startConnection()
+        }
     }
 
     private func startupRefusal(_ transport: BackendProcess) -> String? {

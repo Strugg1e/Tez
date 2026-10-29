@@ -36,6 +36,20 @@ fn options(args: &[std::ffi::OsString]) -> Option<(bool, Option<PathBuf>, Option
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == "--build-info" {
+        println!("{}", serde_json::json!({"channel":clash_verge_service_ipc::CHANNEL_IDENTITY.id,
+            "lifecycleAcceptance":cfg!(feature = "native-lifecycle-acceptance")}));
+        return ExitCode::SUCCESS;
+    }
+    #[cfg(target_os = "macos")]
+    if args.len() == 2 && args[0] == "--stdio" && (args[1] == "--automatic" || args[1] == "--inspect") {
+        let result = if args[1] == "--automatic" { app_lib::native_lifecycle::run_automatic() }
+            else { app_lib::native_lifecycle::run_inspection() };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => { eprintln!("Native lifecycle session failed; inspect current ownership before retrying."); ExitCode::FAILURE }
+        };
+    }
     #[cfg(target_os = "macos")]
     if args.len() == 3 && args[0] == "--stdio" && args[1] == "--isolated" {
         return match app_lib::native_isolated::run_stdio(PathBuf::from(&args[2])) {

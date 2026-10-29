@@ -250,6 +250,7 @@ fn project_connections(data: Connections, query: &ActivityQuery) -> Value {
     let mut identities = HashSet::new();
     let items = connections.into_iter().enumerate().map(|(index, connection)| {
         let id = identity(&connection.id, "connection", index, &mut identities);
+        let closeable = id == connection.id && crate::native_control::parse_connection_id(json!({"id":id})).is_ok();
         let metadata = connection.metadata;
         let address = short(&metadata.destination_ip);
         let port = short(&metadata.destination_port);
@@ -258,7 +259,7 @@ fn project_connections(data: Connections, query: &ActivityQuery) -> Value {
         } else {
             format!("{address}:{port}")
         });
-        json!({"id":id,"host":short(&metadata.host),"destination":destination,
+        json!({"id":id,"closeable":closeable,"host":short(&metadata.host),"destination":destination,
                 "network":short(metadata.network.as_str()),"type":short(metadata.connection_type.as_str()),
                 "process":basename(&metadata.process),"rule":short(&connection.rule),
                 "chains":connection.chains.iter().take(8).map(|chain| short(chain)).collect::<Vec<_>>(),
@@ -306,8 +307,16 @@ pub(crate) async fn read(path: &Path, client: &Mihomo, source: &'static str, que
     }
     let (connections, rules, providers) = tokio::join!(
         read_json::<Connections>(client, "/connections", "connections"),
-        read_json::<Rules>(client, "/rules", "rules"),
-        read_json::<RuleProviders>(client, "/providers/rules", "providers"),
+        async {
+            if query.section.is_none() || query.section == Some(Section::Rules) {
+                read_json::<Rules>(client, "/rules", "rules").await
+            } else { Err(ReadFailure { code: "not_requested", message: "Section was not requested" }) }
+        },
+        async {
+            if query.section.is_none() || query.section == Some(Section::Providers) {
+                read_json::<RuleProviders>(client, "/providers/rules", "providers").await
+            } else { Err(ReadFailure { code: "not_requested", message: "Section was not requested" }) }
+        },
     );
     json!({"schemaVersion":1,"source":source,
         "connections":connections.map(|data| project_connections(data,query)).unwrap_or_else(|error| failed_section("error",error,true)),

@@ -548,6 +548,16 @@ impl Session {
             ));
         }
         match command {
+            "native_close_connection" => {
+                let id = crate::native_control::parse_connection_id(params)?;
+                if self.child.is_none() {
+                    return Err(CommandFailure::coded("CORE_NOT_RUNNING", "No isolated core is running"));
+                }
+                let data = crate::native_data::NativeData::new(self.root.clone(), self.root.join("controller.sock"))
+                    .map_err(isolated_io_error)?;
+                let (_, client, _) = data.controller().await.map_err(isolated_io_error)?;
+                crate::native_control::close_connection(&client, &id).await
+            }
             "native_get_settings"
             | "native_patch_settings"
             | "native_set_mode"

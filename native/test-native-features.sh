@@ -5,9 +5,11 @@ mkdir -p .build/module-cache
 swiftc -target "$(uname -m)-apple-macosx14.0" -module-cache-path .build/module-cache -swift-version 6 -parse-as-library \
     Sources/TezNative/BackendWire.swift \
     Sources/TezNative/BackendSnapshot.swift \
+    Sources/TezNative/NativeCoreLifecycle.swift \
     Sources/TezNative/NativeRecoveryChannel.swift \
     Sources/TezNative/BackendConnection.swift \
     Sources/TezNative/TezStyle.swift \
+    Sources/TezNative/TezUI.swift \
     Sources/TezNative/NativeActivity.swift \
     Sources/TezNative/NativeActivityView.swift \
     Sources/TezNative/NativeFeatureViews.swift \

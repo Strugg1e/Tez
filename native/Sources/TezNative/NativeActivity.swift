@@ -105,6 +105,7 @@ struct NativeActivityConnection: Codable, Equatable, Sendable, Identifiable {
     let upload: UInt64
     let download: UInt64
     let start: String?
+    var closeable: Bool? = nil
 
     var title: String { nonempty(host) ?? destination.flatMap { $0.hasPrefix(":") ? nil : nonempty($0) } ?? "未知目标" }
     var destinationLabel: String? {
@@ -113,6 +114,46 @@ struct NativeActivityConnection: Codable, Equatable, Sendable, Identifiable {
     func matches(_ query: String) -> Bool {
         query.isEmpty || [host, destination, network, type, process, rule]
             .compactMap { $0 }.joined(separator: " ").localizedCaseInsensitiveContains(query)
+    }
+}
+
+struct NativeConnectionRate: Equatable, Sendable {
+    let upload: Double?
+    let download: Double?
+    var status: String {
+        guard let upload, let download else { return "活跃" }
+        return upload > 0 || download > 0 ? "传输中" : "空闲"
+    }
+    static func label(_ bytes: Double?) -> String {
+        guard let bytes, bytes.isFinite, bytes >= 0 else { return "—" }
+        return NativeActivityFormat.bytes(UInt64(min(bytes, Double(UInt64.max / 2)))) + "/s"
+    }
+}
+
+struct NativeActivityRates {
+    private var sampledAt: TimeInterval?
+    private var previous: NativeActivityConnections?
+    private(set) var connections: [String: NativeConnectionRate] = [:]
+    private(set) var total = NativeConnectionRate(upload: nil, download: nil)
+
+    mutating func reset() { self = Self() }
+
+    mutating func sample(_ current: NativeActivityConnections, at now: TimeInterval) {
+        guard current.state == "ready" else { reset(); return }
+        let elapsed = sampledAt.map { now - $0 } ?? 0
+        func rate(_ current: UInt64?, _ previous: UInt64?) -> Double? {
+            guard elapsed > 0, let current, let previous, current >= previous else { return nil }
+            return Double(current - previous) / elapsed
+        }
+        let oldRows = Dictionary(uniqueKeysWithValues: (previous?.items ?? []).map { ($0.id, $0) })
+        connections = Dictionary(uniqueKeysWithValues: current.items.map { row in
+            (row.id, NativeConnectionRate(upload: rate(row.upload, oldRows[row.id]?.upload),
+                                         download: rate(row.download, oldRows[row.id]?.download)))
+        })
+        total = NativeConnectionRate(upload: rate(current.uploadTotal, previous?.uploadTotal),
+                                     download: rate(current.downloadTotal, previous?.downloadTotal))
+        sampledAt = now
+        previous = current
     }
 }
 
@@ -212,17 +253,22 @@ final class NativeActivityModel {
     private(set) var errorMessage: String?
     private(set) var updatedAt: Date?
     private(set) var snapshotQuery: NativeActivityQuery?
+    private(set) var rates = NativeActivityRates()
+    private(set) var closingID: String?
+    private(set) var closeMessage: String?
+    private(set) var closeError = false
     @ObservationIgnored private var generation = UUID()
     @ObservationIgnored private var desiredQuery: NativeActivityQuery?
     @ObservationIgnored private var activeGeneration: UUID?
 
-    func stop() { generation = UUID() }
+    func stop() { generation = UUID(); rates.reset() }
 
     func select(_ query: NativeActivityQuery?) {
         guard desiredQuery != query else { return }
         generation = UUID()
         desiredQuery = query
         errorMessage = nil
+        rates.reset()
     }
 
     func refresh(query: NativeActivityQuery? = nil, request: @MainActor () async throws -> BackendJSON) async {
@@ -244,12 +290,39 @@ final class NativeActivityModel {
             let decoded = try NativeActivity.decode(value)
             if let query { try decoded.validate(query: query) }
             snapshot = decoded
+            rates.sample(decoded.connections, at: ProcessInfo.processInfo.systemUptime)
             snapshotQuery = query
             errorMessage = nil
             updatedAt = Date()
         } catch {
             guard !Task.isCancelled, token == generation else { return }
             errorMessage = "活动数据读取失败。"
+            rates.reset()
+        }
+    }
+
+    func close(id: String, request: @MainActor () async throws -> BackendJSON) async -> Bool {
+        guard closingID == nil else { return false }
+        guard snapshot?.connections.items.contains(where: { $0.id == id && $0.closeable == true }) == true else {
+            closeError = false
+            closeMessage = "连接已结束或不能关闭，请刷新确认。"
+            return false
+        }
+        closingID = id
+        closeMessage = nil
+        closeError = false
+        defer { closingID = nil }
+        do {
+            struct Result: Decodable { let closed: Bool; let id: String }
+            let value = try await request()
+            let result = try JSONDecoder().decode(Result.self, from: JSONEncoder().encode(value))
+            guard result.closed, result.id == id else { throw BackendWireError.invalid("Unexpected close result") }
+            closeMessage = "已关闭选中的连接"
+            return true
+        } catch {
+            closeError = true
+            closeMessage = "关闭连接失败。连接可能已结束，请刷新后确认。"
+            return false
         }
     }
 }

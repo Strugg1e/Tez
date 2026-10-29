@@ -17,6 +17,8 @@ struct NativeSubscriptionSheet: View {
     let store: NativeBackendStore
     let profile: NativeProfileItem?
     @Environment(\.dismiss) private var dismiss
+    @Environment(TezPreviewPreferences.self) private var preferences
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var operation = NativeFeatureOperation()
     @State private var name = ""
     @State private var url = ""
@@ -32,6 +34,7 @@ struct NativeSubscriptionSheet: View {
     @State private var details: NativeSubscriptionDetails?
     private var isCurrent: Bool { profile?.uid == store.snapshot?.profiles.current }
     private var isRemote: Bool { (profile?.type ?? kind) == "remote" }
+    private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
     private var canSave: Bool {
         !operation.busy && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && (!isRemote || (!url.isEmpty && (1440...525600).contains(interval)))
@@ -39,11 +42,12 @@ struct NativeSubscriptionSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(profile == nil ? "添加配置" : "配置管理").font(.headline)
+            HStack(spacing: 10) {
+                Image(systemName: profile == nil ? "doc.badge.plus" : "slider.horizontal.3").foregroundStyle(TezStyle.accent)
+                Text(profile == nil ? "添加配置" : "配置管理").font(.system(size: 15, weight: .semibold))
                 Spacer()
                 if operation.busy { ProgressView().controlSize(.small) }
-                Button("关闭", systemImage: "xmark") { dismiss() }.labelStyle(.iconOnly).disabled(operation.busy)
+                TezToolButton(title: "关闭配置管理", symbol: "xmark", enabled: !operation.busy) { dismiss() }
             }.padding(20)
             Divider()
             Form {
@@ -56,7 +60,8 @@ struct NativeSubscriptionSheet: View {
                         HStack {
                             if revealsURL { TextField("订阅地址", text: $url) }
                             else { SecureField("订阅地址", text: $url) }
-                            Button(revealsURL ? "隐藏地址" : "显示地址", systemImage: revealsURL ? "eye.slash" : "eye") { revealsURL.toggle() }.labelStyle(.iconOnly)
+                            Button(revealsURL ? "隐藏地址" : "显示地址", systemImage: revealsURL ? "eye.slash" : "eye") { revealsURL.toggle() }
+                                .labelStyle(.iconOnly).help(revealsURL ? "隐藏订阅地址" : "显示订阅地址")
                         }.privacySensitive()
                         Toggle("自动更新", isOn: $autoUpdate)
                         TextField("更新间隔（分钟）", value: $interval, format: .number.grouping(.never))
@@ -65,8 +70,8 @@ struct NativeSubscriptionSheet: View {
                     }
                     if let usage = details?.usage {
                         Section("用量") {
-                            LabeledContent("已使用", value: NativeActivityFormat.bytes(usage.upload.addingReportingOverflow(usage.download).overflow ? UInt64.max : usage.upload + usage.download))
-                            LabeledContent("总流量", value: NativeActivityFormat.bytes(usage.total))
+                            TezUsageMeter(used: usage.upload.addingReportingOverflow(usage.download).overflow ? UInt64.max : usage.upload + usage.download,
+                                          total: usage.total, motion: motion)
                             if usage.expire > 0 { LabeledContent("到期", value: Date(timeIntervalSince1970: TimeInterval(usage.expire)).formatted()) }
                         }
                     }
@@ -95,13 +100,17 @@ struct NativeSubscriptionSheet: View {
             }.formStyle(.grouped).disabled(operation.busy)
             Divider()
             HStack {
-                NativeFeatureFeedback(operation: operation)
+                if let error = operation.error {
+                    ScrollView { TezOperationFeedback(message: error, tone: .error) }.frame(maxHeight: 74)
+                } else if let message = operation.message {
+                    TezOperationFeedback(message: message, tone: .success)
+                }
                 Spacer()
                 Button(profile == nil ? "添加" : "保存", systemImage: "square.and.arrow.down") { Task { await save() } }
-                    .buttonStyle(.borderedProminent).disabled(!canSave || !canWrite)
+                    .modifier(TezPrimaryActionStyle()).disabled(!canSave || !canWrite)
             }.padding(16)
         }
-        .frame(width: 620, height: 600)
+        .frame(width: 600, height: 560)
         .interactiveDismissDisabled(operation.busy)
         .task { name = profile?.name ?? ""; if profile != nil { await load() } }
         .alert("删除此配置？", isPresented: $confirmsDelete) {

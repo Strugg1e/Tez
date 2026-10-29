@@ -83,6 +83,47 @@ where
 }
 
 impl CoreManager {
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    pub(crate) async fn restore_native_service(&self, proof: clash_verge_service_ipc::OwnerSessionProof) -> Result<()> {
+        let _write = Config::lock_config_write().await;
+        let _update = self.claim_config_update(&_write)?;
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        anyhow::ensure!(matches!(*self.get_running_mode(), RunningMode::NotRunning), "An owned core is already attached");
+        let credentials = crate::core::owner_identity::current_owner_credentials()?;
+        let response = clash_verge_service_ipc::recover_core_session(&credentials, &proof).await?;
+        anyhow::ensure!(response.code == 0, "Service refused session recovery");
+        let snapshot = response.data.ok_or_else(|| anyhow::anyhow!("Service omitted recovered runtime"))?;
+        Config::restore_native_runtime(&snapshot.runtime_yaml).await?;
+        handle::Handle::app_handle().mihomo().update_socket_path(dirs::path_to_str(&dirs::ipc_path()?)?.to_owned())?;
+        service::adopt_native_service_session(proof);
+        service::select_native_core(&snapshot.core_path);
+        if std::path::Path::new(&snapshot.core_path).file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("tez-")) {
+            let _ = clash_verge_service_ipc::save_owner_core(&credentials, &snapshot.core_path, &snapshot.core_sha256);
+        } else {
+            let _ = clash_verge_service_ipc::forget_owner_core(&credentials);
+        }
+        self.mark_core_ready();
+        self.core_started(RunningMode::Service);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    pub(crate) async fn upgrade_native_service(&self, request: &clash_verge_service_ipc::UpgradeCoreRequest) -> Result<clash_verge_service_ipc::CoreUpgradeOutcome> {
+        let _write = Config::lock_config_write().await;
+        let _update = self.claim_config_update(&_write)?;
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        anyhow::ensure!(matches!(*self.get_running_mode(), RunningMode::Service), "No owned service core");
+        let credentials = crate::core::owner_identity::current_owner_credentials()?;
+        let proof = service::active_service_session()?;
+        let response = clash_verge_service_ipc::upgrade_owned_core(&credentials, &proof, request).await?;
+        anyhow::ensure!(response.code == 0, "Core upgrade or rollback unresolved (code {})", response.code);
+        let outcome = response.data.ok_or_else(|| anyhow::anyhow!("Service omitted upgrade outcome"))?;
+        Config::restore_native_runtime(&outcome.session.runtime_yaml).await?;
+        service::select_native_core(&outcome.session.core_path);
+        self.mark_core_ready();
+        self.restore_selected_nodes().await;
+        Ok(outcome)
+    }
     /// Restores profile selections before callers enable the system proxy.
     /// The bounded first pass continues in the background, and later calls supersede earlier ones.
     async fn restore_selected_nodes(&self) {
