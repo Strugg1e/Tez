@@ -34,7 +34,7 @@ struct NativeAccessSummary {
         let mode = snapshot.network?.mode.state == "ready" ? snapshot.network?.mode.value : nil
         switch mode {
         case "direct": routeTitle = "直连，不经过代理节点"
-        case "global": routeTitle = snapshot.proxyView?.global?.now ?? "全局策略组尚未返回当前线路"
+        case "global": routeTitle = snapshot.proxyView?.global?.now.map(TezProxyName.title) ?? "全局代理组尚未返回当前线路"
         case "rule":
             let count = snapshot.proxyView?.groups.count ?? 0
             routeTitle = count > 0 ? "按规则分流 · \(count) 个策略组" : "按规则决定流量去向"
@@ -45,29 +45,26 @@ struct NativeAccessSummary {
 
 struct NativeConnectionOverview: View {
     let summary: NativeAccessSummary
-    let openRoutes: () -> Void
+    var openRoutes: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Label(summary.accessTitle, systemImage: "network")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(summary.accessTone == .warning ? TezStyle.warning : .primary)
-                .accessibilityIdentifier("connection.access.summary")
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 12) {
                 GridRow { Text("当前配置").foregroundStyle(.secondary); Text(summary.profileTitle) }
-                GridRow { Text("分流模式").foregroundStyle(.secondary); Text(summary.modeTitle) }
                 GridRow {
                     Text("流量去向").foregroundStyle(.secondary)
                     HStack(alignment: .top, spacing: 12) {
                         Text(summary.routeTitle).frame(maxWidth: .infinity, alignment: .leading)
-                        Button("查看线路", systemImage: "arrow.right") { openRoutes() }
-                            .buttonStyle(.link).fixedSize()
+                        if let openRoutes {
+                            Button("查看线路", systemImage: "arrow.right", action: openRoutes)
+                                .buttonStyle(.link).fixedSize()
+                        }
                     }
                 }
             }
-            .font(.system(size: 13)).textSelection(.enabled)
+            .font(TezType.body).textSelection(.enabled)
             Label("连通性尚未验证", systemImage: "questionmark.circle")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(TezType.metadata).foregroundStyle(.secondary)
                 .help("接入开关、内核运行状态和节点延迟不能确认应用是否可以访问目标。")
                 .accessibilityIdentifier("connection.connectivity.unverified")
         }

@@ -24,6 +24,8 @@ struct NativeFeaturesCheck {
         var subscription: [String: BackendJSON] = ["uid": .string("fixture"), "name": .string("示例订阅"), "url": .string("https://example.test/sub"), "interval": .integer(1440), "autoUpdate": .bool(true), "withProxy": .bool(false), "usage": .object(["upload": .integer(1048576), "download": .integer(10485760), "total": .integer(10737418240), "expire": .integer(1800000000)])]
         var backups: [String] = []
         var remoteBackups: [String] = []
+        var webdavReads = 0
+        var webdavConfig: [String: BackendJSON] = ["url": .null, "username": .null, "passwordConfigured": .bool(false)]
         while let line = readLine() {
             guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { fatalError() }
             precondition(id == "seq:\(next)"); next += 1
@@ -90,8 +92,16 @@ struct NativeFeaturesCheck {
             case "native_restore_local_backup", "native_restore_webdav_backup":
                 try emit(.response(id: id, outcome: .result(.object(["restored": .bool(true), "requiresRestart": .bool(true)]))))
             case "native_get_webdav_config":
-                try emit(.response(id: id, outcome: .result(.object(["url": .string("https://example.test/dav"), "username": .string("fixture"), "passwordConfigured": .bool(true)]))))
+                webdavReads += 1
+                if webdavReads == 1 {
+                    try emit(.response(id: id, outcome: .error(.init(detail: "Injected read failure", code: .string("WEBDAV_READ_FAILED"), operation: nil))))
+                    continue
+                }
+                try emit(.response(id: id, outcome: .result(.object(webdavConfig))))
             case "native_save_webdav_config":
+                webdavConfig["url"] = params["url"]
+                webdavConfig["username"] = params["username"]
+                if case .string(let password) = params["password"], !password.isEmpty { webdavConfig["passwordConfigured"] = .bool(true) }
                 try emit(.response(id: id, outcome: .result(.object(["saved": .bool(true)]))))
             case "native_create_webdav_backup":
                 remoteBackups.append("remote.zip")
@@ -154,6 +164,28 @@ struct NativeFeaturesCheck {
             subscriptionDraft.intervalText = value
             precondition(subscriptionDraft.intervalError != nil, "Invalid text must not reuse the previous valid interval")
         }
+        subscriptionDraft.autoUpdate = false
+        subscriptionDraft.intervalText = "0"
+        precondition(subscriptionDraft.intervalError == nil, "Disabled automatic updates must not require an interval")
+        precondition(subscriptionDraft.intervalForRequest == 1440, "The disabled draft must still use a valid protocol interval")
+        subscriptionDraft.autoUpdate = true
+        precondition(subscriptionDraft.intervalError != nil, "Enabling automatic updates must validate the interval")
+        subscriptionDraft.intervalText = "1440"
+        precondition(subscriptionDraft.intervalError == nil)
+
+        for value in ["", " ", "not-a-url", "https://", "ftp://example.test/sub", "https://example.test/bad path"] {
+            subscriptionDraft.url = value
+            precondition(subscriptionDraft.urlError != nil, "Invalid subscription addresses must be rejected before submission")
+        }
+        for value in ["https://example.test/sub?token=a%2Bb", "http://127.0.0.1/sub", " https://user:pass@example.test/sub\n"] {
+            subscriptionDraft.url = value
+            precondition(subscriptionDraft.urlError == nil)
+        }
+        precondition(subscriptionDraft.normalizedURL == "https://user:pass@example.test/sub")
+        precondition(TezProxyName.title("GLOBAL") == "全局代理" && TezProxyName.title("Daily Policy") == "Daily Policy")
+        precondition(!NativeWebdavConfig(url: nil, username: nil, passwordConfigured: false).isConfigured)
+        precondition(!NativeWebdavConfig(url: "https://example.test/dav", username: "fixture", passwordConfigured: false).isConfigured)
+        precondition(NativeWebdavConfig(url: "https://example.test/dav", username: "fixture", passwordConfigured: true).isConfigured)
 
         let latency = NativeLatencyModel()
         var calls: [[String]] = []
@@ -169,6 +201,7 @@ struct NativeFeaturesCheck {
         precondition(calls.map(\.count) == [4, 4, 1])
         precondition(latency.completed == 9 && latency.results.count == 9 && !latency.busy)
         precondition(latency.label(for: names[0], fallback: "old") == "42 ms")
+        precondition(latency.samples[names[0]]?.map(\.delay) == [42], "Sampling must contain only acknowledged measurements")
         calls = []
         await latency.test(names: names, url: "https://example.test", timeout: 1000) { _, params in
             guard case .array(let targets) = params["names"] else { fatalError() }
@@ -178,10 +211,13 @@ struct NativeFeaturesCheck {
         }
         precondition(calls.count == 1 && latency.stopped && latency.completed == 4)
         precondition(latency.label(for: names[0], fallback: "old") == "超时 / 失败")
+        precondition(latency.samples[names[0]]?.count == 2 && latency.samples[names[0]]?.last?.delay == nil,
+                     "A failed probe must be retained as missing data, not zero latency")
         await latency.test(names: ["node"], url: "https://example.test", timeout: 1000) { _, _ in
             .object(["results": .array([.object(["name": .string("wrong"), "delay": .integer(5)])])])
         }
         precondition(latency.error != nil && latency.completed == 0 && !latency.busy)
+        precondition(latency.samples["node"] == nil, "An invalid response must not create a measurement")
 
         let backend = NativeBackendStore(helperURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL,
             arguments: ["--fixture"], timeout: .seconds(1), mode: .attach)
@@ -192,6 +228,16 @@ struct NativeFeaturesCheck {
         }
         precondition(backend.state == .connected)
         let operation = NativeFeatureOperation()
+        let failedWebdavRead = await operation.request(backend, "native_get_webdav_config")
+        precondition(failedWebdavRead == nil && operation.error?.contains("WEBDAV_READ_FAILED") == true)
+        let retriedWebdavRead = await operation.request(backend, "native_get_webdav_config")
+        precondition(retriedWebdavRead != nil && operation.error == nil && !operation.busy)
+        let emptyWebdav = try retriedWebdavRead!.decoded(NativeWebdavConfig.self)
+        precondition(!emptyWebdav.isConfigured)
+        _ = await operation.request(backend, "native_save_webdav_config", ["url": .string("https://example.test/dav"), "username": .string("fixture"), "password": .string("fixture-only")])
+        let configuredWebdavRead = await operation.request(backend, "native_get_webdav_config")
+        let configuredWebdav = try configuredWebdavRead!.decoded(NativeWebdavConfig.self)
+        precondition(configuredWebdav.isConfigured)
         let savedSubscription = await operation.request(backend, "native_patch_subscription", [
             "uid": .string("fixture"), "name": .string("Changed subscription"), "url": .string("https://example.test/changed"),
             "interval": .integer(2880), "auto_update": .bool(false), "with_proxy": .bool(true)

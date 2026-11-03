@@ -57,6 +57,10 @@ enum TezAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+enum TezProxyName {
+    static func title(_ name: String) -> String { name == "GLOBAL" ? "全局代理" : name }
+}
+
 enum TezStyle {
     static let pageInset: CGFloat = 24
     static let footerHeight: CGFloat = 34
@@ -75,6 +79,16 @@ enum TezStyle {
             ? NSColor(srgbRed: 0.96, green: 0.70, blue: 0.28, alpha: 1)
             : NSColor(srgbRed: 0.55, green: 0.30, blue: 0.04, alpha: 1)
     })
+}
+
+enum TezType {
+    static let page = Font.system(size: 20, weight: .semibold)
+    static let itemTitle = Font.system(size: 16, weight: .semibold)
+    static let section = Font.system(size: 13, weight: .semibold)
+    static let body = Font.system(size: 13)
+    static let caption = Font.system(size: 12)
+    static let metadata = Font.system(size: 11)
+    static let code = Font.system(size: 12, design: .monospaced)
 }
 
 struct TezContentMaterial: View {

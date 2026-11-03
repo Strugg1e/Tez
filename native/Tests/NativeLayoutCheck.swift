@@ -6,6 +6,11 @@ private final class LayoutSelection {
     var section: WorkspaceSection? = .routes
 }
 
+@MainActor @Observable
+private final class LayoutMeasurement {
+    var height: CGFloat = 0
+}
+
 @main
 struct NativeLayoutCheck {
     @MainActor private static var uiTarget: LayoutMenuTarget?
@@ -34,7 +39,7 @@ struct NativeLayoutCheck {
         try JSONDecoder().decode(BackendJSON.self, from: JSONEncoder().encode(value))
     }
 
-    static func snapshot(current: String? = nil, revision: String = "1", mode: String = "global", systemProxy: Bool = true, tun: Bool = true) throws -> BackendJSON {
+    static func snapshot(current: String? = nil, groupCurrent: String? = nil, revision: String = "1", mode: String = "global", systemProxy: Bool = true, tun: Bool = true) throws -> BackendJSON {
         let names = (1...24).map { $0 == 2 ? "Tokyo Residential - Long Route Name 02" : "Tokyo \(String(format: "%02d", $0))" }
         let records = Dictionary(uniqueKeysWithValues: names.enumerated().map { index, name in
             let id = "node-\(index)"
@@ -43,15 +48,19 @@ struct NativeLayoutCheck {
                 id: nil, hidden: false, icon: nil, testUrl: nil, udp: true, xudp: false, tfo: false,
                 mptcp: false, smux: false, source: NativeProxySource(kind: "core", proxyName: name, providerName: nil)))
         })
+        let members = names.enumerated().map {
+            NativeProxyMember(kind: "node", name: $0.element, recordId: "node-\($0.offset)", reason: nil)
+        }
         let group = NativeProxyGroup(name: "GLOBAL", type: "Selector", now: current ?? names[0], fixed: nil,
             hidden: false, icon: nil, testUrl: nil, history: [], udp: true, xudp: false, tfo: false,
-            mptcp: false, smux: false, members: names.enumerated().map {
-                NativeProxyMember(kind: "node", name: $0.element, recordId: "node-\($0.offset)", reason: nil)
-            })
+            mptcp: false, smux: false, members: members)
+        let policy = NativeProxyGroup(name: "Daily Policy", type: "Selector", now: groupCurrent ?? names[2], fixed: nil,
+            hidden: false, icon: nil, testUrl: nil, history: [], udp: true, xudp: false, tfo: false,
+            mptcp: false, smux: false, members: members)
         return try json(NativeSnapshot(revision: revision, profiles: NativeProfilesSnapshot(state: "ready",
             current: "profile-1", items: profiles, message: nil),
             proxyView: NativeProxyView(schemaVersion: 1, orderSource: "core", providerState: "ready",
-                global: group, direct: nil, groups: [], records: records, standalone: [], providers: []),
+                global: group, direct: nil, groups: [policy], records: records, standalone: [], providers: []),
             core: NativeCoreSnapshot(state: managedServiceIdle ? "unavailable" : "ready", message: nil, source: "service", lifecycle: managedServiceIdle ? nil : inspection),
             network: NativeNetworkSnapshot(systemProxy: NativeObservedSwitch(state: "ready", enabled: systemProxy),
                 pac: NativeObservedSwitch(state: "ready", enabled: false), tun: NativeObservedSwitch(state: "ready", enabled: tun),
@@ -63,9 +72,9 @@ struct NativeLayoutCheck {
             try FileHandle.standardOutput.write(contentsOf: BackendWire.encode(message))
         }
         let routeControls = routeControlsEnabled
-        var current: String?
+        var selections: [String: String] = [:]
         var revision = 1
-        var mode = "global"
+        var mode = routeControls ? "rule" : "global"
         var systemProxy = true
         var tun = true
         var activityReads = 0
@@ -84,7 +93,7 @@ struct NativeLayoutCheck {
                 guard case .string(let id) = params["id"], id.hasPrefix("connection-") else { fatalError() }
                 closedConnections.insert(id)
                 result = .object(["closed": .bool(true), "id": .string(id)])
-            case "native_subscribe", "native_get_snapshot": result = try snapshot(current: current, revision: String(revision), mode: mode, systemProxy: systemProxy, tun: tun)
+            case "native_subscribe", "native_get_snapshot": result = try snapshot(current: selections["GLOBAL"], groupCurrent: selections["Daily Policy"], revision: String(revision), mode: mode, systemProxy: systemProxy, tun: tun)
             case "native_set_mode" where routeControls:
                 guard case .string(let value) = params["mode"] else { fatalError() }
                 mode = value; revision += 1
@@ -96,13 +105,19 @@ struct NativeLayoutCheck {
                 revision += 1
                 result = .object(["saved": .bool(true)])
             case "native_select_route" where routeControls:
-                guard case .string(let name) = params["name"] else { fatalError() }
-                Thread.sleep(forTimeInterval: 0.5)
-                current = name
+                guard case .string(let name) = params["name"], case .string(let group) = params["group"],
+                      ["GLOBAL", "Daily Policy"].contains(group) else { fatalError() }
+                Thread.sleep(forTimeInterval: 6)
+                if name == "Tokyo 24" {
+                    result = .object(["applied": .bool(false), "persisted": .bool(false)])
+                    break
+                }
+                selections[group] = name
                 revision += 1
+                let incomplete = name.contains("Long Route")
                 result = .object(["applied": .bool(true), "persisted": .bool(true),
-                    "connectionCleanup": .object(["requested": .bool(true), "completed": .bool(false), "closed": .integer(0),
-                        "failure": .object(["code": .string("CONNECTION_CLOSE_FAILED"), "detail": .string("Isolated fixture cleanup refusal")])])])
+                    "connectionCleanup": .object(["requested": .bool(true), "completed": .bool(!incomplete), "closed": .integer(0),
+                        "failure": incomplete ? .object(["code": .string("CONNECTION_CLOSE_FAILED"), "detail": .string("Isolated fixture cleanup refusal")]) : .null])])
             case "native_test_latency" where routeControls:
                 guard case .array(let names) = params["names"] else { fatalError() }
                 Thread.sleep(forTimeInterval: 0.45)
@@ -138,7 +153,13 @@ struct NativeLayoutCheck {
                     let fields: [String: BackendJSON] = [
                     "id": .string("connection-\(index)"), "closeable": .bool(true), "host": .string("service-\(index).example.test"),
                     "destination": .string("192.0.2.1:443"), "network": .string("tcp"), "type": .string("HTTPS"),
-                    "process": .string(index % 2 == 0 ? "Terminal" : "Browser"), "rule": .string("MATCH"), "chains": .array([.string("Daily Policy"), .string("Tokyo Residential - Long Route Name 02")]),
+                    "process": .string(index % 2 == 0 ? "Terminal" : "Browser Helper"),
+                    "application": index % 5 == 0 ? .null : .string(index % 2 == 0 ? "Terminal" : "Browser"),
+                    "rule": .string(index % 3 == 0 ? "Match" : "DomainSuffix"),
+                    "rulePayload": .string(index % 3 == 0 ? "" : "example.test"),
+                    "outbound": index % 5 == 0 ? .null : .string(index % 3 == 0 ? "DIRECT" : "Tokyo Residential - Long Route Name 02"),
+                    "chainOrder": .string("exit-first"),
+                    "chains": index % 5 == 0 ? .array([]) : .array([.string(index % 3 == 0 ? "DIRECT" : "Tokyo Residential - Long Route Name 02"), .string("Daily Policy")]),
                     "upload": .integer(Int64(index * 1024 + (index % 2 == 0 ? activityReads * 1024 : 0))), "download": .integer(Int64(index * 24576 + (index % 2 == 0 ? activityReads * 4096 : 0))), "start": .string("2026-10-29T10:00:00Z")
                     ]
                     return .object(fields)
@@ -211,7 +232,8 @@ struct NativeLayoutCheck {
         precondition(offline.coreTitle == "内核状态未确认" && offline.context.contains("离线快照"))
         let connected = TezConnectionPresentation(state: .connected, hasSnapshot: true, coreState: "ready", writable: false)
         precondition(connected.coreTitle == "内核运行中" && connected.context == "只读访问")
-        precondition(TezMotion(reduced: true).feedback == nil && TezMotion(reduced: true).layout == nil)
+        precondition(TezMotion(reduced: true).feedback == nil && TezMotion(reduced: true).layout == nil
+                     && TezMotion(reduced: true).mechanism == nil)
         let suite = "tez.layout-check.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let preferences = TezPreviewPreferences(defaults: defaults)
@@ -281,6 +303,14 @@ struct NativeLayoutCheck {
                     }
                     precondition(table.frame.width <= host.bounds.width, "Route table overflowed")
                     let unselectedHeight = table.enclosingScrollView!.frame.height
+                    if width == 800 {
+                        let viewport = table.visibleRect
+                        let fullRows = (0..<table.numberOfRows).filter {
+                            let row = table.rect(ofRow: $0)
+                            return row.minY >= viewport.minY - 0.5 && row.maxY <= viewport.maxY + 0.5
+                        }.count
+                        precondition(fullRows >= 5, "Compact routes must show five complete rows: \(fullRows), viewport \(viewport)")
+                    }
                     table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
                     await settle(host)
                     precondition(abs(table.enclosingScrollView!.frame.height - unselectedHeight) < 1,
@@ -290,16 +320,119 @@ struct NativeLayoutCheck {
                 }
             }
         }
+        window.setContentSize(NSSize(width: 1320, height: 780))
+        await settle(host)
+        guard let wideRoutes = tables(host).first(where: { $0.numberOfRows == 24 }) else { fatalError("Wide routes missing") }
+        let wideListHeight = wideRoutes.enclosingScrollView!.frame.height
+        wideRoutes.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        await settle(host)
+        guard let inspectedRoutes = tables(host).first(where: { $0.numberOfRows == 24 }) else { fatalError("Inspected routes missing") }
+        precondition(inspectedRoutes.frame.width < 1000, "Wide route inspector must sit beside its table")
+        precondition(abs(inspectedRoutes.enclosingScrollView!.frame.height - wideListHeight) < 1,
+                     "A side inspector must not reduce table height")
+        precondition(store.snapshot?.revision == "1", "A side inspector must not switch routes")
         window.setContentSize(NSSize(width: 1040, height: 700))
         selection.section = .activity
         await settle(host)
         for _ in 0..<10 {
-            if tables(host).contains(where: { $0.headerView != nil && $0.numberOfColumns == 6 && $0.numberOfRows == 24 }) { break }
+            if tables(host).contains(where: { $0.headerView != nil && [3, 6].contains($0.numberOfColumns) && $0.numberOfRows == 24 }) { break }
             await settle(host)
         }
-        guard let activityTable = tables(host).first(where: { $0.headerView != nil && $0.numberOfColumns == 6 && $0.numberOfRows == 24 }),
+        guard let activityTable = tables(host).first(where: { $0.headerView != nil && [3, 6].contains($0.numberOfColumns) && $0.numberOfRows == 24 }),
               let scroll = activityTable.enclosingScrollView else { fatalError("Activity fixture did not render") }
         precondition(scroll.frame.height >= 400, "Empty activity details still consume list height: \(scroll.frame.height)")
+        window.setContentSize(NSSize(width: 800, height: 560))
+        await settle(host)
+        precondition(activityTable.numberOfColumns == 3, "Compact activity must group related information instead of squeezing six columns")
+        precondition(activityTable.tableColumns[0].width >= 190 && activityTable.tableColumns[1].width >= 175,
+                     "Compact activity must leave readable target and outbound columns")
+        let visibleWidth = scroll.contentView.bounds.width - scroll.contentInsets.left - scroll.contentInsets.right
+        precondition(activityTable.frame.width <= visibleWidth + 1,
+                     "Compact activity columns overflow: \(activityTable.frame.width), viewport \(visibleWidth), columns \(activityTable.tableColumns.map(\.width))")
+        let horizontalPosition = activityTable.visibleRect.minX
+        for row in [1, 9, 23] {
+            activityTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            await settle(host)
+            let selectedFrame = activityTable.rect(ofRow: row)
+            let visible = activityTable.visibleRect
+            precondition(selectedFrame.minY >= visible.minY - 1 && selectedFrame.maxY <= visible.maxY + 1,
+                         "Activity inspector hid selected row \(row): \(selectedFrame), viewport \(visible)")
+            precondition(scroll.frame.height >= 100, "Activity inspector must leave a usable table")
+            let firstCell = activityTable.frameOfCell(atColumn: 0, row: row)
+            let lastCell = activityTable.frameOfCell(atColumn: activityTable.numberOfColumns - 1, row: row)
+            precondition(firstCell.minX >= activityTable.visibleRect.minX - 1 && lastCell.maxX <= activityTable.visibleRect.maxX + 1,
+                         "Compact connection columns must stay visible: \(firstCell), \(lastCell), viewport \(activityTable.visibleRect)")
+            precondition(abs(activityTable.visibleRect.minX - horizontalPosition) < 1,
+                         "Vertical selection scrolling changed the horizontal position: \(horizontalPosition) to \(activityTable.visibleRect.minX)")
+        }
+        print("PASS: compact activity inspector keeps second, middle and last selected rows visible")
+        window.setContentSize(NSSize(width: 1320, height: 780))
+        await settle(host)
+        guard let wideActivity = tables(host).first(where: { [3, 6].contains($0.numberOfColumns) && $0.numberOfRows == 24 }) else { fatalError("Wide activity missing") }
+        precondition(wideActivity.selectedRow == 23 && wideActivity.frame.width < 1000,
+                     "Changing inspector placement must preserve the selected connection")
+        precondition(wideActivity.enclosingScrollView!.frame.height > 400, "Side details must preserve vertical table space")
+        selection.section = .routes
+        await settle(host)
+        selection.section = .activity
+        await settle(host)
+        precondition(tables(host).first(where: { $0.numberOfRows == 24 })?.selectedRow == 23,
+                     "Navigating away from activity must preserve the selected connection")
+        tables(host).first(where: { $0.numberOfRows == 24 })?.deselectAll(nil)
+        await settle(host)
+        precondition(tables(host).first(where: { $0.numberOfRows == 24 })?.numberOfColumns == 6,
+                     "Wide activity without an inspector must retain its detailed six-column table")
+        let activitySession = NativeActivitySession()
+        activitySession.paused = true
+        let activityHost = NSHostingView(rootView: NativeActivityWorkspace(store: store, session: activitySession)
+            .environment(preferences))
+        window.contentView = activityHost
+        for width in [800.0, 1040.0] {
+            window.setContentSize(NSSize(width: width, height: width == 800 ? 560 : 700))
+            activitySession.tab = .connections
+            await settle(activityHost)
+            guard let connections = tables(activityHost).first(where: { $0.numberOfRows == 24 }),
+                  let connectionScroll = connections.enclosingScrollView else { fatalError("Connections missing") }
+            let connectionHeight = connectionScroll.frame.height
+            for (tab, count) in [(ActivityTab.rules, 12), (.providers, 3)] {
+                activitySession.tab = tab
+                await settle(activityHost)
+                guard let table = tables(activityHost).first(where: { $0.numberOfRows == count }),
+                      let scroll = table.enclosingScrollView else { fatalError("Activity subpage missing: \(tab)") }
+                precondition(scroll.frame.height >= connectionHeight + 64,
+                             "Rules and providers must reclaim the connection summary height: \(scroll.frame.height), connections \(connectionHeight)")
+            }
+            activitySession.tab = .connections
+            await settle(activityHost)
+            let restoredHeight = tables(activityHost).first(where: { $0.numberOfRows == 24 })?.enclosingScrollView?.frame.height
+            precondition(restoredHeight.map { abs($0 - connectionHeight) < 1 } == true,
+                         "Returning to connections must restore its summary without changing the table layout")
+        }
+        print("PASS: rules and providers reclaim summary space at compact and standard widths; connections retain their summary")
+        for count in [1, 6] {
+            let measurement = LayoutMeasurement()
+            let changes = (0..<count).map {
+                NativePendingChange(id: String($0), scope: .proxy, title: "Example change \($0)",
+                                    previousValue: "Off", proposedValue: "On", affectsTraffic: true)
+            }
+            let pendingHost = NSHostingView(rootView: VStack(spacing: 0) {
+                NativePendingChangesList(changes: changes)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { measurement.height = $0 }
+                Spacer(minLength: 0)
+            }.frame(width: 640))
+            window.contentView = pendingHost
+            window.setContentSize(NSSize(width: 640, height: 300))
+            await settle(pendingHost)
+            precondition(measurement.height >= 32 && measurement.height <= 160,
+                         "Pending list must remain visible and capped: \(measurement.height)")
+            if count == 1 {
+                precondition(measurement.height <= 60, "A single pending change must fit its content: \(measurement.height)")
+            } else {
+                precondition(measurement.height >= 120, "Long pending lists must use the available height: \(measurement.height)")
+            }
+        }
+        print("PASS: pending changes fit one row and scroll at the height cap")
+        window.contentView = host
         selection.section = .connection
         for width in [1040.0, 800.0] {
             window.setContentSize(NSSize(width: width, height: width == 1040 ? 700 : 560))
@@ -414,6 +547,28 @@ struct NativeLayoutCheck {
         precondition(route.isAvailable(in: snapshot) && route.isCurrent(in: snapshot))
         precondition(!NativeRecentRoute(profileID: "profile-2", group: "GLOBAL", name: "Tokyo 01").isAvailable(in: snapshot))
         precondition(!NativeRecentRoute(profileID: "profile-1", group: "GLOBAL", name: "Missing").isAvailable(in: snapshot))
+        guard let view = snapshot.proxyView, let global = view.global, let policy = view.groups.first else { fatalError() }
+        precondition(NativeRoutePresentation.groups(in: view, mode: "rule").map(\.name) == ["Daily Policy", "GLOBAL"])
+        precondition(NativeRoutePresentation.groups(in: view, mode: "global").first?.name == "GLOBAL")
+        precondition(NativeRoutePresentation.groups(in: view, mode: "direct").first?.name == "Daily Policy")
+        precondition(NativeRoutePresentation.title("GLOBAL") == "全局代理" && global.name == "GLOBAL")
+        var change = NativeRouteSwitchChange(group: "GLOBAL", target: "Tokyo 01")
+        precondition(!change.isConfirmed(by: global), "A matching snapshot must not confirm an unfinished request")
+        change.outcome = .applied
+        precondition(change.isConfirmed(by: global) && !change.isConfirmed(by: policy))
+        change.outcome = .notApplied
+        precondition(!change.isConfirmed(by: global))
+        let samplerState = NativeRouteSamplerState()
+        let held = NativeRouteSamplerState.Reading(samples: [], testing: false, origin: "snapshot")
+        let latest = NativeRouteSamplerState.Reading(samples: [.init(date: .now, delay: 42)], testing: false, origin: "session")
+        samplerState.held = held
+        samplerState.accept(latest)
+        precondition(samplerState.held == held, "New data must not replace a held reading")
+        samplerState.captureNext = true
+        samplerState.accept(latest)
+        precondition(samplerState.held == latest && !samplerState.captureNext)
+        samplerState.reset()
+        precondition(samplerState.held == nil && !samplerState.captureNext)
         var selection = NativeRouteComparisonSelection()
         for id in ["a", "a", "b", "c", "d"] { selection.add(id) }
         precondition(selection.ids == ["a", "b", "c"] && selection.isFull)
@@ -422,6 +577,10 @@ struct NativeLayoutCheck {
         selection.clear(); precondition(selection.ids.isEmpty)
         let historical = NativeRouteMeasurement(sessionDate: nil, snapshotTime: "2026-10-29T10:00:00Z")
         precondition(historical.origin == .snapshot && historical.date != nil)
+        let fractional = NativeRouteMeasurement(sessionDate: nil, snapshotTime: "2026-10-29T18:00:00.125+08:00")
+        precondition(fractional.date?.timeIntervalSince(historical.date!) == 0.125)
+        let invalid = NativeRouteMeasurement(sessionDate: nil, snapshotTime: "unavailable")
+        precondition(invalid.date == nil && invalid.rawTime == "unavailable")
         let date = Date(timeIntervalSince1970: 100)
         let fresh = NativeRouteMeasurement(sessionDate: date, snapshotTime: "2026-10-29T10:00:00Z")
         precondition(fresh.origin == .session && fresh.date == date)
@@ -437,6 +596,7 @@ struct NativeLayoutCheck {
         let item = NSMenuItem(); let appMenu = NSMenu()
         for (title, selector, key) in [("Compact Window", #selector(LayoutMenuTarget.compact), "1"),
                                        ("Standard Window", #selector(LayoutMenuTarget.standard), "2"),
+                                       ("Wide Window", #selector(LayoutMenuTarget.wide), "3"),
                                        ("Open Menu Panel", #selector(LayoutMenuTarget.openMenuPanel), "b"),
                                        ("Disconnect Fixture", #selector(LayoutMenuTarget.disconnectFixture), "0"),
                                        ("Toggle Dark Mode", #selector(LayoutMenuTarget.toggleDark), "d"),
@@ -470,6 +630,7 @@ private final class LayoutMenuTarget: NSObject, NSApplicationDelegate {
     }
     @objc func compact() { window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: 800, height: 560)), display: true) }
     @objc func standard() { window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: 1040, height: 700)), display: true) }
+    @objc func wide() { window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: 1320, height: 780)), display: true) }
     @objc func toggleDark() { window.appearance = NSAppearance(named: window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .aqua : .darkAqua) }
     @objc func toggleProtocol() { preferences.showProtocol.toggle() }
     @objc func toggleMotion() { preferences.reduceMotion.toggle() }

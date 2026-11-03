@@ -38,7 +38,7 @@ struct NativeActivity: Codable, Equatable, Sendable {
             matched: result.providers.matched, offset: result.providers.offset, nextOffset: result.providers.nextOffset)
         guard result.connections.items.allSatisfy({ row in
             !row.id.isEmpty && row.chains.count <= 8
-                && ([row.id, row.host, row.destination, row.network, row.type, row.process, row.rule, row.start].compactMap { $0 } + row.chains)
+                && ([row.id, row.host, row.destination, row.network, row.type, row.process, row.application, row.rule, row.rulePayload, row.outbound, row.chainOrder, row.start].compactMap { $0 } + row.chains)
                     .allSatisfy { $0.count <= 512 }
         }), result.rules.items.allSatisfy({ row in
             [row.type, row.payload, row.proxy].compactMap { $0 }.allSatisfy { $0.count <= 512 }
@@ -106,18 +106,68 @@ struct NativeActivityConnection: Codable, Equatable, Sendable, Identifiable {
     let download: UInt64
     let start: String?
     var closeable: Bool? = nil
+    var application: String? = nil
+    var rulePayload: String? = nil
+    var outbound: String? = nil
+    var chainOrder: String? = nil
+
+    var applicationLabel: String { nonempty(application) ?? nonempty(process) ?? "未识别进程" }
+    var actualOutbound: String? {
+        nonempty(outbound) ?? ((chainOrder == "exit-first" || chains.count == 1) ? chains.first.flatMap(nonempty) : nil)
+    }
+    var outboundLabel: String {
+        guard let name = actualOutbound else { return "出口未提供" }
+        return switch name.uppercased() {
+        case "DIRECT": "直连"
+        case "REJECT", "REJECT-DROP", "REJECTDROP": "阻断"
+        default: name
+        }
+    }
+    var outboundSymbol: String {
+        switch actualOutbound?.uppercased() {
+        case "DIRECT": "arrow.up.right"
+        case "REJECT", "REJECT-DROP", "REJECTDROP": "hand.raised"
+        case nil: "questionmark.circle"
+        default: "point.3.connected.trianglepath.dotted"
+        }
+    }
+    var orderedChain: [String]? { chainOrder == "exit-first" ? Array(chains.reversed()) : nil }
+    var ruleLabel: String {
+        switch rule?.uppercased().replacingOccurrences(of: "-", with: "") {
+        case "DOMAIN": "域名"
+        case "DOMAINSUFFIX": "域名后缀"
+        case "DOMAINKEYWORD": "域名关键词"
+        case "IPCIDR", "IPCIDR6": "IP 网段"
+        case "GEOIP": "IP 地区"
+        case "GEOSITE": "域名分类"
+        case "PROCESSNAME": "进程名称"
+        case "PROCESSPATH": "进程路径"
+        case "RULESET": "规则集"
+        case "MATCH": "兜底规则"
+        case "AND", "OR", "NOT": "组合规则"
+        default: nonempty(rule) ?? "规则未提供"
+        }
+    }
+    var rulePayloadLabel: String {
+        if rulePayload == "[hidden]" { return "路径内容已隐藏" }
+        if let payload = nonempty(rulePayload) { return payload }
+        return rule?.uppercased() == "MATCH" ? "无附加匹配条件" : "匹配内容未提供"
+    }
 
     var title: String { nonempty(host) ?? destination.flatMap { $0.hasPrefix(":") ? nil : nonempty($0) } ?? "未知目标" }
     var destinationLabel: String? {
         nonempty(destination).map { $0.hasPrefix(":") ? "端口 \($0.dropFirst())" : $0 }
     }
-    var ruleQuery: String? { nonempty(rule) }
+    var ruleQuery: String? {
+        if let payload = nonempty(rulePayload), payload != "[hidden]", payload.utf8.count <= 256 { return payload }
+        return nonempty(rule)
+    }
     var logQuery: String? {
         nonempty(host) ?? nonempty(destination).flatMap { $0.hasPrefix(":") ? nil : $0 }
     }
     func matches(_ query: String) -> Bool {
-        query.isEmpty || [host, destination, network, type, process, rule]
-            .compactMap { $0 }.joined(separator: " ").localizedCaseInsensitiveContains(query)
+        query.isEmpty || ([host, destination, network, type, application, process, rule, rulePayload, actualOutbound]
+            .compactMap { $0 } + chains).joined(separator: " ").localizedCaseInsensitiveContains(query)
     }
 }
 
@@ -218,7 +268,8 @@ struct NativeActivityQuery: Equatable, Hashable, Sendable {
     var limit: UInt64
 
     var params: [String: BackendJSON] {
-        ["section": .string(section), "query": .string(query), "offset": .unsigned(offset), "limit": .unsigned(limit)]
+        let search = section == "connections" ? ["直连": "DIRECT", "阻断": "REJECT"][query.trimmingCharacters(in: .whitespacesAndNewlines)] ?? query : query
+        return ["section": .string(section), "query": .string(search), "offset": .unsigned(offset), "limit": .unsigned(limit)]
     }
 
     var isValid: Bool {

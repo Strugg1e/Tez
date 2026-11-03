@@ -88,7 +88,7 @@ struct NativeMenuBarPanel: View {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "network").font(.system(size: 20)).foregroundStyle(TezStyle.accent)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Tez").font(.system(size: 14, weight: .semibold))
+                    Text("Tez").font(TezType.section)
                     TezStatusLabel(title: summary.accessTitle, tone: summary.accessTone, motion: motion)
                 }
                 Spacer(minLength: 8)
@@ -103,10 +103,10 @@ struct NativeMenuBarPanel: View {
                 summaryRow("当前线路", value: summary.routeTitle)
                 summaryRow("当前配置", value: summary.profileTitle)
             }
-            Text("连通性尚未验证").font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("连通性尚未验证").font(TezType.metadata).foregroundStyle(.secondary)
             if !connected {
                 Text(store.errorMessage ?? store.statusText)
-                    .font(.caption).foregroundStyle(store.errorMessage == nil ? Color.secondary : TezTone.warning.color)
+                    .font(TezType.metadata).foregroundStyle(store.errorMessage == nil ? Color.secondary : TezTone.warning.color)
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -118,7 +118,7 @@ struct NativeMenuBarPanel: View {
             Text(value).lineLimit(1).truncationMode(.middle).help(value)
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
-        .font(.system(size: 12))
+        .font(TezType.body)
         .accessibilityElement(children: .combine)
     }
 
@@ -135,7 +135,7 @@ struct NativeMenuBarPanel: View {
                     Text("分流模式")
                     Spacer()
                     Text(summary.modeTitle).foregroundStyle(.secondary)
-                }.font(.system(size: 12))
+                }.font(TezType.body)
                 Picker("分流模式", selection: Binding(get: { observedMode }, set: { if $0 != observedMode { pending = .mode($0) } })) {
                     if observedMode.isEmpty { Text("未确认").tag("") }
                     Text("规则").tag("rule")
@@ -162,17 +162,18 @@ struct NativeMenuBarPanel: View {
                 Text(title)
                 Spacer(minLength: 4)
                 Text(connected ? observed?.label ?? "未确认" : "未确认")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(TezType.metadata).foregroundStyle(.secondary)
             }
         }
-        .font(.system(size: 12)).toggleStyle(.switch).controlSize(.small)
+        .font(TezType.body).toggleStyle(.switch).controlSize(.small)
+        .accessibilityLabel(title)
         .disabled(!connected || busy || !store.supports("native_patch_settings") || observed?.state != "ready" || observed?.enabled == nil)
     }
 
     private var recentSelections: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("最近线路").font(.system(size: 12, weight: .medium))
+                Text("最近线路").font(TezType.body.weight(.medium))
                 Spacer()
                 Button("全部线路", systemImage: "chevron.right", action: openRoutes)
                     .labelStyle(.iconOnly).help("打开全部线路")
@@ -180,7 +181,7 @@ struct NativeMenuBarPanel: View {
             }
             if recentRoutes.isEmpty || !connected {
                 Text(!connected ? "连接后台后可查看当前配置的最近线路。" : preferences.recentRoutes.isEmpty ? "暂无已确认的线路选择。" : "当前配置没有可用的最近线路。")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(TezType.metadata).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(recentRoutes) { route in
@@ -189,17 +190,17 @@ struct NativeMenuBarPanel: View {
                             Image(systemName: route.isCurrent(in: store.snapshot) ? "checkmark" : "clock.arrow.circlepath")
                                 .frame(width: 16).foregroundStyle(.secondary)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(route.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
-                                Text(route.group).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                                Text(TezProxyName.title(route.name)).font(TezType.body).lineLimit(1).truncationMode(.middle)
+                                Text(TezProxyName.title(route.group)).font(TezType.metadata).foregroundStyle(.secondary).lineLimit(1)
                             }
                             Spacer(minLength: 4)
-                            if route.isCurrent(in: store.snapshot) { Text("当前").font(.system(size: 10)).foregroundStyle(.secondary) }
+                            if route.isCurrent(in: store.snapshot) { Text("此组已选").font(TezType.metadata).foregroundStyle(.secondary) }
                         }
                         .contentShape(Rectangle()).padding(.vertical, 3)
                     }
                     .buttonStyle(.plain).disabled(!canApply(.route(route)))
                     .help("\(route.group)：\(route.name)")
-                    .accessibilityLabel("\(route.group)，\(route.name)\(route.isCurrent(in: store.snapshot) ? "，当前线路" : "")")
+                    .accessibilityLabel("\(TezProxyName.title(route.group))，\(TezProxyName.title(route.name))\(route.isCurrent(in: store.snapshot) ? "，此组当前选择" : "")")
                 }
             }
         }
@@ -208,7 +209,7 @@ struct NativeMenuBarPanel: View {
     private var feedback: some View {
         VStack(alignment: .leading, spacing: 8) {
             if operation.busy {
-                ProgressView("等待后台确认…").controlSize(.small).font(.caption)
+                ProgressView("等待后台确认…").controlSize(.small).font(TezType.metadata)
             } else if let error = operation.error {
                 TezOperationFeedback(message: "改动结果未确认。", details: error, tone: .error)
             } else if let message = operation.message {
@@ -276,7 +277,7 @@ struct NativeMenuBarPanel: View {
             } else if cleanupIncomplete {
                 operation.message = "线路已切换并保存；部分旧连接未关闭。"
             } else {
-                operation.message = "已切换到 \(route.name)，选择已保存。"
+                operation.message = "已切换到 \(TezProxyName.title(route.name))，选择已保存。"
             }
             feedbackDetails = persisted && applied && !cleanupIncomplete ? nil : render(result)
         } else {
@@ -305,7 +306,7 @@ struct NativeMenuBarPanel: View {
             switch self {
             case .access(_, let title, let enabled): "\(enabled ? "开启" : "关闭")\(title)"
             case .mode(let value): "使用\(NativeObservedMode(state: "ready", value: value).label)模式"
-            case .route(let route): "切换到 \(route.name)"
+            case .route(let route): "切换到 \(TezProxyName.title(route.name))"
             }
         }
         var title: String { "\(actionTitle)？" }
@@ -320,7 +321,7 @@ struct NativeMenuBarPanel: View {
                 let effect = value == "direct" ? "流量将直接连接目标。" : value == "global" ? "代理流量将使用全局策略组。" : "流量将按当前配置中的规则分流。"
                 return "目标模式：\(NativeObservedMode(state: "ready", value: value).label)。\(effect)此操作可能中断现有连接。"
             case .route(let route):
-                return "策略组：\(route.group)。目标线路：\(route.name)。此操作会改变流量路径，并可能中断现有连接。"
+                return "分组：\(TezProxyName.title(route.group))。目标线路：\(TezProxyName.title(route.name))。此操作会改变流量路径，并可能中断现有连接。"
             }
         }
         var command: String {

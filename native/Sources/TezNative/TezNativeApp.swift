@@ -34,7 +34,6 @@ struct TezNativeApp: App {
         .windowToolbarStyle(.unified)
         .commands {
             SidebarCommands()
-            TezRouteCommands()
             CommandGroup(after: .windowArrangement) {
                 Button("紧凑窗口") {
                     NSApplication.shared.windows.first { $0.identifier?.rawValue == "workspace" }?
@@ -46,6 +45,11 @@ struct TezNativeApp: App {
                         .setContentSize(NSSize(width: 1040, height: 700))
                 }
                 .keyboardShortcut("2", modifiers: [.command, .option])
+                Button("宽窗布局") {
+                    NSApplication.shared.windows.first { $0.identifier?.rawValue == "workspace" }?
+                        .setContentSize(NSSize(width: 1320, height: 780))
+                }
+                .keyboardShortcut("3", modifiers: [.command, .option])
             }
             CommandMenu("导航") {
                 ForEach(WorkspaceSection.allCases) { section in

@@ -73,7 +73,7 @@ impl ActivityQuery {
 fn page(items: impl Iterator<Item = Value>, total: usize, section: Section, query: &ActivityQuery) -> Value {
     let (search, offset, limit) = query.for_section(section);
     let fields: &[&str] = match section {
-        Section::Connections => &["host", "destination", "network", "type", "process", "rule"],
+        Section::Connections => &["host", "destination", "network", "type", "application", "process", "rule", "rulePayload", "outbound"],
         Section::Rules => &["type", "payload", "proxy"],
         Section::Providers => &["name", "behavior", "format", "type", "vehicleType"],
     };
@@ -85,7 +85,10 @@ fn page(items: impl Iterator<Item = Value>, total: usize, section: Section, quer
                 item[*field]
                     .as_str()
                     .is_some_and(|value| value.to_lowercase().contains(&search))
-            });
+            })
+            || (section == Section::Connections && item["chains"].as_array().is_some_and(|chains| {
+                chains.iter().any(|value| value.as_str().is_some_and(|value| value.to_lowercase().contains(&search)))
+            }));
         if matches {
             if matched >= offset && rows.len() < limit {
                 rows.push(item);
@@ -261,7 +264,10 @@ fn project_connections(data: Connections, query: &ActivityQuery) -> Value {
         });
         json!({"id":id,"closeable":closeable,"host":short(&metadata.host),"destination":destination,
                 "network":short(metadata.network.as_str()),"type":short(metadata.connection_type.as_str()),
+                "application":application_name(&metadata.process_path),
                 "process":basename(&metadata.process),"rule":short(&connection.rule),
+                "rulePayload":rule_payload(&connection.rule, &connection.rule_payload),
+                "outbound":connection.chains.first().map(|chain| short(chain)),"chainOrder":"exit-first",
                 "chains":connection.chains.iter().take(8).map(|chain| short(chain)).collect::<Vec<_>>(),
                 "upload":connection.upload,"download":connection.download,"start":short(&connection.start)})
     });
@@ -276,12 +282,27 @@ fn project_rules(data: Rules, query: &ActivityQuery) -> Value {
     let total = data.rules.len();
     let items = data.rules.into_iter().enumerate().map(|(index, rule)| {
         let kind = rule.rule_type.as_str();
-        let contains_path = kind.contains("ProcessPath") || rule.payload.to_ascii_uppercase().contains("PROCESS-PATH");
         json!({"index":index,"type":short(kind),
-                "payload":if contains_path { "[hidden]".to_owned() } else { text(&rule.payload,256) },
+                "payload":rule_payload(kind, &rule.payload),
                 "proxy":short(&rule.proxy),"size":rule.size.max(0) as u64})
     });
     page(items, total, Section::Rules, query)
+}
+
+fn application_name(path: &str) -> Option<String> {
+    path.split(['/', '\\']).find_map(|part| {
+        part.strip_suffix(".app").filter(|name| !name.is_empty()).map(short)
+    })
+}
+
+fn rule_payload(kind: &str, payload: &str) -> String {
+    if kind.to_ascii_uppercase().replace('-', "").contains("PROCESSPATH")
+        || payload.to_ascii_uppercase().contains("PROCESS-PATH")
+    {
+        "[hidden]".to_owned()
+    } else {
+        text(payload, 256)
+    }
 }
 
 fn project_providers(data: RuleProviders, query: &ActivityQuery) -> Value {
@@ -422,17 +443,25 @@ mod tests {
             "uploadTotal":u64::MAX,"downloadTotal":15,"memory":42,
             "private":"private-token","connections":[{
                 "id":"one","metadata":{"host":"example.test","process":"/private/account/Test.app",
-                    "processPath":"/private/secret","sourceIP":"private-source","destinationIP":"127.0.0.1",
+                    "processPath":"/private/account/Browser.app/Contents/MacOS/Browser Helper","sourceIP":"private-source","destinationIP":"127.0.0.1",
                     "destinationPort":"443","inboundUser":"private-user"},
-                "upload":7,"download":8,"rule":"Domain","rulePayload":"private-payload",
+                "upload":7,"download":8,"rule":"Domain","rulePayload":"example.test",
                 "chains":["DIRECT"],"extra-secret":"private-token"}]
         }))
         .unwrap();
         let value = project_connections(data, &ActivityQuery::default());
         assert_eq!(value["items"][0]["process"], "Test.app");
+        assert_eq!(value["items"][0]["application"], "Browser");
+        assert_eq!(value["items"][0]["rulePayload"], "example.test");
+        assert_eq!(value["items"][0]["outbound"], "DIRECT");
+        assert_eq!(value["items"][0]["chainOrder"], "exit-first");
         assert_eq!(value["items"][0]["destination"], "127.0.0.1:443");
         assert_eq!(value["uploadTotal"], u64::MAX);
         assert!(!value.to_string().contains("private"));
+        assert_eq!(rule_payload("ProcessPath", "/private/secret"), "[hidden]");
+        assert_eq!(rule_payload("AND", "((PROCESS-PATH,/private/secret),(NETWORK,TCP))"), "[hidden]");
+        assert_eq!(application_name("/Applications/Browser.app/Contents/Helpers/Helper.app/Contents/MacOS/Helper"), Some("Browser".to_owned()));
+        assert_eq!(application_name("/usr/bin/curl"), None);
 
         let rules: Rules = serde_json::from_value(json!({"rules":[
             {"type":"ProcessPath","payload":"/private/secret","proxy":"DIRECT","index":-1,"size":-1},

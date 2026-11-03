@@ -562,8 +562,7 @@ fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
                 "failed to locate the current executable while resolving Service core {clash_core:?}: {error}"
             )
         })?;
-    let name = if executable.file_name().is_some_and(|n| n == "tez-native-host") { native_core_name(clash_core) } else { clash_core };
-    let sibling = executable.with_file_name(format!("{name}{bin_ext}"));
+    let sibling = bundled_core_path_for(&executable, clash_core, bin_ext);
 
     #[cfg(all(target_os = "macos", feature = "verge-dev"))]
     {
@@ -579,6 +578,74 @@ fn service_core_path(clash_core: &str, bin_ext: &str) -> Result<PathBuf> {
 
 pub(crate) fn native_core_name(name: &str) -> &str {
     match name { "verge-mihomo" => "mihomo", "verge-mihomo-alpha" => "mihomo-alpha", _ => name }
+}
+
+pub(crate) fn core_sidecar_argument_for(executable: &Path, core: &str) -> PathBuf {
+    if executable.file_name().is_some_and(|name| name == "tez-native-host") {
+        executable.with_file_name(native_core_name(core))
+    } else {
+        PathBuf::from(core)
+    }
+}
+
+pub(crate) fn bundled_core_path_for(executable: &Path, core: &str, extension: &str) -> PathBuf {
+    let mut name = core_sidecar_argument_for(executable, core).into_os_string();
+    name.push(extension);
+    executable.with_file_name(name)
+}
+
+pub(crate) fn core_sidecar_argument(core: &str) -> Result<PathBuf> {
+    Ok(core_sidecar_argument_for(&current_exe()?, core))
+}
+
+fn choose_runtime_core(bundled: PathBuf, selected: Option<PathBuf>) -> PathBuf {
+    selected.unwrap_or(bundled)
+}
+
+#[cfg(test)]
+mod native_core_selection_tests {
+    use super::*;
+
+    #[test]
+    fn native_runtime_and_validation_prefer_selected_core() {
+        let bundled = PathBuf::from("/Tez.app/Contents/Helpers/mihomo");
+        let selected = PathBuf::from("/approved/tez-selected-version");
+        assert_eq!(choose_runtime_core(bundled.clone(), Some(selected.clone())), selected);
+        assert_eq!(choose_runtime_core(bundled.clone(), None), bundled);
+    }
+
+    #[test]
+    #[ignore = "requires an explicit packaged application; validates a private copy without starting a core"]
+    fn native_selected_core_runs_packaged_validation() -> Result<()> {
+        let app = std::env::var_os("TEZ_CORE_VALIDATION_TEST_APP").ok_or_else(|| anyhow!("Set TEZ_CORE_VALIDATION_TEST_APP"))?;
+        let root = std::env::temp_dir().join(format!("tez-selected-validation-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir(&root)?;
+        let cleanup = scopeguard::guard(root, |path| { let _ = std::fs::remove_dir_all(path); });
+        let selected = cleanup.join("tez-approved-fixture");
+        std::fs::copy(Path::new(&app).join("Contents/Helpers/mihomo"), &selected)?;
+        let program = choose_runtime_core(cleanup.join("missing-bundled-core"), Some(selected.clone()));
+        assert_eq!(program, selected);
+        let config = cleanup.join("fixture.yaml");
+        for valid in [true, false] {
+            std::fs::write(&config, if valid {
+                "mixed-port: 0\ndns: {enable: false}\ntun: {enable: false}\nproxies: []\nrules: ['MATCH,DIRECT']\n"
+            } else { "proxies: [{name: Bad, type: tez-invalid-fixture}]\n" })?;
+            let output = StdCommand::new(&program).arg("-t").arg("-d").arg(&*cleanup).arg("-f").arg(&config).output()?;
+            assert_eq!(output.status.success(), valid);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn runtime_core_path(bundled: PathBuf) -> Result<PathBuf> {
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    let selected = if crate::native_ownership::supported().await {
+        let remembered = NATIVE_CORE_SELECTION.lock().clone();
+        match remembered { Some(path) => Some(path), None => clash_verge_service_ipc::load_owner_core(&current_owner_credentials()?)? }
+    } else { None };
+    #[cfg(not(all(feature = "native-host", target_os = "macos")))]
+    let selected = None;
+    Ok(choose_runtime_core(bundled, selected))
 }
 
 #[cfg(target_os = "macos")]
@@ -833,15 +900,7 @@ async fn collect_service_runtime_bundle(config_file: &Path) -> Result<RuntimeBun
     drop(verge_config);
 
     let bin_ext = if cfg!(windows) { ".exe" } else { "" };
-    let mut bin_path = service_core_path(&clash_core, bin_ext)?;
-    #[cfg(all(feature = "native-host", target_os = "macos"))]
-    if crate::native_ownership::supported().await {
-        let remembered = NATIVE_CORE_SELECTION.lock().clone();
-        let selected = match remembered { Some(path) => Some(path), None => clash_verge_service_ipc::load_owner_core(&current_owner_credentials()?)? };
-        if let Some(selected) = selected {
-            bin_path = selected;
-        }
-    }
+    let bin_path = runtime_core_path(service_core_path(&clash_core, bin_ext)?).await?;
     collect_runtime_bundle(config_file, &bin_path).await
 }
 

@@ -87,7 +87,7 @@ struct TezSettingsView: View {
                             }
                             Text("52 ms").monospacedDigit().foregroundStyle(.secondary)
                         }
-                        .font(.system(size: 12))
+                        .font(TezType.body)
                         .animation(TezMotion(reduced: reducesMotion).feedback, value: preferences.showProtocol)
                     }
                 }

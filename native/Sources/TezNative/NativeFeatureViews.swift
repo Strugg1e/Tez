@@ -48,10 +48,10 @@ struct NativeFeatureFeedback: View {
     let operation: NativeFeatureOperation
     var body: some View {
         if let error = operation.error {
-            ScrollView { Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+            ScrollView { Label(error, systemImage: "exclamationmark.triangle").font(TezType.metadata).foregroundStyle(.red).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                 .frame(maxHeight: 74)
         } else if let message = operation.message {
-            Label(message, systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
+            Label(message, systemImage: "checkmark.circle").font(TezType.metadata).foregroundStyle(.secondary)
         }
     }
 }
@@ -77,6 +77,8 @@ struct NativeLocalBackupsView: View {
     @State private var location: BackupLocation = .local
     @State private var showingWebdavSettings = false
     @State private var loaded = false
+    @State private var webdavConfigured: Bool?
+    @State private var errorMessage = "备份列表读取失败。请重试刷新。"
 
     private var busy: Bool { operation.busy || store.workspaceBusy }
     private enum BackupLocation: String, CaseIterable { case local = "本地", webdav = "远程（WebDAV）" }
@@ -90,11 +92,14 @@ struct NativeLocalBackupsView: View {
     }
     private var prefix: String { location == .local ? "local" : "webdav" }
     private var listCommand: String { "native_list_\(prefix)_backups" }
+    private var needsWebdavSettings: Bool {
+        location == .webdav && store.supports("native_get_webdav_config") && webdavConfigured != true
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 16) {
-                Text("备份与恢复").font(.system(size: 18, weight: .semibold))
+                Text("备份与恢复").font(TezType.page)
                 HStack(spacing: 10) {
                     Picker("备份位置", selection: $location) {
                         ForEach(BackupLocation.allCases, id: \.self) { Text($0.rawValue).tag($0) }
@@ -110,14 +115,36 @@ struct NativeLocalBackupsView: View {
                     }
                     TezToolButton(title: "刷新备份列表", symbol: "arrow.clockwise", enabled: !busy && store.supports(listCommand)) { Task { await load() } }
                     Button("创建备份", systemImage: "plus") { Task { await create() } }
-                        .modifier(TezPrimaryActionStyle()).disabled(busy || !store.supports("native_create_\(prefix)_backup"))
+                        .modifier(TezPrimaryActionStyle()).disabled(busy || needsWebdavSettings || !store.supports("native_create_\(prefix)_backup"))
                 }
                 Text("恢复会覆盖当前配置，并可能中断连接。恢复前会创建一份本地备份。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .font(TezType.metadata).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }.padding(TezStyle.pageInset)
             Divider()
             if !store.supports(listCommand) {
                 TezEmptyState(title: "备份不可用", symbol: "archivebox", detail: "后台未开放此位置的备份操作。")
+            } else if location == .webdav && webdavConfigured == false {
+                ContentUnavailableView {
+                    Label("尚未设置远程备份服务器", systemImage: "externaldrive.badge.icloud")
+                } description: {
+                    Text("填写 WebDAV 服务器地址与访问凭据后，再创建或查看远程备份。")
+                } actions: {
+                    Button("设置服务器…", systemImage: "gearshape") { showingWebdavSettings = true }
+                        .modifier(TezPrimaryActionStyle())
+                        .disabled(busy)
+                        .accessibilityIdentifier("backups.webdav.setup")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !loaded && operation.error != nil {
+                ContentUnavailableView {
+                    Label("备份列表尚未读取", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(errorMessage)
+                } actions: {
+                    Button("重试读取", systemImage: "arrow.clockwise") { Task { await load() } }
+                        .disabled(busy)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if backups.isEmpty && loaded {
                 TezEmptyState(title: location == .local ? "暂无本地备份" : "暂无远程备份", symbol: "archivebox")
             } else {
@@ -127,23 +154,23 @@ struct NativeLocalBackupsView: View {
                        HStack(spacing: 12) {
                         Image(systemName: "doc.zipper").foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(backup.filename).font(.system(size: 13, weight: .medium)).lineLimit(2).help(backup.filename)
+                            Text(backup.filename).font(TezType.body.weight(.medium)).lineLimit(2).help(backup.filename)
                             Text(detail(backup))
-                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                .font(TezType.metadata).foregroundStyle(.secondary)
                         }
                         Spacer()
                         if location == .local {
-                            TezToolButton(title: "导出备份", symbol: "square.and.arrow.up", enabled: !busy && store.supports("native_export_local_backup")) { exportBackup(backup) }
+                            TezToolButton(title: "导出备份：\(backup.filename)", symbol: "square.and.arrow.up", enabled: !busy && store.supports("native_export_local_backup")) { exportBackup(backup) }
                         }
-                        TezToolButton(title: "恢复备份", symbol: "arrow.uturn.backward", enabled: !busy && store.supports("native_restore_\(prefix)_backup")) {
+                        TezToolButton(title: "恢复备份：\(backup.filename)", symbol: "arrow.uturn.backward", enabled: !busy && store.supports("native_restore_\(prefix)_backup")) {
                             pending = BackupAction(kind: .restore, backup: backup, location: location)
                         }
                         Button(role: .destructive) { pending = BackupAction(kind: .delete, backup: backup, location: location) } label: {
                             Image(systemName: "trash").frame(width: 14, height: 14)
                         }
                         .buttonStyle(.bordered).controlSize(.small)
-                        .help("删除备份")
-                        .accessibilityLabel("删除备份")
+                        .help("删除备份：\(backup.filename)")
+                        .accessibilityLabel("删除备份：\(backup.filename)")
                         .disabled(busy || !store.supports("native_delete_\(prefix)_backup"))
                        }.frame(minHeight: 58).padding(.vertical, 6).padding(.horizontal, TezStyle.pageInset).accessibilityElement(children: .contain)
                        Divider()
@@ -155,7 +182,7 @@ struct NativeLocalBackupsView: View {
             if operation.error != nil || operation.message != nil {
                 Divider()
                 Group {
-                    if let error = operation.error { TezOperationFeedback(message: "未收到成功结果，请刷新备份列表确认。", details: error, tone: .error) }
+                    if let error = operation.error { TezOperationFeedback(message: errorMessage, details: error, tone: .error) }
                     else if let message = operation.message { TezOperationFeedback(message: message, tone: .success) }
                 }.padding(16)
             }
@@ -166,7 +193,7 @@ struct NativeLocalBackupsView: View {
         .onChange(of: store.supports(listCommand)) { _, available in
             if available { Task { await load() } }
         }
-        .onChange(of: location) { _, _ in backups = []; loaded = false; Task { await load() } }
+        .onChange(of: location) { _, _ in backups = []; loaded = false; webdavConfigured = nil; Task { await load() } }
         .sheet(isPresented: $showingWebdavSettings, onDismiss: { Task { await load() } }) {
             NativeWebdavSettings(store: store)
         }
@@ -181,12 +208,26 @@ struct NativeLocalBackupsView: View {
 
     private func load() async {
         guard store.supports(listCommand), !busy else { return }
+        if location == .webdav && store.supports("native_get_webdav_config") {
+            errorMessage = "远程服务器设置读取失败。请重试，或打开服务器设置检查。"
+            guard let result = await operation.request(store, "native_get_webdav_config") else { return }
+            do { webdavConfigured = try result.decoded(NativeWebdavConfig.self).isConfigured }
+            catch { operation.error = "无法读取远程服务器设置。"; return }
+            if webdavConfigured == false {
+                backups = []; loaded = true
+                return
+            }
+        }
+        errorMessage = location == .local ? "本地备份列表读取失败。请重试刷新。"
+            : "远程备份列表读取失败。请重试，或检查服务器设置。"
         guard let result = await operation.request(store, listCommand, timeout: .seconds(350)) else { return }
         do { backups = try result.decoded(NativeBackupList.self).backups; loaded = true }
         catch { operation.error = "无法读取备份列表。" }
     }
 
     private func create() async {
+        guard !needsWebdavSettings else { return }
+        errorMessage = "创建备份未收到成功结果。请刷新列表确认后再试。"
         guard await operation.request(store, "native_create_\(prefix)_backup", timeout: .seconds(350)) != nil else { return }
         await reloadAfter("备份已创建")
     }
@@ -194,6 +235,8 @@ struct NativeLocalBackupsView: View {
     private func perform(_ action: BackupAction) async {
         let target = action.location == .local ? "local" : "webdav"
         let verb = action.kind == .restore ? "restore" : "delete"
+        errorMessage = action.kind == .restore ? "恢复结果未确认。请检查当前配置，不要重复恢复。"
+            : "删除结果未确认。请刷新列表确认后再试。"
         guard await operation.request(store, "native_\(verb)_\(target)_backup", ["filename": .string(action.backup.filename)], refresh: action.kind == .restore, timeout: .seconds(350)) != nil else { return }
         await reloadAfter(action.kind == .restore ? "配置已恢复，重启 Tez 后完全生效" : "备份已删除")
     }
@@ -203,6 +246,7 @@ struct NativeLocalBackupsView: View {
         panel.allowedContentTypes = [.zip]; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task {
+            errorMessage = "导入备份未收到成功结果。请刷新列表确认后再试。"
             guard await operation.request(store, "native_import_local_backup", ["source": .string(url.path)], timeout: .seconds(350)) != nil else { return }
             await reloadAfter("备份已导入")
         }
@@ -213,6 +257,7 @@ struct NativeLocalBackupsView: View {
         panel.allowedContentTypes = [.zip]; panel.nameFieldStringValue = backup.filename
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task {
+            errorMessage = "导出备份未收到成功结果。请检查目标文件后再试。"
             guard await operation.request(store, "native_export_local_backup", ["filename": .string(backup.filename), "destination": .string(url.path)], timeout: .seconds(350)) != nil else { return }
             operation.message = "备份已导出"
         }
@@ -226,7 +271,8 @@ struct NativeLocalBackupsView: View {
     private func reloadAfter(_ message: String) async {
         await load()
         if let error = operation.error {
-            operation.error = "\(message)；刷新列表失败：\(error)"
+            errorMessage = "\(message)，但列表刷新失败。请重试刷新。"
+            operation.error = error
         } else {
             operation.message = message
         }
@@ -238,10 +284,14 @@ struct NativeLocalBackupsView: View {
     }
 }
 
-private struct NativeWebdavConfig: Decodable {
+struct NativeWebdavConfig: Decodable {
     let url: String?
     let username: String?
     let passwordConfigured: Bool
+    var isConfigured: Bool {
+        !(url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !(username ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && passwordConfigured
+    }
 }
 
 struct NativeWebdavSettings: View {
@@ -255,6 +305,10 @@ struct NativeWebdavSettings: View {
     @State private var originalURL = ""
     @State private var originalUsername = ""
     @State private var confirmHTTP = false
+    @State private var confirmsReload = false
+    @State private var loaded = false
+    private var canRead: Bool { store.supports("native_get_webdav_config") }
+    private var dirty: Bool { loaded && (url != originalURL || username != originalUsername || !password.isEmpty) }
     private var requiresPassword: Bool { !hasPassword || url != originalURL || username != originalUsername }
     private var validURL: Bool {
         guard let value = URLComponents(string: url) else { return false }
@@ -265,8 +319,9 @@ struct NativeWebdavSettings: View {
             TezSettingsPage(title: "远程备份服务器", summary: "连接 WebDAV 服务器以存放远程备份。") {
                 TezSettingsSection(title: "服务器地址") {
                     TextField("服务器地址", text: $url).textFieldStyle(.roundedBorder).labelsHidden()
+                        .accessibilityIdentifier("webdav.url")
                     Text(verbatim: "完整地址，例如 https://example.com/dav/。推荐使用 HTTPS。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .font(TezType.metadata).foregroundStyle(.secondary)
                     if !url.isEmpty && !validURL {
                         TezStatusLabel(title: "请输入不含用户名或密码的 HTTP / HTTPS 地址", tone: .warning)
                     }
@@ -275,17 +330,28 @@ struct NativeWebdavSettings: View {
                     }
                 }
                 TezSettingsSection(title: "访问凭据") {
-                    TezSettingRow(title: "用户名") { TextField("用户名", text: $username).textFieldStyle(.roundedBorder).frame(width: 280) }
-                    TezSettingRow(title: "密码") { SecureField("密码", text: $password).textFieldStyle(.roundedBorder).frame(width: 280) }
+                    TezSettingRow(title: "用户名") {
+                        TextField("用户名", text: $username).textFieldStyle(.roundedBorder).frame(width: 280)
+                            .accessibilityIdentifier("webdav.username")
+                    }
+                    TezSettingRow(title: "密码") {
+                        SecureField("密码", text: $password).textFieldStyle(.roundedBorder).frame(width: 280)
+                            .accessibilityIdentifier("webdav.password")
+                    }
                     Text(requiresPassword ? "首次连接，或更改地址与用户名后，必须填写密码。" : "留空保留已保存的密码。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .font(TezType.metadata).foregroundStyle(.secondary)
                 }.privacySensitive()
             }
-            .disabled(operation.busy)
+            .disabled(operation.busy || !loaded)
             Divider()
             VStack(alignment: .leading, spacing: 10) {
-                NativeSettingsFeedback(operation: operation)
+                NativeSettingsFeedback(operation: operation, errorMessage: loaded
+                                       ? "未收到成功结果。当前输入仍保留，请重新读取确认。"
+                                       : "服务器设置读取失败。当前服务器未更改。")
                 HStack {
+                    TezToolButton(title: loaded ? "重新读取服务器设置" : "重试读取服务器设置", symbol: "arrow.clockwise", enabled: !operation.busy && canRead) {
+                        if dirty { confirmsReload = true } else { Task { await load() } }
+                    }.accessibilityIdentifier("webdav.reload")
                     if operation.busy { ProgressView().controlSize(.small) }
                     Spacer()
                     Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(operation.busy)
@@ -294,24 +360,34 @@ struct NativeWebdavSettings: View {
                         else { Task { await save() } }
                     }
                     .modifier(TezPrimaryActionStyle()).keyboardShortcut(.defaultAction)
-                    .disabled(operation.busy || !validURL || username.isEmpty || (requiresPassword && password.isEmpty) || !store.supports("native_save_webdav_config"))
+                    .disabled(operation.busy || !loaded || !validURL || username.isEmpty || (requiresPassword && password.isEmpty) || !store.supports("native_save_webdav_config"))
+                    .accessibilityIdentifier("webdav.save")
                 }
             }.padding(16)
         }.frame(width: 540, height: 470).interactiveDismissDisabled(operation.busy)
-        .task {
-            guard let value = await operation.request(store, "native_get_webdav_config") else { return }
-            do {
-                let config = try value.decoded(NativeWebdavConfig.self)
-                url = config.url ?? ""; username = config.username ?? ""; hasPassword = config.passwordConfigured
-                originalURL = url; originalUsername = username
-            } catch { operation.error = "无法读取 WebDAV 设置。" }
-        }
+        .task(id: canRead) { if canRead && !loaded { await load() } }
+        .alert("舍弃未保存的服务器设置？", isPresented: $confirmsReload) {
+            Button("保留改动", role: .cancel) {}
+            Button("重新读取", role: .destructive) { Task { await load() } }
+        } message: { Text("重新读取会替换当前填写的服务器地址与凭据。") }
         .alert("使用未加密连接？", isPresented: $confirmHTTP) {
             Button("取消", role: .cancel) {}
             Button("继续", role: .destructive) { Task { await save() } }
         } message: { Text("HTTP 会以明文传输用户名和密码。") }
     }
+    private func load() async {
+        guard canRead, !operation.busy,
+              let value = await operation.request(store, "native_get_webdav_config") else { return }
+        do {
+            let config = try value.decoded(NativeWebdavConfig.self)
+            url = config.url ?? ""; username = config.username ?? ""; hasPassword = config.passwordConfigured
+            originalURL = url; originalUsername = username
+            password = ""
+            loaded = true
+        } catch { operation.error = "无法读取 WebDAV 设置。" }
+    }
     private func save() async {
+        guard loaded else { return }
         let parameters: [String: BackendJSON] = ["url": .string(url), "username": .string(username), "password": password.isEmpty ? .null : .string(password)]
         if await operation.request(store, "native_save_webdav_config", parameters) != nil { dismiss() }
     }
@@ -361,6 +437,9 @@ struct NativeNetworkSettingsView: View {
     @State private var attemptedScope: NativePendingChange.Scope?
     @State private var previousSuccess: String?
     @State private var loaded = false
+    @State private var locatedField: String?
+    @State private var locationID = UUID()
+    @FocusState private var focusedField: String?
 
     private var changes: [String: BackendJSON] { values.filter { original[$0.key] != $0.value } }
     private var canRead: Bool { store.supports("native_get_settings") }
@@ -390,11 +469,14 @@ struct NativeNetworkSettingsView: View {
     }
 
     var body: some View {
+      ScrollViewReader { proxy in
         VStack(spacing: 0) {
             TezSettingsPage(title: "网络代理", summary: "代理设置与分流模式分别应用。修改可能中断当前连接。") {
                 TezSettingsSection(title: "流量接入") {
                     TezSettingToggle(title: "系统代理", detail: "让遵循 macOS 系统代理的应用使用 Tez。", isOn: boolean("enable_system_proxy"))
+                        .modifier(anchor("enable_system_proxy"))
                     TezSettingToggle(title: "虚拟网卡（TUN）", detail: "由虚拟网卡接收流量，接入范围取决于当前配置。", isOn: boolean("enable_tun_mode"))
+                        .modifier(anchor("enable_tun_mode"))
                     Button("TUN 与内核详细设置…", systemImage: "slider.horizontal.3") { showsTunSettings = true }
                         .disabled(!store.supports("native_get_proxy_config"))
                         .accessibilityIdentifier("proxy.settings.advanced")
@@ -402,72 +484,86 @@ struct NativeNetworkSettingsView: View {
                 TezSettingsSection(title: "分流模式") {
                     Picker("分流模式", selection: $mode) {
                         Text("规则").tag("rule"); Text("全局").tag("global"); Text("直连").tag("direct")
-                    }.pickerStyle(.segmented)
-                    Text(modeDescription).font(.system(size: 11)).foregroundStyle(.secondary)
-                    Text("上次确认：\(loaded ? modeTitle(originalMode) : "未读取")").font(.system(size: 11)).foregroundStyle(.secondary)
-                }
+                    }.pickerStyle(.segmented).focused($focusedField, equals: "mode")
+                    Text(modeDescription).font(TezType.metadata).foregroundStyle(.secondary)
+                    Text("上次确认：\(loaded ? modeTitle(originalMode) : "未读取")").font(TezType.metadata).foregroundStyle(.secondary)
+                }.modifier(anchor("mode"))
                 Divider()
                 TezSettingsDisclosure(title: "高级设置", summary: "代理端口 · 自动代理（PAC） · 绕过列表 · 测速与日志",
-                                      isExpanded: $advancedExpanded, motion: motion) {
+                                      isExpanded: $advancedExpanded, motion: TezMotion(reduced: motion.reduced || locatedField != nil)) {
                     TezSettingsSection(title: "代理端口") {
                         portField("混合代理端口", key: "verge_mixed_port", fallback: "7897", detail: "HTTP 与 SOCKS 共用；整数 1–65535。")
                         TezSettingToggle(title: "独立 HTTP 端口", detail: "为 HTTP 代理单独开放一个端口。", isOn: boolean("verge_http_enabled"))
+                            .modifier(anchor("verge_http_enabled"))
                         portField("HTTP 端口", key: "verge_port", fallback: "7899", detail: "整数 1–65535；独立 HTTP 端口开启后使用。")
                         TezSettingToggle(title: "独立 SOCKS 端口", detail: "为 SOCKS 代理单独开放一个端口。", isOn: boolean("verge_socks_enabled"))
+                            .modifier(anchor("verge_socks_enabled"))
                         portField("SOCKS 端口", key: "verge_socks_port", fallback: "7898", detail: "整数 1–65535；独立 SOCKS 端口开启后使用。")
                     }
                     TezSettingsSection(title: "系统代理行为") {
                         TezSettingRow(title: "代理主机", detail: "主机名或 IP 地址，例如 127.0.0.1。") {
                             TextField("代理主机", text: string("proxy_host", "127.0.0.1")).textFieldStyle(.roundedBorder).frame(width: 190)
-                        }
+                                .focused($focusedField, equals: "proxy_host")
+                        }.modifier(anchor("proxy_host"))
                         TezSettingToggle(title: "使用默认绕过列表", detail: "在自定义地址之外保留默认的绕过地址。", isOn: boolean("use_default_bypass"))
+                            .modifier(anchor("use_default_bypass"))
                         TezSettingRow(title: "检查绕过列表") {
                             Toggle("检查绕过列表", isOn: boolean("enable_bypass_check")).labelsHidden().toggleStyle(.switch)
-                        }
+                        }.modifier(anchor("enable_bypass_check"))
                         TezSettingToggle(title: "自动代理（PAC）", detail: "系统代理开启时，改用 PAC 脚本决定请求去向。", isOn: boolean("proxy_auto_config"))
+                            .modifier(anchor("proxy_auto_config"))
                         TezSettingToggle(title: "保持系统代理", detail: "系统代理开启时，定期恢复 Tez 的系统代理设置。", isOn: boolean("enable_proxy_guard"))
+                            .modifier(anchor("enable_proxy_guard"))
                         TezSettingRow(title: "代理保持间隔", detail: "秒（s）；范围 1–86400。") {
                             TextField("代理保持间隔（秒）", text: port("proxy_guard_duration", "30")).textFieldStyle(.roundedBorder).frame(width: 96)
-                        }
+                                .focused($focusedField, equals: "proxy_guard_duration")
+                        }.modifier(anchor("proxy_guard_duration"))
                         if !guardIntervalValid { TezStatusLabel(title: "代理保持间隔必须是 1–86400 的整数", tone: .warning) }
                         TezSettingRow(title: "切换模式或线路时关闭已有连接") {
                             Toggle("切换模式或线路时关闭已有连接", isOn: boolean("auto_close_connection")).labelsHidden().toggleStyle(.switch)
-                        }
-                        if values["proxy_auto_config"] == .bool(true) {
+                        }.modifier(anchor("auto_close_connection"))
+                        if values["proxy_auto_config"] == .bool(true) || changes["pac_file_content"] != nil {
                             VStack(alignment: .leading, spacing: 7) {
-                                Text("PAC 脚本").font(.system(size: 13))
+                                Text("PAC 脚本").font(TezType.body)
                                 TextEditor(text: string("pac_file_content", "function FindProxyForURL(url, host) { return \"PROXY %proxy_host%:%mixed-port%; SOCKS5 %proxy_host%:%mixed-port%; DIRECT;\"; }"))
-                                    .font(.system(size: 12, design: .monospaced)).padding(8).frame(height: 150)
+                                    .font(TezType.code).padding(8).frame(height: 150)
                                     .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)) }
                                     .accessibilityLabel("PAC 脚本")
-                                Text("JavaScript 格式；保留 FindProxyForURL 函数。").font(.system(size: 11)).foregroundStyle(.secondary)
-                            }
+                                    .focused($focusedField, equals: "pac_file_content")
+                                Text("JavaScript 格式；保留 FindProxyForURL 函数。").font(TezType.metadata).foregroundStyle(.secondary)
+                                if values["proxy_auto_config"] != .bool(true) {
+                                    Text("PAC 已关闭；此脚本暂不使用。").font(TezType.metadata).foregroundStyle(.secondary)
+                                }
+                            }.modifier(anchor("pac_file_content"))
                         }
                         VStack(alignment: .leading, spacing: 7) {
-                            Text("不经过系统代理的地址").font(.system(size: 13))
+                            Text("不经过系统代理的地址").font(TezType.body)
                             TextField("绕过地址", text: string("system_proxy_bypass", ""), axis: .vertical)
                                 .textFieldStyle(.roundedBorder).lineLimit(2...4).labelsHidden()
-                            Text("用英文逗号分隔，例如 localhost, 127.0.0.1。仅影响系统代理。").font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
+                                .focused($focusedField, equals: "system_proxy_bypass")
+                            Text("用英文逗号分隔，例如 localhost, 127.0.0.1。仅影响系统代理。").font(TezType.metadata).foregroundStyle(.secondary)
+                        }.modifier(anchor("system_proxy_bypass"))
                     }
                     TezSettingsSection(title: "测速与日志") {
                         VStack(alignment: .leading, spacing: 7) {
-                            Text("测速地址").font(.system(size: 13))
+                            Text("测速地址").font(TezType.body)
                             TextField("测速地址", text: string("default_latency_test", "https://www.gstatic.com/generate_204"))
                                 .textFieldStyle(.roundedBorder).labelsHidden()
-                            Text("完整的 HTTP 或 HTTPS 地址，用于线路延迟测试。").font(.system(size: 11)).foregroundStyle(.secondary)
+                                .focused($focusedField, equals: "default_latency_test")
+                            Text("完整的 HTTP 或 HTTPS 地址，用于线路延迟测试。").font(TezType.metadata).foregroundStyle(.secondary)
                             if !testURLValid { TezStatusLabel(title: "请输入不含用户名或密码的 HTTP / HTTPS 地址", tone: .warning) }
-                        }
+                        }.modifier(anchor("default_latency_test"))
                         TezSettingRow(title: "测速超时", detail: "毫秒（ms）；范围 100–30000。") {
                             TextField("测速超时（毫秒）", text: port("default_latency_timeout", "5000"))
                                 .textFieldStyle(.roundedBorder).frame(width: 96)
-                        }
+                                .focused($focusedField, equals: "default_latency_timeout")
+                        }.modifier(anchor("default_latency_timeout"))
                         if !timeoutValid { TezStatusLabel(title: "测速超时必须是 100–30000 的整数", tone: .warning) }
                         TezSettingRow(title: "应用日志级别", detail: "调试与跟踪会记录更多诊断信息。") {
                             Picker("应用日志级别", selection: string("app_log_level", "info")) {
                                 ForEach(["silent", "error", "warn", "info", "debug", "trace"], id: \.self) { Text(logTitle($0)).tag($0) }
-                            }.labelsHidden().frame(width: 160)
-                        }
+                            }.labelsHidden().frame(width: 160).focused($focusedField, equals: "app_log_level")
+                        }.modifier(anchor("app_log_level"))
                     }
                 }
             }.disabled(operation.busy || !canRead || !loaded)
@@ -480,7 +576,7 @@ struct NativeNetworkSettingsView: View {
                             withAnimation(motion.layout) { pendingExpanded.toggle() }
                         } label: {
                             Label("\(pendingChanges.count) 项待应用", systemImage: pendingExpanded ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(TezType.body.weight(.medium))
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("\(pendingExpanded ? "收起" : "展开") \(pendingChanges.count) 项待应用更改")
@@ -500,14 +596,18 @@ struct NativeNetworkSettingsView: View {
                     if showsCloseButton { Button("完成") { close() }.disabled(operation.busy) }
                 }
                 if pendingExpanded && dirty {
-                    NativePendingChangesList(changes: pendingChanges)
+                    NativePendingChangesList(changes: pendingChanges) { key in
+                        if !["mode", "enable_system_proxy", "enable_tun_mode"].contains(key) { advancedExpanded = true }
+                        locatedField = key
+                        locationID = UUID()
+                    }
                 }
                 if pendingChanges.contains(where: \.affectsTraffic) {
                     TezStatusLabel(title: "流量相关更改可能中断当前连接", tone: .warning, motion: motion)
                 }
                 HStack(spacing: 10) {
                     Text("代理设置 \(changes.count) 项 · 分流模式 \(mode == originalMode ? 0 : 1) 项")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .font(TezType.metadata).foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                     Button("应用分流模式", systemImage: "checkmark") { confirmsMode = true }
                         .disabled(operation.busy || !loaded || mode == originalMode || !store.supports("native_set_mode"))
@@ -518,10 +618,20 @@ struct NativeNetworkSettingsView: View {
                         .accessibilityIdentifier("network.apply.proxy")
                 }
                 if !portsValid || !timeoutValid || !guardIntervalValid || !testURLValid {
-                    Text("高级设置中有无效输入，请展开后修改。").font(.system(size: 11)).foregroundStyle(TezStyle.warning)
+                    Text("高级设置中有无效输入，请展开后修改。").font(TezType.metadata).foregroundStyle(TezStyle.warning)
                 }
             }.padding(16)
         }
+        .task(id: locationID) {
+            guard let key = locatedField else { return }
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            withAnimation(motion.layout) { proxy.scrollTo(key, anchor: .center) }
+            focusedField = key
+            try? await Task.sleep(for: .seconds(2))
+            if !Task.isCancelled { locatedField = nil }
+        }
+      }
         .task(id: canRead) { if canRead && !loaded { await load() } }
         .interactiveDismissDisabled(showsCloseButton && (dirty || operation.busy))
         .onExitCommand { if showsCloseButton && !operation.busy { close() } }
@@ -555,15 +665,20 @@ struct NativeNetworkSettingsView: View {
         if dirty { confirmsClose = true } else { dismiss() }
     }
 
+    private func anchor(_ key: String) -> TezFieldAnchor {
+        TezFieldAnchor(key: key, highlighted: locatedField == key, motion: motion)
+    }
+
     private func portField(_ title: String, key: String, fallback: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             TezSettingRow(title: title, detail: detail) {
                 TextField(title, text: port(key, fallback)).textFieldStyle(.roundedBorder).frame(width: 96)
+                    .focused($focusedField, equals: key)
             }
             if Int(text(key, fallback)).map({ (1...65535).contains($0) }) != true {
                 TezStatusLabel(title: "\(title)必须是 1–65535 的整数", tone: .warning)
             }
-        }
+        }.modifier(anchor(key))
     }
 
     private func modeTitle(_ value: String) -> String {
@@ -662,7 +777,7 @@ struct NativeDNSSettingsView: View {
             TezSettingsPage(title: "DNS 覆写", summary: "保存草稿不会改变正在运行的 DNS。应用会重新载入配置，可能中断连接。") {
                 TezSettingsSection(title: "目标配置") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(profileName).font(.system(size: 13, weight: .medium)).textSelection(.enabled)
+                        Text(profileName).font(TezType.body.weight(.medium)).textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                         TezStatusLabel(title: !canRead ? "后台未连接，配置状态未确认" : !loaded ? "正在读取配置"
                                        : originalEnabled ? "此配置正在使用 DNS 覆写" : "此配置使用原有 DNS", symbol: "server.rack", motion: motion)
@@ -672,8 +787,8 @@ struct NativeDNSSettingsView: View {
                 }
                 TezSettingsSection(title: "DNS 草稿") {
                     Text("YAML 映射格式；保存后再应用到上方的目标配置。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                    TextEditor(text: $content).font(.system(size: 12, design: .monospaced))
+                        .font(TezType.metadata).foregroundStyle(.secondary)
+                    TextEditor(text: $content).font(TezType.code)
                         .padding(8).frame(height: 200)
                         .background(Color(nsColor: .textBackgroundColor))
                         .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)) }
@@ -687,7 +802,7 @@ struct NativeDNSSettingsView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         TezStatusLabel(title: !canRead ? "后台未连接，设置不可用" : !loaded ? "草稿尚未读取" : content != original ? "草稿未保存，请先保存" : "草稿已保存",
                                        tone: content != original ? .warning : .neutral, motion: motion)
-                        Text("目标：\(profileName)").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text("目标：\(profileName)").font(TezType.metadata).foregroundStyle(.secondary)
                             .lineLimit(1).truncationMode(.middle).help(profileName)
                     }
                     Spacer(minLength: 0)
@@ -697,7 +812,7 @@ struct NativeDNSSettingsView: View {
                     }
                     Button("保存草稿", systemImage: "square.and.arrow.down") { Task { await save() } }
                         .disabled(operation.busy || content == original || !store.supports("native_save_dns"))
-                    Button("应用到此配置", systemImage: "checkmark") { Task { await apply(confirmation: nil) } }
+                    Button(enabled ? "应用 DNS 覆写" : "使用原有 DNS", systemImage: "checkmark") { Task { await apply(confirmation: nil) } }
                         .modifier(TezPrimaryActionStyle())
                         .disabled(operation.busy || uid == nil || content != original || !store.supports("native_set_dns_override"))
                 }
@@ -734,14 +849,16 @@ struct NativeDNSSettingsView: View {
            let source = fields["source"], case .string(let token) = source {
             self.confirmation = token; showConfirmation = true
         } else {
-            await load(); operation.message = "DNS 覆写设置已应用"
+            await load()
+            guard operation.error == nil else { return }
+            operation.message = originalEnabled ? "此配置已应用 DNS 覆写" : "此配置使用原有 DNS，草稿未应用"
         }
     }
 }
 
 struct NativeActivityWorkspace: View {
     let store: NativeBackendStore
-    @State private var session = NativeActivitySession()
+    @Bindable var session: NativeActivitySession
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -781,6 +898,7 @@ struct NativeLogsView: View {
     @State private var isVisible = false
     @State private var exports = false
     @State private var exportDocument = NativeLogDocument(content: "")
+    @State private var viewportSize = CGSize.zero
     private var pollKey: String { "\(store.state)-\(session.paused)" }
     private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
     private var lines: [String] { session.lines }
@@ -821,7 +939,7 @@ struct NativeLogsView: View {
                     Text("关键词关联：\(target) · 非连接追踪").lineLimit(2).textSelection(.enabled)
                     Spacer(minLength: 0)
                     TezToolButton(title: "关闭关联说明", symbol: "xmark") { session.relatedTarget = nil }
-                }.font(.caption).foregroundStyle(.secondary)
+                }.font(TezType.metadata).foregroundStyle(.secondary)
                     .padding(.horizontal, TezStyle.pageInset).padding(.vertical, 6)
                     .accessibilityIdentifier("live.logs.related")
                 Divider()
@@ -840,10 +958,19 @@ struct NativeLogsView: View {
                             }
                         }
                         Color.clear.frame(height: 1).id("log-tail")
-                    }.font(.system(size: 12, design: .monospaced))
+                    }.font(TezType.code)
                         .padding(.horizontal, TezStyle.pageInset).padding(.vertical, 14)
                 }
                 .onChange(of: lines) { _, _ in if session.followsTail { proxy.scrollTo("log-tail", anchor: .bottom) } }
+                .onChange(of: session.followsTail) { _, follows in
+                    if follows { proxy.scrollTo("log-tail", anchor: .bottom) }
+                }
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { viewportSize = $0 }
+                .task(id: viewportSize) {
+                    await Task.yield()
+                    guard !Task.isCancelled, session.followsTail else { return }
+                    proxy.scrollTo("log-tail", anchor: .bottom)
+                }
                 .overlay {
                     if lines.isEmpty {
                         TezEmptyState(title: !store.supports("native_get_logs") ? "日志读取不可用" : session.query.isEmpty && session.level == "all" ? "暂无日志" : "缓存内没有匹配的日志", symbol: "text.alignleft")
@@ -853,7 +980,7 @@ struct NativeLogsView: View {
             Divider()
             HStack(spacing: 12) {
                 Text("匹配 \(lines.count) / 缓存 \(windowCount) 行 · 上限 \(NativeLogSession.limit)")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(TezType.metadata).foregroundStyle(.secondary)
                     .help(session.paused ? "仅筛选最近读取的冻结窗口；暂停期间不读取新日志" : "筛选最近读取的最多 1000 行日志")
                 Spacer(minLength: 0)
                 if logGap || logTruncated {

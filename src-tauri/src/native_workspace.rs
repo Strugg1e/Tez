@@ -307,6 +307,34 @@ fn encode(value: impl serde::Serialize) -> CmdResult<Value> {
     serde_json::to_value(value).map_err(|error| CommandFailure::coded("NATIVE_ENCODING_FAILED", error))
 }
 
+fn subscription_details(uid: &str, item: crate::config::PrfItem, next_update: Option<i64>) -> Value {
+    let option = item.option.unwrap_or_default();
+    let auto_update = option.auto_update_interval().is_some();
+    let with_proxy = !matches!(option.download_proxy_type(), crate::utils::network::ProxyType::None);
+    json!({"uid": uid, "name": item.name, "url": item.url,
+        "interval": option.update_interval.filter(|interval| *interval > 0).unwrap_or(1440),
+        "autoUpdate": auto_update, "withProxy": with_proxy,
+        "usage": item.extra, "nextUpdate": next_update.filter(|_| auto_update)})
+}
+
+fn subscription_options(
+    mut option: crate::config::PrfOption,
+    interval: u64,
+    auto_update: bool,
+    with_proxy: bool,
+) -> crate::config::PrfOption {
+    if auto_update {
+        option.update_interval = Some(interval);
+    }
+    option.allow_auto_update = Some(auto_update);
+    let uses_core = matches!(option.download_proxy_type(), crate::utils::network::ProxyType::Localhost);
+    option.with_proxy = Some(with_proxy && !uses_core);
+    if !with_proxy {
+        option.self_proxy = Some(false);
+    }
+    option
+}
+
 pub async fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
     let request = parse(command, params)?;
     match request {
@@ -407,12 +435,8 @@ pub async fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
         }
         Request::SubscriptionDetails { uid } => {
             let item = profile(&uid).await?;
-            let option = item.option.unwrap_or_default();
-            Ok(
-                json!({"uid": uid, "name": item.name, "url": item.url, "interval": option.update_interval.unwrap_or(1440),
-                "autoUpdate": option.allow_auto_update.unwrap_or(true), "withProxy": option.with_proxy.unwrap_or(false),
-                "usage": item.extra, "nextUpdate": cmd::get_next_update_time(uid).await?}),
-            )
+            let next_update = cmd::get_next_update_time(uid.clone()).await?;
+            Ok(subscription_details(&uid, item, next_update))
         }
         Request::PatchSubscription {
             uid,
@@ -437,10 +461,7 @@ pub async fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
                 .await?;
                 return Ok(json!({"saved": true}));
             }
-            let mut option = item.option.unwrap_or_default();
-            option.update_interval = Some(interval);
-            option.allow_auto_update = Some(auto_update);
-            option.with_proxy = Some(with_proxy);
+            let option = subscription_options(item.option.unwrap_or_default(), interval, auto_update, with_proxy);
             cmd::patch_profile(
                 uid,
                 cmd::ProfilePatch {
@@ -865,6 +886,59 @@ mod tests {
             ["time=now level=warning msg=slow"]
         );
     }
+    #[test]
+    fn native_subscription_policy_reports_the_actual_download_transport() {
+        use crate::config::{PrfItem, PrfOption};
+        for (core, system, expected) in [(false, false, false), (false, true, true), (true, false, true), (true, true, true)] {
+            let item = PrfItem { option: Some(PrfOption { self_proxy: Some(core), with_proxy: Some(system), ..Default::default() }), ..Default::default() };
+            assert_eq!(subscription_details("fixture", item, None)["withProxy"], expected);
+        }
+    }
+
+    #[test]
+    fn native_subscription_policy_can_disable_a_migrated_core_proxy() {
+        use crate::{config::PrfOption, utils::network::ProxyType};
+        for system in [false, true] {
+            let migrated = PrfOption { self_proxy: Some(true), with_proxy: Some(system), ..Default::default() };
+            let unchanged = subscription_options(migrated.clone(), 1440, false, true);
+            assert!(matches!(unchanged.download_proxy_type(), ProxyType::Localhost));
+            let disabled = subscription_options(migrated, 1440, false, false);
+            assert_eq!(disabled.self_proxy, Some(false));
+            assert_eq!(disabled.with_proxy, Some(false));
+            assert!(matches!(disabled.download_proxy_type(), ProxyType::None));
+            let enabled = subscription_options(disabled, 1440, false, true);
+            assert!(matches!(enabled.download_proxy_type(), ProxyType::System));
+        }
+    }
+
+    #[test]
+    fn native_subscription_policy_matches_scheduler_eligibility() {
+        use crate::config::{PrfItem, PrfOption};
+        for (interval, allow, enabled) in [(None, None, false), (None, Some(true), false), (Some(0), Some(true), false), (Some(2880), Some(false), false), (Some(2880), None, true), (Some(2880), Some(true), true)] {
+            let option = PrfOption { update_interval: interval, allow_auto_update: allow, ..Default::default() };
+            let expected_interval = interval.filter(|value| *value > 0).unwrap_or(1440);
+            assert_eq!(option.auto_update_interval().is_some(), enabled);
+            let item = PrfItem { option: Some(option), ..Default::default() };
+            let details = subscription_details("fixture", item, Some(12345));
+            assert_eq!(details["autoUpdate"], enabled);
+            assert_eq!(details["interval"], expected_interval);
+            assert_eq!(details["nextUpdate"], if enabled { json!(12345) } else { Value::Null });
+        }
+    }
+
+    #[test]
+    fn native_subscription_policy_keeps_absent_intervals_disabled_until_saved_on() {
+        use crate::config::PrfOption;
+        for interval in [None, Some(0), Some(2880)] {
+            let original = PrfOption { update_interval: interval, allow_auto_update: Some(true), ..Default::default() };
+            let off = subscription_options(original, 1440, false, false);
+            assert_eq!(off.update_interval, interval);
+            assert_eq!(off.auto_update_interval(), None);
+            let on = subscription_options(off, 1440, true, false);
+            assert_eq!(on.auto_update_interval(), Some(1440));
+        }
+    }
+
     #[test]
     fn workspace_subscription_options_and_serialized_log_budget_are_bounded() {
         let params = json!({"url":"https://example.test/sub", "name":"Test", "interval":1440, "auto_update":false, "with_proxy":true});

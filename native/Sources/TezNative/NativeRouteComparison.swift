@@ -2,6 +2,8 @@ import Foundation
 
 struct NativeRouteMeasurement: Equatable {
     enum Origin: Equatable { case session, snapshot, none }
+    private static let fractionalTime = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    private static let wholeTime = Date.ISO8601FormatStyle()
 
     let origin: Origin
     let date: Date?
@@ -14,9 +16,7 @@ struct NativeRouteMeasurement: Equatable {
             rawTime = nil
         } else if let snapshotTime {
             origin = .snapshot
-            let parser = ISO8601DateFormatter()
-            parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            date = parser.date(from: snapshotTime) ?? ISO8601DateFormatter().date(from: snapshotTime)
+            date = (try? Self.fractionalTime.parse(snapshotTime)) ?? (try? Self.wholeTime.parse(snapshotTime))
             rawTime = snapshotTime
         } else {
             origin = .none

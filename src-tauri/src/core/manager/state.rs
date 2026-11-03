@@ -232,7 +232,7 @@ impl CoreManager {
         let previous_mask = unsafe { tauri_plugin_clash_verge_sysinfo::libc::umask(0o077) };
         let command = app_handle
             .shell()
-            .sidecar(clash_core.as_str())
+            .sidecar(service::core_sidecar_argument(clash_core.as_str())?)
             .map_err(|error| anyhow::anyhow!("failed to build sidecar command for core {clash_core:?}: {error:#}"))?;
         let command = command.args([
             "-d",

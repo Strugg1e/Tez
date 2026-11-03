@@ -43,6 +43,32 @@ struct ActivityCheck {
         precondition(projected.connections.items[0].matches("BROWSER"))
         precondition(projected.connections.items[0].matches("192.0.2"))
         precondition(!projected.connections.items[0].matches("missing"))
+        precondition(projected.connections.items[0].outboundLabel == "直连")
+        precondition(projected.connections.items[0].rulePayloadLabel == "无附加匹配条件")
+        let attributed = NativeActivityConnection(id: "attributed", host: "example.test", destination: nil,
+            network: "tcp", type: "HTTPS", process: "Browser Helper", rule: "DomainSuffix",
+            chains: ["Tokyo 01", "Auto", "Proxy"], upload: 0, download: 0, start: nil,
+            application: "Browser", rulePayload: "example.test", outbound: "Tokyo 01", chainOrder: "exit-first")
+        precondition(attributed.applicationLabel == "Browser" && attributed.actualOutbound == "Tokyo 01")
+        precondition(attributed.orderedChain == ["Proxy", "Auto", "Tokyo 01"])
+        precondition(attributed.ruleQuery == "example.test" && attributed.ruleLabel == "域名后缀")
+        precondition(attributed.matches("Tokyo") && attributed.matches("Browser"))
+        var unavailable = attributed
+        unavailable.outbound = nil; unavailable.chainOrder = nil
+        precondition(unavailable.actualOutbound == nil && unavailable.orderedChain == nil,
+                     "Legacy unordered chains must not claim an actual exit")
+        unavailable.rulePayload = "[hidden]"
+        precondition(unavailable.ruleQuery == "DomainSuffix" && unavailable.rulePayloadLabel == "路径内容已隐藏")
+        var longRule = attributed
+        for payload in [String(repeating: "a", count: 256), String(repeating: "中", count: 85), String(repeating: "中", count: 86)] {
+            longRule.rulePayload = payload
+            let session = NativeActivitySession()
+            session.showRules(for: longRule)
+            let query = session.context.request(for: .rules)
+            precondition(query.isValid, "Related-rule navigation must generate a valid search")
+            precondition(query.query == (payload.utf8.count <= 256 ? payload : "DomainSuffix"))
+        }
+        precondition(NativeActivityQuery(section: "connections", query: "直连", limit: 128).params["query"] == .string("DIRECT"))
         var rates = NativeActivityRates()
         rates.sample(projected.connections, at: 10)
         precondition(rates.connections["a"]?.upload == nil)
@@ -65,6 +91,7 @@ struct ActivityCheck {
         let portOnly = NativeActivityConnection(id: "port", host: nil, destination: ":443", network: "tcp",
             type: nil, process: nil, rule: nil, chains: [], upload: 0, download: 0, start: nil)
         precondition(portOnly.title == "未知目标" && portOnly.destinationLabel == "端口 443")
+        precondition(portOnly.rulePayloadLabel == "匹配内容未提供")
         precondition(projected.rules.items[0].matches("direct"))
         precondition(NativeActivityFormat.bytes(nil) == "—")
         precondition(!NativeActivityFormat.bytes(UInt64.max).isEmpty)

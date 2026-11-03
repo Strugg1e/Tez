@@ -105,13 +105,18 @@ final class NativeBackendStore {
     @ObservationIgnored private var observerSession = false
     @ObservationIgnored private var automaticRecoveryTask: Task<Void, Never>?
     @ObservationIgnored private var automaticRecoveryAttempts = 0
+    @ObservationIgnored private var authorizationResultUnconfirmed = false
     private(set) var serviceSetupInProgress = false
+    private(set) var coreUpgradeInProgress = false
+
+    private var authorizationInProgress: Bool { serviceSetupInProgress || coreUpgradeInProgress }
+    private var authorizationLabel: String { coreUpgradeInProgress ? "内核升级" : "后台服务更新" }
 
     var requiresManagedShutdown: Bool {
         let managed = mode == .managed || (mode == .automatic && !observerSession)
         return managed && (child != nil || state == .shutdownFailed)
     }
-    var blocksTermination: Bool { serviceSetupInProgress || requiresManagedShutdown }
+    var blocksTermination: Bool { authorizationInProgress || requiresManagedShutdown }
     var isReadOnlyConnection: Bool {
         mode == .attach || (mode == .automatic && observerSession)
     }
@@ -137,6 +142,17 @@ final class NativeBackendStore {
     }
 
     func connect() {
+        if authorizationInProgress {
+            guard authorizationResultUnconfirmed, let transport = child, transport.started, !transport.process.isRunning else {
+                errorMessage = "\(authorizationLabel)尚未结束，保留当前后台，不重复提交请求。"
+                return
+            }
+            transport.process.terminationHandler = nil
+            transport.recovery?.removeAfterConfirmedExit()
+            child = nil
+            releaseAuthorization()
+            workspaceBusy = false
+        }
         automaticRecoveryTask?.cancel()
         automaticRecoveryTask = nil
         automaticRecoveryAttempts = 0
@@ -196,8 +212,8 @@ final class NativeBackendStore {
     }
 
     func disconnect() {
-        guard !serviceSetupInProgress else {
-            errorMessage = "后台服务更新正在进行，请等待系统授权结果。"
+        guard !authorizationInProgress else {
+            errorMessage = "\(authorizationLabel)正在进行或结果未确认，保留当前后台。"
             return
         }
         automaticRecoveryTask?.cancel()
@@ -230,17 +246,22 @@ final class NativeBackendStore {
     }
 
     func installService(params: [String: BackendJSON]) async throws -> BackendJSON {
-        guard mode != .attach, state == .connected, supports("native_install_service"), !serviceSetupInProgress else {
+        guard mode != .attach, state == .connected, supports("native_install_service"), !authorizationInProgress else {
             throw NativeBackendError.unavailable("当前连接未开放后台服务更新")
         }
-        serviceSetupInProgress = true
-        defer { serviceSetupInProgress = false }
         return try await request("native_install_service", params: params, serialWorkspace: true)
     }
 
+    func upgradeCore(params: [String: BackendJSON]) async throws -> BackendJSON {
+        guard mode != .attach, state == .connected, supports("native_upgrade_core"), !authorizationInProgress else {
+            throw NativeBackendError.unavailable("当前连接未开放内核升级")
+        }
+        return try await request("native_upgrade_core", params: params, serialWorkspace: true)
+    }
+
     func shutdownForTermination() async -> Bool {
-        guard !serviceSetupInProgress else {
-            errorMessage = "后台服务更新正在进行，等待授权结果后才能退出。"
+        guard !authorizationInProgress else {
+            errorMessage = "\(authorizationLabel)正在进行或结果未确认，暂不退出后台。"
             return false
         }
         guard requiresManagedShutdown else { disconnect(); return true }
@@ -303,6 +324,10 @@ final class NativeBackendStore {
     }
 
     private func beginManagedShutdown(failure: String? = nil) -> Task<Bool, Never> {
+        guard !authorizationInProgress else {
+            errorMessage = "\(authorizationLabel)尚未确认，不追加停止内核请求。"
+            return Task { false }
+        }
         if let shutdownTask { return shutdownTask }
         guard let transport = child else { return Task { state != .shutdownFailed } }
         managedShutdownRequested = true
@@ -450,14 +475,41 @@ final class NativeBackendStore {
             throw NativeBackendError.unavailable("后台正在退出，只允许重试恢复")
         }
         guard !workspaceBusy else { throw NativeBackendError.unavailable("后台正在执行请求，请等待完成") }
-        if serialWorkspace { workspaceBusy = true }
+        let humanPaced = command == "native_install_service" || command == "native_upgrade_core"
+        if humanPaced {
+            guard mode != .attach, state == .connected, capabilities.contains(command), !authorizationInProgress else {
+                throw NativeBackendError.unavailable("当前连接未开放此授权操作")
+            }
+            serviceSetupInProgress = command == "native_install_service"
+            coreUpgradeInProgress = command == "native_upgrade_core"
+            authorizationResultUnconfirmed = false
+        }
+        let serialized = serialWorkspace || humanPaced
+        if serialized { workspaceBusy = true }
         defer {
-            if serialWorkspace {
+            if humanPaced && !authorizationResultUnconfirmed { releaseAuthorization() }
+            if serialized && !(humanPaced && authorizationResultUnconfirmed) {
                 workspaceBusy = false
                 if refreshAgain { refreshAgain = false; refresh() }
             }
         }
-        return try await sendRequest(command, params: params, timeout: requestTimeout)
+        do {
+            let result = try await sendRequest(command, params: params, timeout: requestTimeout)
+            if command == "native_upgrade_core" {
+                guard case .object(let fields) = result, case .string(let outcome) = fields["outcome"],
+                      ["upgraded", "rolled_back"].contains(outcome) else {
+                    errorMessage = "后台未返回可确认的升级结果，请重新检查当前内核。"
+                    throw NativeBackendError.unavailable("内核升级结果未确认")
+                }
+                authorizationResultUnconfirmed = false
+            }
+            return result
+        } catch NativeBackendError.remote(let remote) {
+            if command == "native_upgrade_core" && remote.code == .string("CORE_UPGRADE_UNRESOLVED") {
+                errorMessage = "升级或回退结果未确认，请重新检查当前内核；不会自动重试升级。"
+            }
+            throw NativeBackendError.remote(remote)
+        }
     }
 
     private func sendRequest(_ command: String, params: [String: BackendJSON] = [:], timeout requestTimeout: Duration? = nil) async throws -> BackendJSON {
@@ -471,7 +523,7 @@ final class NativeBackendStore {
             pending[id] = continuation
             requestCount += 1
             // Administrator authorization is human-paced; a request timeout must not detach its installer.
-            if command != "native_install_service" {
+            if command != "native_install_service" && command != "native_upgrade_core" {
                 timers[id] = Task { [weak self, timeout = requestTimeout ?? timeout] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled, let self, token == generation else { return }
@@ -565,9 +617,27 @@ final class NativeBackendStore {
         for continuation in continuations { continuation.resume(throwing: NativeBackendError.unavailable(message)) }
     }
 
+    private func releaseAuthorization() {
+        serviceSetupInProgress = false
+        coreUpgradeInProgress = false
+        authorizationResultUnconfirmed = false
+    }
+
+    private func markAuthorizationUnconfirmed(_ message: String) {
+        authorizationResultUnconfirmed = true
+        state = .failed
+        statusText = "\(authorizationLabel)结果未确认"
+        errorMessage = "\(message)。保留当前后台，不重复升级或请求停止内核。后台退出后可重新连接。"
+    }
+
     private func fail(_ message: String, generation token: UUID, channelBroken: Bool = false) {
         guard generation == token else { return }
         if mode != .attach && channelBroken { managedMainChannelBroken = true }
+        if authorizationInProgress {
+            markAuthorizationUnconfirmed(message)
+            finishPending("授权操作结果未确认，保留当前后台")
+            return
+        }
         if mode != .attach && managedShutdownRequested {
             finishPending("后台控制通道异常，请求结果未确认")
             return

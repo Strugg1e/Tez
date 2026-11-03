@@ -55,7 +55,7 @@ struct NativeCoreUpgradeView: View {
             .formStyle(.grouped)
             .scrollDisabled(true)
             if let feedback {
-                Text(feedback).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(feedback).font(TezType.body).fixedSize(horizontal: false, vertical: true)
             }
             if let details {
                 DisclosureGroup("详情") {
@@ -119,8 +119,8 @@ struct NativeCoreUpgradeView: View {
         Task { @MainActor in
             defer { busy = false; store.refresh() }
             do {
-                let result = try await store.request("native_upgrade_core", params: ["confirmed": .bool(true), "expected": identity.params,
-                    "approvedCorePath": .string(prepared.path), "sha256": .string(prepared.sha256), "version": .string(prepared.version)], timeout: .seconds(180), serialWorkspace: true)
+                let result = try await store.upgradeCore(params: ["confirmed": .bool(true), "expected": identity.params,
+                    "approvedCorePath": .string(prepared.path), "sha256": .string(prepared.sha256), "version": .string(prepared.version)])
                 guard case .object(let fields) = result, case .string(let outcome) = fields["outcome"],
                       ["upgraded", "rolled_back"].contains(outcome) else { throw NativeBackendError.unavailable("后台未返回可确认的升级状态") }
                 feedback = outcome == "upgraded" ? "新版本内核运行中。" : "新版本启动失败，上一版本内核运行中。"
@@ -130,7 +130,13 @@ struct NativeCoreUpgradeView: View {
                 await loadIdentity()
             } catch {
                 self.prepared = nil; self.identity = nil
-                feedback = "升级或回退结果未确认。请关闭此窗口后重新检查内核状态。"
+                if store.coreUpgradeInProgress {
+                    feedback = "升级结果未确认，当前后台仍受保护。后台退出后可重新连接；不要重复升级。"
+                } else if case NativeBackendError.remote(let remote) = error, remote.code == .string("CORE_APPROVAL_FAILED") {
+                    feedback = "管理员授权未完成，未请求内核升级。"
+                } else {
+                    feedback = "升级或回退结果未确认。请关闭此窗口后重新检查内核状态。"
+                }
                 details = NativeFeatureError.message(error)
             }
         }

@@ -127,6 +127,21 @@ pub struct PrfOption {
 }
 
 impl PrfOption {
+    pub(crate) fn auto_update_interval(&self) -> Option<u64> {
+        self.update_interval
+            .filter(|interval| *interval > 0 && self.allow_auto_update.unwrap_or(true))
+    }
+
+    pub(crate) fn download_proxy_type(&self) -> ProxyType {
+        if self.self_proxy.unwrap_or(false) {
+            ProxyType::Localhost
+        } else if self.with_proxy.unwrap_or(false) {
+            ProxyType::System
+        } else {
+            ProxyType::None
+        }
+    }
+
     pub(crate) fn merge(one: Option<&Self>, other: Option<&Self>) -> Option<Self> {
         match (one, other) {
             (Some(a_ref), Some(b_ref)) => {
@@ -252,8 +267,6 @@ impl PrfItem {
         desc: Option<&String>,
         option: Option<&PrfOption>,
     ) -> Result<Self> {
-        let with_proxy = option.is_some_and(|o| o.with_proxy.unwrap_or(false));
-        let self_proxy = option.is_some_and(|o| o.self_proxy.unwrap_or(false));
         let accept_invalid_certs = option.is_some_and(|o| o.danger_accept_invalid_certs.unwrap_or(false));
         let allow_auto_update = Some(allow_auto_update_enabled(option));
         let user_agent = option.and_then(|o| o.user_agent.clone());
@@ -265,13 +278,7 @@ impl PrfItem {
         let mut proxies = option.and_then(|o| o.proxies.clone());
         let mut groups = option.and_then(|o| o.groups.clone());
 
-        let proxy_type = if self_proxy {
-            ProxyType::Localhost
-        } else if with_proxy {
-            ProxyType::System
-        } else {
-            ProxyType::None
-        };
+        let proxy_type = option.map(PrfOption::download_proxy_type).unwrap_or(ProxyType::None);
 
         let url = fix_dirty_url(url)?;
 

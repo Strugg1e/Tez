@@ -57,11 +57,11 @@ const server = http.createServer((request, response) => {
             id: 'connection-1',
             metadata: {
               host: 'example.test', destinationIP: '127.0.0.1', destinationPort: '443',
-              process: '/private/application/Test.app', processPath: '/private/application/secret',
+              process: '/private/application/Test.app', processPath: '/private/application/Test.app/Contents/MacOS/Test',
               sourceIP: 'private-source', inboundUser: 'private-user',
             },
-            upload: 10, download: 20, chains: ['Daily', chosen], rule: 'Domain',
-            rulePayload: 'private-rule-payload',
+            upload: 10, download: 20, chains: [chosen, 'Daily'], rule: 'Domain',
+            rulePayload: 'example.test',
           }],
         }
       : request.url === '/rules'
@@ -180,6 +180,10 @@ try {
   assert.equal(activity.connections.total, 1)
   assert.equal(activity.connections.uploadTotal, 100)
   assert.equal(activity.connections.items[0].process, 'Test.app')
+  assert.equal(activity.connections.items[0].application, 'Test')
+  assert.equal(activity.connections.items[0].rulePayload, 'example.test')
+  assert.equal(activity.connections.items[0].outbound, chosen)
+  assert.equal(activity.connections.items[0].chainOrder, 'exit-first')
   assert.equal(activity.connections.items[0].destination, '127.0.0.1:443')
   assert.equal(activity.rules.items[0].payload, '[hidden]')
   assert.equal(activity.rules.total, 311)
@@ -188,6 +192,14 @@ try {
   assert.equal(activity.rules.nextOffset, 256)
   assert.equal(activity.providers.items[0].ruleCount, 42)
   assert.ok(!JSON.stringify(activity).includes('private'))
+  const applicationSearch = (await request('activity-app-search', 'native_get_activity', {
+    section: 'connections', query: 'TEST',
+  })).result.connections
+  assert.equal(applicationSearch.matched, 1)
+  const exitSearch = (await request('activity-exit-search', 'native_get_activity', {
+    section: 'connections', query: chosen,
+  })).result.connections
+  assert.equal(exitSearch.matched, 1)
   const nextPage = (await request('activity-rules-next', 'native_get_activity', {
     section: 'rules', offset: 256, limit: 55,
   })).result.rules

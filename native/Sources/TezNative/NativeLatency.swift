@@ -6,6 +6,11 @@ struct NativeLatencyPayload: Decodable {
     var results: [Result]
 }
 
+struct NativeLatencySample: Equatable {
+    let date: Date?
+    let delay: UInt64?
+}
+
 @Observable @MainActor
 final class NativeLatencyModel {
     typealias Request = @MainActor (String, [String: BackendJSON]) async throws -> BackendJSON
@@ -18,6 +23,7 @@ final class NativeLatencyModel {
     private(set) var stopped = false
     private var stopRequested = false
     private(set) var measuredAt: [String: Date] = [:]
+    private(set) var samples: [String: [NativeLatencySample]] = [:]
 
     func stopAfterCurrentBatch() { stopRequested = true }
 
@@ -40,7 +46,14 @@ final class NativeLatencyModel {
                 guard payload.results.count == batch.count, Set(payload.results.map(\.name)) == Set(batch) else {
                     throw BackendWireError.invalid("Invalid latency result identities")
                 }
-                for result in payload.results { results[result.name] = result; measuredAt[result.name] = Date() }
+                let date = Date()
+                for result in payload.results {
+                    results[result.name] = result
+                    measuredAt[result.name] = date
+                    let delay = result.error == nil ? result.delay.flatMap { $0 > 0 ? UInt64($0) : nil } : nil
+                    let sample = NativeLatencySample(date: date, delay: delay)
+                    samples[result.name] = Array(((samples[result.name] ?? []) + [sample]).suffix(20))
+                }
                 completed += batch.count
             } catch { self.error = NativeFeatureError.message(error); return }
         }

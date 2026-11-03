@@ -18,40 +18,44 @@ enum NativeProxyInput {
 struct NativeProxyControls: View {
     let store: NativeBackendStore
     let snapshot: NativeSnapshot
+    var openRoutes: (() -> Void)? = nil
     @State private var operation = NativeFeatureOperation()
     @State private var pending: ProxyChange?
     @State private var settings = false
     @State private var chains = false
     private var available: Bool { store.state == .connected && !store.workspaceBusy && !operation.busy }
     private func toggle(_ key: String, _ observed: NativeObservedSwitch?) -> Binding<Bool> {
-        Binding(get: { observed?.enabled == true }, set: { pending = ProxyChange(key: key, value: .bool($0)) })
+        Binding(get: { store.state == .connected && observed?.state == "ready" && observed?.enabled == true },
+                set: { pending = ProxyChange(key: key, value: .bool($0)) })
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("流量接入").font(.system(size: 13, weight: .semibold)); Spacer()
+                Text("流量接入").font(TezType.section); Spacer()
                 TezToolButton(title: "代理设置", symbol: "gearshape") { settings = true }.accessibilityIdentifier("live.proxy.settings")
                 TezToolButton(title: "链式代理", symbol: "link", enabled: store.supports("native_get_proxy_chains")) { chains = true }
                     .accessibilityIdentifier("live.proxy.chains")
             }
-            TezSettingToggle(title: "系统代理", detail: "\(store.state == .connected ? snapshot.network?.systemProxyControl.label ?? "未确认" : "未确认") · 使用 macOS 代理的应用跟随此设置。",
+            TezSettingToggle(title: "系统代理", detail: "\(store.state != .connected || snapshot.network?.systemProxyControl.state != "ready" ? "状态未确认。" : "")使用 macOS 代理的应用跟随此设置。",
                              isOn: toggle("enable_system_proxy", snapshot.network?.systemProxyControl))
                 .disabled(!available || !store.supports("native_patch_settings") || snapshot.network?.systemProxyControl.state != "ready")
                 .accessibilityIdentifier("live.proxy.system")
-            TezSettingToggle(title: "虚拟网卡（TUN）", detail: "\(store.state == .connected ? snapshot.network?.tun.label ?? "未确认" : "未确认") · 接管范围取决于路由，不代表全部流量。",
+            TezSettingToggle(title: "虚拟网卡（TUN）", detail: "\(store.state != .connected || snapshot.network?.tun.state != "ready" ? "状态未确认。" : "")接管范围取决于路由，不代表全部流量。",
                              isOn: toggle("enable_tun_mode", snapshot.network?.tun))
                 .disabled(!available || !store.supports("native_patch_settings") || snapshot.network?.tun.state != "ready")
                 .accessibilityIdentifier("live.proxy.tun")
             VStack(alignment: .leading, spacing: 8) {
-                Text("分流模式").font(.system(size: 13))
-                Picker("分流模式", selection: Binding(get: { snapshot.network?.mode.value ?? "" }, set: { pending = ProxyChange(key: "mode", value: .string($0)) })) {
-                    if snapshot.network?.mode.value == nil { Text("未确认").tag("") }
+                Text("分流模式").font(TezType.body)
+                Picker("分流模式", selection: Binding(get: { observedMode }, set: { pending = ProxyChange(key: "mode", value: .string($0)) })) {
+                    if observedMode.isEmpty { Text("未确认").tag("") }
                     Text("规则").tag("rule"); Text("全局").tag("global"); Text("直连").tag("direct")
                 }.pickerStyle(.segmented).labelsHidden()
                     .disabled(!available || !store.supports("native_set_mode") || snapshot.network?.mode.state != "ready")
                     .accessibilityIdentifier("live.proxy.mode")
-                Text(modeSummary).font(.caption).foregroundStyle(.secondary)
+                    .help(modeSummary)
             }
+            Divider()
+            NativeConnectionOverview(summary: NativeAccessSummary(snapshot: snapshot, connected: store.state == .connected), openRoutes: openRoutes)
             if operation.busy { ProgressView("正在应用代理改动…").controlSize(.small) }
             if let error = operation.error {
                 TezOperationFeedback(message: "改动结果未确认。请刷新连接状态后重试。", details: error, tone: .error)
@@ -65,6 +69,9 @@ struct NativeProxyControls: View {
         } message: { Text("此操作会改变流量路径，并可能中断现有连接。") }
         .sheet(isPresented: $settings) { NativeNetworkSettingsView(store: store, showsCloseButton: true).frame(width: 680, height: 650) }
         .sheet(isPresented: $chains) { NativeProxyChainView(store: store) }
+    }
+    private var observedMode: String {
+        store.state == .connected && snapshot.network?.mode.state == "ready" ? snapshot.network?.mode.value ?? "" : ""
     }
     private var modeSummary: String {
         guard store.state == .connected else { return "尚未确认当前模式，请连接后台后重试。" }
@@ -184,27 +191,27 @@ struct NativeAdvancedProxySettings: View {
                         TezSettingRow(title: "设备名称", detail: "最多 64 个字母、数字或 - _ .，例如 utun1024。") {
                             TextField("设备名称", text: text("device", "utun1024")).textFieldStyle(.roundedBorder).frame(width: 160)
                         }
-                        if deviceError { Text("设备名称格式不正确。").font(.caption).foregroundStyle(.red) }
+                        if deviceError { Text("设备名称格式不正确。").font(TezType.metadata).foregroundStyle(.red) }
                         TezSettingRow(title: "MTU", detail: "每个数据包的最大大小，1–65535 字节。") {
                             HStack(spacing: 6) {
                                 TextField("MTU", text: mtu).textFieldStyle(.roundedBorder).frame(width: 94).accessibilityIdentifier("proxy.tun.mtu")
-                                Text("字节").font(.caption).foregroundStyle(.secondary)
+                                Text("字节").font(TezType.metadata).foregroundStyle(.secondary)
                             }
                         }
-                        if mtuError { Text("MTU 必须是 1–65535 的整数。").font(.caption).foregroundStyle(.red) }
+                        if mtuError { Text("MTU 必须是 1–65535 的整数。").font(TezType.metadata).foregroundStyle(.red) }
                     }
                     TezSettingsSection(title: "路由排除") {
                         TezMultilineField(title: "不经过 TUN 的网段", text: lines("route-exclude-address", draft: $excludedRoutes))
                             .accessibilityIdentifier("proxy.tun.exclusions")
                         Text("每行一个 CIDR 网段，例如 192.168.1.0/24 或 fd00::/8。留空表示不添加排除项。")
-                            .font(.caption).foregroundStyle(.secondary)
-                        if routesError { Text("请输入有效的 IP 地址与前缀长度，最多 256 个网段。").font(.caption).foregroundStyle(.red) }
+                            .font(TezType.metadata).foregroundStyle(.secondary)
+                        if routesError { Text("请输入有效的 IP 地址与前缀长度，最多 256 个网段。").font(TezType.metadata).foregroundStyle(.red) }
                     }
                     TezSettingsSection(title: "DNS 接管") {
                         TezMultilineField(title: "接管的 DNS 地址", text: lines("dns-hijack", draft: $hijackedDNS, fallback: ["any:53"]))
                         Text("每行一个地址，例如 any:53。这里控制 TUN 接管的请求，不修改 DNS 覆写草稿。")
-                            .font(.caption).foregroundStyle(.secondary)
-                        if dnsError { Text("最多 64 个地址；每个地址最多 256 字节，不含控制字符。").font(.caption).foregroundStyle(.red) }
+                            .font(TezType.metadata).foregroundStyle(.secondary)
+                        if dnsError { Text("最多 64 个地址；每个地址最多 256 字节，不含控制字符。").font(TezType.metadata).foregroundStyle(.red) }
                         TezSettingRow(title: "DNS 模式") {
                             Picker("DNS 模式", selection: text("dns-mode", "")) {
                                 Text("自动").tag(""); Text("禁用 (Disabled)").tag("disabled"); Text("原生 (Native)").tag("native"); Text("接管 (Hijack)").tag("hijack")
@@ -228,7 +235,7 @@ struct NativeAdvancedProxySettings: View {
                 HStack(spacing: 12) {
                     if operation.busy { ProgressView().controlSize(.small) }
                     Text(!loaded ? "尚未读取设置" : inputInvalid ? "请修正高级设置中的输入" : changes.isEmpty ? "与已读取的设置一致" : "有未应用的更改")
-                        .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                        .font(TezType.metadata).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                     TezToolButton(title: "重新读取", symbol: "arrow.clockwise", enabled: !operation.busy && store.supports("native_get_proxy_config")) {
                         if changes.isEmpty { Task { await load() } } else { pending = "reload" }
                     }
@@ -336,37 +343,37 @@ struct NativeProxyChainView: View {
                     if let current = payload.chains.first(where: { $0.id == payload.activeId }) {
                         TezStatusLabel(title: payload.applied ? "正在使用：\(current.name)" : "未确认生效：\(current.name)",
                                        tone: payload.applied ? .success : .warning, motion: motion)
-                    } else { Text("当前未启用代理链").font(.caption).foregroundStyle(.secondary) }
+                    } else { Text("当前未启用代理链").font(TezType.metadata).foregroundStyle(.secondary) }
                 }
                 TezSettingsSection(title: "名称与使用范围") {
                     TezSettingRow(title: "名称") {
                         TextField("代理链名称", text: $draft.name).textFieldStyle(.roundedBorder).frame(width: 300)
                             .accessibilityIdentifier("proxy.chain.name")
                     }
-                    TezSettingRow(title: "策略组", detail: "启用时，此组将选择代理链入口。") {
-                        Picker("策略组", selection: $draft.group) {
-                            if !(payload?.groups.contains(draft.group) ?? false) { Text(draft.group.isEmpty ? "选择策略组" : draft.group).tag(draft.group) }
-                            ForEach(payload?.groups ?? [], id: \.self) { Text($0).tag($0) }
-                        }.labelsHidden().frame(width: 300)
+                    TezSettingRow(title: "分组", detail: "启用时，此组将选择代理链入口。") {
+                        Picker("分组", selection: $draft.group) {
+                            if !(payload?.groups.contains(draft.group) ?? false) { Text(draft.group.isEmpty ? "选择分组" : TezProxyName.title(draft.group)).tag(draft.group) }
+                            ForEach(payload?.groups ?? [], id: \.self) { Text(TezProxyName.title($0)).tag($0) }
+                        }.labelsHidden().frame(width: 300).help("原始分组名称：\(draft.group)")
                     }
                     if active {
-                        Text("这条代理链正在使用。先停用，再修改节点或名称。").font(.caption).foregroundStyle(.secondary)
+                        Text("这条代理链正在使用。先停用，再修改节点或名称。").font(TezType.metadata).foregroundStyle(.secondary)
                     }
                 }.disabled(active)
                 TezSettingsSection(title: "连接顺序") {
                     if draft.nodes.isEmpty {
-                        Text("尚未添加节点").font(.callout).foregroundStyle(.secondary).padding(.vertical, 8)
+                        Text("尚未添加节点").font(TezType.body).foregroundStyle(.secondary).padding(.vertical, 8)
                     }
                     VStack(spacing: 0) {
                         ForEach(Array(draft.nodes.enumerated()), id: \.element) { index, name in
                             HStack(spacing: 12) {
                                 Text("\(index + 1)").monospacedDigit().foregroundStyle(.secondary).frame(width: 22)
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(name).font(.callout).lineLimit(2)
+                                    Text(name).font(TezType.body).lineLimit(2)
                                     Text(index == 0 ? "入口" : index == draft.nodes.count - 1 ? "出口" : "中转")
-                                        .font(.caption).foregroundStyle(.secondary)
+                                        .font(TezType.metadata).foregroundStyle(.secondary)
                                     if payload?.available.contains(name) != true {
-                                        Label("当前配置中不可用", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.red)
+                                        Label("当前配置中不可用", systemImage: "exclamationmark.triangle").font(TezType.metadata).foregroundStyle(.red)
                                     }
                                 }.frame(maxWidth: .infinity, alignment: .leading)
                                 TezToolButton(title: "上移 \(name)", symbol: "arrow.up", enabled: index > 0 && !active, motion: motion) { draft.nodes.swapAt(index, index - 1) }
@@ -386,8 +393,8 @@ struct NativeProxyChainView: View {
                         }
                     }.disabled(active)
                     Text("\(draft.nodes.count)/16 个节点 · 至少 2 个 · 首项为入口，末项为出口")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if payload?.available.isEmpty == true { Text("当前配置没有可用节点。请先在配置页检查线路来源。").font(.caption).foregroundStyle(.secondary) }
+                        .font(TezType.metadata).foregroundStyle(.secondary)
+                    if payload?.available.isEmpty == true { Text("当前配置没有可用节点。请先在配置页检查线路来源。").font(TezType.metadata).foregroundStyle(.secondary) }
                 }
             }.disabled(operation.busy || payload == nil)
             Divider()
@@ -395,9 +402,9 @@ struct NativeProxyChainView: View {
                 NativeSettingsFeedback(operation: operation)
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(payload == nil ? "尚未读取代理链" : needsSave ? "未保存" : active ? "已启用" : "已保存，尚未启用").font(.callout)
+                        Text(payload == nil ? "尚未读取代理链" : needsSave ? "未保存" : active ? "已启用" : "已保存，尚未启用").font(TezType.body)
                         Text(payload == nil ? "重新读取后可编辑。" : needsSave ? validation ?? "保存仅更新记录，不改变当前连接。" : active ? "停用后可继续编辑。" : "启用后改变流量路径。")
-                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            .font(TezType.metadata).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }.frame(maxWidth: .infinity, alignment: .leading)
                     if operation.busy { ProgressView().controlSize(.small) }
                     TezToolButton(title: "重新读取", symbol: "arrow.clockwise", enabled: store.supports("native_get_proxy_chains") && !operation.busy) { navigate(.reload) }
@@ -438,7 +445,7 @@ struct NativeProxyChainView: View {
                 } }
             }
             Button("取消", role: .cancel) { pending = nil }
-        } message: { Text(pending == "native_delete_proxy_chain" ? "删除保存记录及当前未保存的更改。此操作无法撤销。" : "策略组：\(draft.group)。代理链会修改节点拨号关系和策略组选择，可能影响使用这些节点的其他连接。") }
+        } message: { Text(pending == "native_delete_proxy_chain" ? "删除保存记录及当前未保存的更改。此操作无法撤销。" : "分组：\(TezProxyName.title(draft.group))。代理链会修改节点拨号关系和分组选择，可能影响使用这些节点的其他连接。") }
     }
     private func load() async {
         guard store.supports("native_get_proxy_chains"), let result = await operation.request(store, "native_get_proxy_chains") else { return }

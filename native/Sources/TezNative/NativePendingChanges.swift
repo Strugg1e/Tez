@@ -105,18 +105,45 @@ enum NativeNetworkPendingChanges {
 
 struct NativePendingChangesList: View {
     let changes: [NativePendingChange]
+    var locate: ((String) -> Void)? = nil
+    @State private var contentHeight: CGFloat = 44
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(changes) { change in
-                    VStack(alignment: .leading, spacing: 4) {
+                    Group {
+                        if let locate {
+                            Button { locate(change.id) } label: { changeRow(change) }
+                                .buttonStyle(.plain)
+                                .help("定位到\(change.title)")
+                        } else {
+                            changeRow(change)
+                        }
+                    }
+                    .accessibilityIdentifier("network.pending.\(change.id)")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+        }
+        .frame(height: min(max(contentHeight, 44), 160))
+        .accessibilityIdentifier("network.pending.list")
+    }
+
+    private func changeRow(_ change: NativePendingChange) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            Text(change.title).font(.system(size: 12, weight: .medium))
+                            Text(change.title).font(TezType.body.weight(.medium))
                             if change.affectsTraffic {
                                 Image(systemName: "exclamationmark.triangle")
-                                    .font(.system(size: 10)).foregroundStyle(TezStyle.warning)
+                                    .font(TezType.metadata).foregroundStyle(TezStyle.warning)
                                     .accessibilityLabel("影响流量")
+                            }
+                            Spacer(minLength: 4)
+                            if locate != nil {
+                                Image(systemName: "scope").foregroundStyle(.secondary).accessibilityLabel("定位字段")
                             }
                         }
                         HStack(alignment: .top, spacing: 8) {
@@ -126,15 +153,11 @@ struct NativePendingChangesList: View {
                             Text("待应用：\(change.proposedValue)")
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .font(.system(size: 11))
+                        .font(TezType.metadata)
                         .fixedSize(horizontal: false, vertical: true)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                     .accessibilityElement(children: .combine)
-                    .accessibilityIdentifier("network.pending.\(change.id)")
-                }
-            }.frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(maxHeight: 160)
-        .accessibilityIdentifier("network.pending.list")
     }
 }

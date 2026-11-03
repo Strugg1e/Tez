@@ -19,23 +19,69 @@ use clash_verge_logging::{Type, logging};
 
 const SYNTAX_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg(test)]
+mod native_core_path_tests {
+    use super::*;
+    use crate::core::service::core_sidecar_argument_for;
+    use std::path::Path;
+
+    #[test]
+    fn native_core_paths_cover_both_packaged_variants_without_changing_legacy() {
+        let executable = Path::new("/Applications/Tez Test.app/Contents/Helpers/tez-native-host");
+        for (saved, packaged) in [("verge-mihomo", "mihomo"), ("verge-mihomo-alpha", "mihomo-alpha")] {
+            assert_eq!(core_sidecar_argument_for(executable, saved), executable.with_file_name(packaged));
+            assert_eq!(super::super::service::bundled_core_path_for(executable, saved, ""), executable.with_file_name(packaged));
+            assert_eq!(core_sidecar_argument_for(executable, packaged), executable.with_file_name(packaged));
+            assert_eq!(core_sidecar_argument_for(Path::new("/Applications/Legacy.app/Contents/MacOS/tez"), saved), Path::new(saved));
+            assert_eq!(super::super::service::bundled_core_path_for(Path::new("/legacy/tez.exe"), saved, ".exe"), Path::new("/legacy").join(format!("{saved}.exe")));
+        }
+    }
+
+    #[test]
+    fn native_validation_core_switch_changes_fingerprint() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("tez-core-fingerprint-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir(&root)?;
+        let cleanup = scopeguard::guard(root, |path| { let _ = std::fs::remove_dir_all(path); });
+        let first = cleanup.join("mihomo");
+        let second = cleanup.join("tez-approved-version");
+        std::fs::write(&first, "same-sized-core")?;
+        std::fs::write(&second, "same-sized-core")?;
+        let times = std::fs::FileTimes::new().set_modified(std::fs::metadata(&first)?.modified()?);
+        std::fs::File::options().write(true).open(&second)?.set_times(times)?;
+        assert_ne!(fingerprint_for_paths("rules: []", &first, &[]), fingerprint_for_paths("rules: []", &second, &[]));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected packaged application; only runs validation, never starts a core"]
+    fn native_packaged_core_validation() -> Result<()> {
+        let app = std::env::var_os("TEZ_CORE_VALIDATION_TEST_APP").ok_or_else(|| anyhow::anyhow!("Set TEZ_CORE_VALIDATION_TEST_APP"))?;
+        let helper = Path::new(&app).join("Contents/Helpers/tez-native-host");
+        let root = std::env::temp_dir().join(format!("tez-validate-package-{}", nanoid::nanoid!(8)));
+        std::fs::create_dir(&root)?;
+        let cleanup = scopeguard::guard(root, |path| { let _ = std::fs::remove_dir_all(path); });
+        let config = cleanup.join("fixture.yaml");
+        for saved in ["verge-mihomo", "verge-mihomo-alpha"] {
+            let binary = core_sidecar_argument_for(&helper, saved);
+            for valid in [true, false] {
+                let yaml = if valid { "mixed-port: 0\ndns: {enable: false}\ntun: {enable: false}\nproxies: []\nrules: ['MATCH,DIRECT']\n" }
+                    else { "proxies: [{name: Invalid, type: tez-invalid-fixture}]\n" };
+                std::fs::write(&config, yaml)?;
+                let output = std::process::Command::new(&binary).args(["-t", "-d"]).arg(&*cleanup).arg("-f").arg(&config).output()?;
+                assert_eq!(output.status.success(), valid, "Packaged validation disagreed for {saved}: {}", std::string::String::from_utf8_lossy(&output.stdout));
+            }
+        }
+        Ok(())
+    }
+}
+
 static LAST_VALIDATED: LazyLock<parking_lot::Mutex<Option<u64>>> = LazyLock::new(|| parking_lot::Mutex::new(None));
 
-async fn validation_fingerprint(yaml: &str) -> u64 {
-    let core = Config::verge().await.latest_arc().get_valid_clash_core();
+fn fingerprint_for_paths(yaml: &str, binary: &std::path::Path, geo: &[std::path::PathBuf]) -> u64 {
     let mut hasher = DefaultHasher::new();
     yaml.hash(&mut hasher);
-    core.as_str().hash(&mut hasher);
-    let binary = std::env::current_exe()
-        .into_iter()
-        .map(|exe| exe.with_file_name(format!("{}{}", core.as_str(), std::env::consts::EXE_SUFFIX)));
-    // The test run reads geo databases from the app dir; a geo update must revalidate.
-    let geo = dirs::app_home_dir().into_iter().flat_map(|dir| {
-        super::runtime_bundle::GEO_ASSETS
-            .iter()
-            .map(move |asset| dir.join(asset))
-    });
-    for path in binary.chain(geo) {
+    binary.hash(&mut hasher);
+    for path in std::iter::once(binary).chain(geo.iter().map(|path| path.as_path())) {
         match std::fs::metadata(&path) {
             Ok(meta) => {
                 meta.len().hash(&mut hasher);
@@ -45,6 +91,18 @@ async fn validation_fingerprint(yaml: &str) -> u64 {
         }
     }
     hasher.finish()
+}
+
+async fn validation_binary() -> Result<std::path::PathBuf> {
+    let core = Config::verge().await.latest_arc().get_valid_clash_core();
+    let executable = tauri::utils::platform::current_exe()?;
+    let bundled = super::service::bundled_core_path_for(&executable, core.as_str(), std::env::consts::EXE_SUFFIX);
+    super::service::runtime_core_path(bundled).await
+}
+
+fn validation_fingerprint(yaml: &str, binary: &std::path::Path) -> u64 {
+    let geo = dirs::app_home_dir().into_iter().flat_map(|dir| super::runtime_bundle::GEO_ASSETS.iter().map(move |asset| dir.join(asset))).collect::<Vec<_>>();
+    fingerprint_for_paths(yaml, binary, &geo)
 }
 
 pub struct CoreConfigValidator {
@@ -347,6 +405,11 @@ impl CoreConfigValidator {
     }
 
     async fn validate_config_internal_outcome(config_path: &str) -> Result<ValidationOutcome> {
+        let binary = validation_binary().await?;
+        Self::validate_config_with_binary(config_path, &binary).await
+    }
+
+    async fn validate_config_with_binary(config_path: &str, binary: &std::path::Path) -> Result<ValidationOutcome> {
         if handle::Handle::global().is_exiting() {
             logging!(info, Type::Validate, "应用正在退出，跳过验证");
             return Ok(ValidationOutcome::Skipped {
@@ -356,7 +419,7 @@ impl CoreConfigValidator {
 
         logging!(info, Type::Validate, "开始验证配置文件: {}", config_path);
 
-        let clash_core = Config::verge().await.latest_arc().get_valid_clash_core();
+        let clash_core = binary.display();
         logging!(info, Type::Validate, "使用内核: {}", clash_core);
 
         let app_handle = handle::Handle::app_handle();
@@ -364,7 +427,7 @@ impl CoreConfigValidator {
         let app_dir_str = dirs::path_to_str(&app_dir)?;
         logging!(info, Type::Validate, "验证目录: {}", app_dir_str);
 
-        let command = app_handle.shell().sidecar(clash_core.as_str()).map_err(|error| {
+        let command = app_handle.shell().sidecar(binary).map_err(|error| {
             anyhow::anyhow!("failed to build validation command for core {clash_core:?}: {error:#}")
         })?;
         let command = command.args(["-t", "-d", app_dir_str, "-f", config_path]);
@@ -425,7 +488,8 @@ impl CoreConfigValidator {
         }
         logging!(info, Type::Validate, "生成临时配置文件用于验证");
 
-        let fingerprint = validation_fingerprint(yaml).await;
+        let binary = validation_binary().await?;
+        let fingerprint = validation_fingerprint(yaml, &binary);
         if *LAST_VALIDATED.lock() == Some(fingerprint) {
             logging!(info, Type::Validate, "配置与上次通过验证的字节一致，跳过内核检查");
             return Ok(ValidationOutcome::Valid);
@@ -433,7 +497,7 @@ impl CoreConfigValidator {
 
         let check_path = dirs::app_home_dir()?.join(crate::constants::files::CHECK_CONFIG);
         help::save_yaml_str(&check_path, yaml).await?;
-        let outcome = Self::validate_config_internal_outcome(dirs::path_to_str(&check_path)?).await?;
+        let outcome = Self::validate_config_with_binary(dirs::path_to_str(&check_path)?, &binary).await?;
         if outcome.is_valid() {
             *LAST_VALIDATED.lock() = Some(fingerprint);
             let _ = fs::remove_file(&check_path).await;

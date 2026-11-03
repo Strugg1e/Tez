@@ -157,9 +157,7 @@ impl Timer {
         if let Some(items) = Config::profiles().await.data_arc().items.as_ref() {
             for item in items.iter() {
                 if let Some(option) = item.option.as_ref()
-                    && option.allow_auto_update.unwrap_or(true)
-                    && let Some(interval) = option.update_interval
-                    && interval > 0
+                    && let Some(interval) = option.auto_update_interval()
                     && let Some(uid) = item.uid.as_ref()
                     && let Some(updated) = item.updated
                     && cur_timestamp - (updated as i64) >= (interval as i64) * 60
@@ -227,9 +225,7 @@ impl Timer {
 
         for item in items {
             if let Some(option) = item.option.as_ref()
-                && let (Some(interval), Some(uid)) = (option.update_interval, &item.uid)
-                && option.allow_auto_update.unwrap_or(true)
-                && interval > 0
+                && let (Some(interval), Some(uid)) = (option.auto_update_interval(), &item.uid)
             {
                 new_map.insert(uid.clone(), TaskSchedule::new(interval, item.updated, now));
             }

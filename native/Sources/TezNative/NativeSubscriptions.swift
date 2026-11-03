@@ -22,14 +22,31 @@ struct NativeSubscriptionDraft: Equatable {
     var autoUpdate = true
     var withProxy = false
 
+    var normalizedURL: String { url.trimmingCharacters(in: .whitespacesAndNewlines) }
+    var urlError: String? {
+        guard !normalizedURL.isEmpty else { return "请输入完整的 HTTP 或 HTTPS 订阅地址。" }
+        guard !normalizedURL.contains(where: { $0.isWhitespace }),
+              let address = URLComponents(string: normalizedURL),
+              ["http", "https"].contains(address.scheme?.lowercased() ?? ""),
+              !(address.host ?? "").isEmpty, address.url != nil else {
+            return "订阅地址必须包含 HTTP 或 HTTPS 协议和服务器名称。"
+        }
+        return nil
+    }
+
     var interval: Int64? {
         let text = intervalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
         return Int64(text)
     }
     var intervalError: String? {
+        guard autoUpdate else { return nil }
         guard let interval else { return "请输入整数分钟，不支持小数或其他字符。" }
         return (1440...525600).contains(interval) ? nil : "更新间隔必须为 1440–525600 分钟。"
+    }
+    var intervalForRequest: Int64 {
+        guard let interval, (1440...525600).contains(interval) else { return 1440 }
+        return interval
     }
 }
 
@@ -54,7 +71,7 @@ struct NativeSubscriptionSheet: View {
     private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
     private var canSave: Bool {
         !operation.busy && baseline != nil && canWrite && !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && (!isRemote || (!draft.url.isEmpty && draft.intervalError == nil))
+            && (!isRemote || (draft.urlError == nil && draft.intervalError == nil))
     }
 
     init(store: NativeBackendStore, profile: NativeProfileItem?) {
@@ -71,9 +88,10 @@ struct NativeSubscriptionSheet: View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: profile == nil ? "doc.badge.plus" : "slider.horizontal.3").foregroundStyle(TezStyle.accent)
-                Text(profile == nil ? "添加配置" : "配置管理").font(.system(size: 15, weight: .semibold))
+                Text(profile == nil ? "添加配置" : "配置管理").font(TezType.itemTitle)
+                    .accessibilityAddTraits(.isHeader)
                 if dirty {
-                    Text("未保存").font(.caption).foregroundStyle(.secondary)
+                    Text("未保存").font(TezType.metadata).foregroundStyle(.secondary)
                         .accessibilityIdentifier("subscription.dirty")
                 }
                 Spacer()
@@ -86,27 +104,39 @@ struct NativeSubscriptionSheet: View {
                 if profile == nil {
                     Picker("来源", selection: $draft.kind) { Text("订阅").tag("remote"); Text("本地 YAML").tag("local") }.pickerStyle(.segmented)
                 }
-                TextField("名称", text: $draft.name).disabled(!canWrite)
+                TextField("名称", text: $draft.name, prompt: Text("例如：日常上网"))
+                    .textFieldStyle(.roundedBorder).disabled(!canWrite)
                     .accessibilityIdentifier("subscription.name")
                 if isRemote {
                     Section("订阅") {
                         HStack {
                             Group {
-                                if revealsURL { TextField("订阅地址", text: $draft.url) }
-                                else { SecureField("订阅地址", text: $draft.url) }
-                            }.disabled(!canWrite).accessibilityIdentifier("subscription.url")
+                                if revealsURL { TextField("订阅地址", text: $draft.url, prompt: Text("https://example.com/sub")) }
+                                else { SecureField("订阅地址", text: $draft.url, prompt: Text("https://example.com/sub")) }
+                            }.textFieldStyle(.roundedBorder).disabled(!canWrite).accessibilityIdentifier("subscription.url")
                             Button(revealsURL ? "隐藏地址" : "显示地址", systemImage: revealsURL ? "eye.slash" : "eye") { revealsURL.toggle() }
                                 .labelStyle(.iconOnly).help(revealsURL ? "隐藏订阅地址" : "显示订阅地址")
                         }.privacySensitive()
+                        Text("完整的 HTTP 或 HTTPS 地址，例如 https://example.com/sub。")
+                            .font(TezType.metadata).foregroundStyle(.secondary)
+                        if !draft.url.isEmpty, let error = draft.urlError {
+                            TezStatusLabel(title: error, tone: .warning)
+                                .accessibilityIdentifier("subscription.url.error")
+                        }
                         Toggle("自动更新", isOn: $draft.autoUpdate).disabled(!canWrite)
                         VStack(alignment: .leading, spacing: 6) {
-                            TextField("更新间隔（分钟）", text: $draft.intervalText).disabled(!canWrite)
-                                .accessibilityIdentifier("subscription.interval")
+                            LabeledContent("更新间隔（分钟）") {
+                                TextField("更新间隔（分钟）", text: $draft.intervalText, prompt: Text("1440"))
+                                    .labelsHidden().accessibilityLabel("更新间隔（分钟）")
+                                    .textFieldStyle(.roundedBorder).frame(width: 110)
+                                    .disabled(!canWrite || !draft.autoUpdate)
+                                    .accessibilityIdentifier("subscription.interval")
+                            }
                             Text("允许范围：1440–525600 分钟（1–365 天）")
-                                .font(.caption).foregroundStyle(.secondary)
+                                .font(TezType.metadata).foregroundStyle(.secondary)
                             if let error = draft.intervalError {
                                 Label(error, systemImage: "exclamationmark.triangle")
-                                    .font(.caption).foregroundStyle(.red)
+                                    .font(TezType.metadata).foregroundStyle(.red)
                                     .accessibilityIdentifier("subscription.interval.error")
                             }
                         }
@@ -123,7 +153,7 @@ struct NativeSubscriptionSheet: View {
                 } else if profile == nil {
                     Section("配置内容") {
                         Button("选择 YAML 文件…", systemImage: "doc.badge.plus") { showsImporter = true }
-                        TextEditor(text: $draft.localContent).font(.system(size: 12, design: .monospaced)).frame(minHeight: 200)
+                        TextEditor(text: $draft.localContent).font(TezType.code).frame(minHeight: 200)
                             .accessibilityLabel("配置内容").accessibilityIdentifier("subscription.content")
                     }.disabled(!canWrite)
                 }
@@ -145,7 +175,7 @@ struct NativeSubscriptionSheet: View {
                         }
                         if dirty {
                             Text(isRemote ? "启用配置或更新订阅前，请先保存修改；或关闭并放弃更改。" : "启用配置前，请先保存修改；或关闭并放弃更改。")
-                                .font(.caption).foregroundStyle(.secondary)
+                                .font(TezType.metadata).foregroundStyle(.secondary)
                                 .accessibilityIdentifier("subscription.activation.draftHint")
                         }
                         reorderControls
@@ -236,13 +266,13 @@ struct NativeSubscriptionSheet: View {
         let command: String
         if let profile {
             command = "native_patch_subscription"
-            var patch: [String: BackendJSON] = ["uid": .string(profile.uid), "name": .string(submitted.name), "interval": .integer(submitted.interval ?? 1440),
+            var patch: [String: BackendJSON] = ["uid": .string(profile.uid), "name": .string(submitted.name), "interval": .integer(submitted.intervalForRequest),
                 "auto_update": .bool(submitted.autoUpdate), "with_proxy": .bool(submitted.withProxy)]
-            if isRemote { patch["url"] = .string(submitted.url) }
+            if isRemote { patch["url"] = .string(submitted.normalizedURL) }
             params = patch
         } else if isRemote {
-            command = "native_import_subscription"; params = ["url": .string(submitted.url), "name": .string(submitted.name),
-                "interval": .integer(submitted.interval ?? 1440), "auto_update": .bool(submitted.autoUpdate), "with_proxy": .bool(submitted.withProxy)]
+            command = "native_import_subscription"; params = ["url": .string(submitted.normalizedURL), "name": .string(submitted.name),
+                "interval": .integer(submitted.intervalForRequest), "auto_update": .bool(submitted.autoUpdate), "with_proxy": .bool(submitted.withProxy)]
         } else {
             command = "native_create_local_profile"; params = ["name": .string(submitted.name), "content": .string(submitted.localContent)]
         }

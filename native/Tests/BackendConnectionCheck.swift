@@ -51,9 +51,12 @@ struct BackendConnectionCheck {
     static func fixture(_ requestedMode: String) throws {
         let claimedFile = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent(".automatic-claim-ready")
         let installedFile = claimedFile.deletingLastPathComponent().appendingPathComponent(".automatic-install-ready")
+        let upgradeRelease = claimedFile.deletingLastPathComponent().appendingPathComponent(".upgrade-eof-release")
+        let upgradeInput = claimedFile.deletingLastPathComponent().appendingPathComponent(".upgrade-eof-input")
         let mode: String
         if requestedMode == "automatic-claim" { mode = FileManager.default.fileExists(atPath: claimedFile.path) ? "prepared-normal" : "automatic-readonly" }
         else if requestedMode.hasPrefix("automatic-install") { mode = FileManager.default.fileExists(atPath: installedFile.path) ? "prepared-normal" : "automatic-readonly" }
+        else if requestedMode == "prepared-upgrade-eof" && FileManager.default.fileExists(atPath: upgradeRelease.path) { mode = "prepared-normal" }
         else { mode = requestedMode }
         if mode == "activation-busy" { exit(73) }
         if mode == "activation-refused" { exit(78) }
@@ -74,6 +77,7 @@ struct BackendConnectionCheck {
         } else if mode.hasPrefix("prepared-") || mode.hasPrefix("recovery-") {
             var capabilities = ["native_subscribe", "native_get_snapshot", "native_prepare_shutdown"]
             if mode == "prepared-service-install" { capabilities.append("native_install_service") }
+            if mode.hasPrefix("prepared-upgrade-") { capabilities.append("native_upgrade_core") }
             try emit(.hello(sessionID: "fixture", capabilities: capabilities))
         } else if mode == "automatic-readonly" {
             try emit(.hello(sessionID: "fixture", capabilities: ["native_continuous_session", "native_subscribe", "native_get_snapshot", "native_inspect_core", "native_claim_core", "native_install_service"]))
@@ -110,6 +114,32 @@ struct BackendConnectionCheck {
                     if mode != "prepared-service-install" { try Data("installed".utf8).write(to: installedFile) }
                     try emit(.response(id: id, outcome: .result(.object(["installed": .bool(true), "reconnectRequired": .bool(mode != "prepared-service-install")]))))
                 }
+            } else if command == "native_upgrade_core" && mode.hasPrefix("prepared-upgrade-") {
+                guard params["confirmed"] == .bool(true) else { exit(2) }
+                if mode == "prepared-upgrade-eof" {
+                    try FileHandle.standardOutput.close()
+                    let deadline = Date().addingTimeInterval(5)
+                    while !FileManager.default.fileExists(atPath: upgradeRelease.path) && Date() < deadline {
+                        var input = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+                        if poll(&input, 1, 10) > 0 {
+                            if let queued = readLine() { try Data(queued.utf8).write(to: upgradeInput) }
+                            else { return }
+                        }
+                    }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.3)
+                if mode == "prepared-upgrade-cancel" {
+                    try emit(.response(id: id, outcome: .error(.init(detail: "Administrator authorization cancelled", code: .string("CORE_APPROVAL_FAILED"), operation: nil))))
+                } else if mode == "prepared-upgrade-unresolved" {
+                    try emit(.response(id: id, outcome: .error(.init(detail: "Upgrade outcome unavailable", code: .string("CORE_UPGRADE_UNRESOLVED"), operation: nil))))
+                } else if mode == "prepared-upgrade-invalid" {
+                    try emit(.response(id: id, outcome: .result(.object(["unexpected": .bool(true)]))))
+                } else {
+                    try emit(.response(id: id, outcome: .result(.object(["outcome": .string("upgraded"), "versionSelectionSaved": .bool(true)]))))
+                }
+            } else if command == "shutdown-attempts" {
+                try emit(.response(id: id, outcome: .result(.integer(Int64(prepareAttempts)))))
             } else if command == "break-main" {
                 try FileHandle.standardOutput.close()
             } else if command == "recovery-directory" {
@@ -258,6 +288,76 @@ struct BackendConnectionCheck {
         precondition(automaticManaged.requiresManagedShutdown && !automaticManaged.isReadOnlyConnection)
         let managedAutomaticClosed = await automaticManaged.shutdownForTermination()
         precondition(managedAutomaticClosed && automaticManaged.state == .disconnected)
+        let slowUpgrade = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "prepared-upgrade-slow"],
+            timeout: .seconds(1), mode: .automatic, shutdownTimeout: .milliseconds(80))
+        slowUpgrade.connect()
+        try await wait { slowUpgrade.state == .connected }
+        let upgrading = Task { try await slowUpgrade.request("native_upgrade_core", params: ["confirmed": .bool(true)], timeout: .milliseconds(40), serialWorkspace: true) }
+        try await Task.sleep(for: .milliseconds(120))
+        precondition(slowUpgrade.workspaceBusy && slowUpgrade.state == .connected,
+                     "Human-paced core authorization must outlive a request deadline")
+        precondition(slowUpgrade.coreUpgradeInProgress && !slowUpgrade.serviceSetupInProgress)
+        let quitDuringUpgrade = await slowUpgrade.shutdownForTermination()
+        precondition(!quitDuringUpgrade && slowUpgrade.state == .connected)
+        slowUpgrade.disconnect()
+        precondition(slowUpgrade.state == .connected && slowUpgrade.workspaceBusy)
+        slowUpgrade.refresh()
+        let upgraded = try await upgrading.value
+        guard case .object(let upgradeFields) = upgraded else { fatalError() }
+        precondition(upgradeFields["outcome"] == .string("upgraded"))
+        try await wait { !slowUpgrade.workspaceBusy && slowUpgrade.state == .connected }
+        precondition(!slowUpgrade.coreUpgradeInProgress)
+        let automaticStops = try await slowUpgrade.request("shutdown-attempts")
+        precondition(automaticStops == .integer(0))
+        let slowUpgradeClosed = await slowUpgrade.shutdownForTermination()
+        precondition(slowUpgradeClosed)
+        for mode in ["prepared-upgrade-cancel", "prepared-upgrade-unresolved", "prepared-upgrade-invalid"] {
+            let failedUpgrade = NativeBackendStore(helperURL: helper, arguments: ["--fixture", mode],
+                timeout: .seconds(1), mode: .automatic)
+            failedUpgrade.connect()
+            try await wait { failedUpgrade.state == .connected }
+            do {
+                _ = try await failedUpgrade.upgradeCore(params: ["confirmed": .bool(true)])
+                fatalError("Rejected or unconfirmed upgrade returned success")
+            } catch NativeBackendError.remote(let remote) {
+                precondition(remote.code == .string(mode == "prepared-upgrade-cancel" ? "CORE_APPROVAL_FAILED" : "CORE_UPGRADE_UNRESOLVED"))
+            } catch NativeBackendError.unavailable(let message) {
+                precondition(mode == "prepared-upgrade-invalid" && message == "内核升级结果未确认")
+            }
+            precondition(!failedUpgrade.coreUpgradeInProgress && !failedUpgrade.serviceSetupInProgress && !failedUpgrade.workspaceBusy)
+            failedUpgrade.refresh()
+            let stopsAfterFailure = try await failedUpgrade.request("shutdown-attempts")
+            precondition(stopsAfterFailure == .integer(0) && failedUpgrade.state == .connected)
+            let failedUpgradeClosed = await failedUpgrade.shutdownForTermination()
+            precondition(failedUpgradeClosed)
+        }
+        let eofUpgrade = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "prepared-upgrade-eof"],
+            timeout: .seconds(1), mode: .automatic, shutdownTimeout: .milliseconds(80))
+        eofUpgrade.connect()
+        try await wait { eofUpgrade.state == .connected }
+        guard case .integer(let upgradePID) = try await eofUpgrade.request("pid") else { fatalError() }
+        let interruptedUpgrade = Task { try await eofUpgrade.upgradeCore(params: ["confirmed": .bool(true)]) }
+        try await wait { eofUpgrade.state == .failed }
+        do { _ = try await interruptedUpgrade.value; fatalError("EOF cannot confirm core upgrade success") } catch {}
+        precondition(eofUpgrade.coreUpgradeInProgress && !eofUpgrade.serviceSetupInProgress && eofUpgrade.workspaceBusy)
+        let quitAfterUpgradeEOF = await eofUpgrade.shutdownForTermination()
+        precondition(!quitAfterUpgradeEOF)
+        eofUpgrade.disconnect()
+        eofUpgrade.connect()
+        eofUpgrade.refresh()
+        try await Task.sleep(for: .milliseconds(120))
+        precondition(eofUpgrade.state == .failed && eofUpgrade.coreUpgradeInProgress && eofUpgrade.workspaceBusy)
+        let unexpectedUpgradeInput = directory.appendingPathComponent(".upgrade-eof-input")
+        precondition(!FileManager.default.fileExists(atPath: unexpectedUpgradeInput.path), "Unknown upgrade result must not enqueue shutdown or replay")
+        try Data("finished".utf8).write(to: directory.appendingPathComponent(".upgrade-eof-release"))
+        try await wait { kill(pid_t(upgradePID), 0) == -1 && errno == ESRCH }
+        precondition(eofUpgrade.coreUpgradeInProgress && eofUpgrade.workspaceBusy)
+        eofUpgrade.connect()
+        try await wait { eofUpgrade.state == .connected }
+        precondition(!eofUpgrade.coreUpgradeInProgress && !eofUpgrade.workspaceBusy && !eofUpgrade.supports("native_upgrade_core"))
+        let eofUpgradeClosed = await eofUpgrade.shutdownForTermination()
+        precondition(eofUpgradeClosed)
+        print("PASS: human-paced core upgrade delay, late result, quit/disconnect refusal, no automatic shutdown, recoverable returned errors, EOF protection and explicit rediscovery without replay")
         let managedInstall = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "prepared-service-install"],
             timeout: .seconds(1), mode: .automatic)
         managedInstall.connect()

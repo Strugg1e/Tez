@@ -19,6 +19,8 @@ struct LiveWorkspaceView: View {
     @State private var confirmServiceInstall = false
     @State private var serviceInstallInspection: NativeCoreInspection?
     @State private var maintenanceExpanded = false
+    @State private var routeLatency = NativeLatencyModel()
+    @State private var activitySession = NativeActivitySession()
 
     private var connectionPresentation: TezConnectionPresentation {
         TezConnectionPresentation(state: store.state, hasSnapshot: store.snapshot != nil,
@@ -51,7 +53,7 @@ struct LiveWorkspaceView: View {
                     SettingsLink { Label("设置", systemImage: "slider.horizontal.3") }
                         .buttonStyle(.plain)
                 }
-                .font(.system(size: 13))
+                .font(TezType.body)
                 .padding(20)
             }
             .background {
@@ -71,9 +73,11 @@ struct LiveWorkspaceView: View {
                     if let snapshot = store.snapshot {
                         switch selection ?? .connection {
                         case .connection: connection(snapshot)
-                        case .routes: LiveRoutesView(snapshot: snapshot, store: store)
+                        case .routes: LiveRoutesView(snapshot: snapshot, store: store, latency: routeLatency)
                         case .profiles: LiveProfilesView(snapshot: snapshot, store: store)
-                        case .activity: NativeActivityWorkspace(store: store)
+                        case .activity:
+                            NativeActivityWorkspace(store: store, session: activitySession)
+                                .id(ObjectIdentifier(activitySession))
                         }
                     } else {
                         ContentUnavailableView(emptyTitle, systemImage: (selection ?? .connection).symbol,
@@ -130,6 +134,10 @@ struct LiveWorkspaceView: View {
             Button("取消", role: .cancel) {}
         } message: { Text("将接管 PID \(claimInspection?.corePid ?? 0)。内核进程保持运行。原管理会话将失效。") }
         .sheet(isPresented: $showCoreUpgrade) { NativeCoreUpgradeView(store: store) }
+        .onChange(of: store.snapshot?.profiles.current) { _, _ in
+            routeLatency = NativeLatencyModel()
+            activitySession = NativeActivitySession()
+        }
         .confirmationDialog("更新系统后台服务？", isPresented: $confirmServiceInstall) {
             Button("授权并更新后台服务", role: .destructive) { installService() }
             Button("取消", role: .cancel) {}
@@ -164,15 +172,13 @@ struct LiveWorkspaceView: View {
     private func connection(_ snapshot: NativeSnapshot) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("连接概况").font(.system(size: 22, weight: .semibold))
-                NativeConnectionOverview(summary: NativeAccessSummary(snapshot: snapshot, connected: store.state == .connected)) {
+                Text("连接概况").font(TezType.page)
+                NativeProxyControls(store: store, snapshot: snapshot) {
                     selection = .routes
                 }
                 Divider()
-                NativeProxyControls(store: store, snapshot: snapshot)
-                Divider()
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("内核与服务").font(.system(size: 13, weight: .semibold))
+                    Text("内核与服务").font(TezType.section)
                     if LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) || store.supports("native_upgrade_core") {
                         HStack(spacing: 12) {
                             ForEach(LiveCoreAction.allCases) { action in
@@ -186,21 +192,21 @@ struct LiveWorkspaceView: View {
                         }
                     }
                     if let inspection = snapshot.core.lifecycle {
-                        Text(inspection.explanation).font(.callout).foregroundStyle(.secondary)
+                        Text(inspection.explanation).font(TezType.body).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     if store.serviceSetupInProgress {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
                             Text("等待系统授权并更新后台服务…")
-                        }.font(.callout).foregroundStyle(.secondary)
+                        }.font(TezType.body).foregroundStyle(.secondary)
                     }
                     if snapshot.core.lifecycle != nil || store.supports("native_upgrade_core") || store.supports("native_install_service") {
                         TezSettingsDisclosure(title: "高级维护", summary: "更新内核、后台服务与控制权", isExpanded: $maintenanceExpanded,
                                               motion: TezMotion(reduced: preferences.reduceMotion || systemReduceMotion)) {
                             if store.supports("native_upgrade_core") {
-                                TezSettingRow(title: "更新内核", detail: "替换处理代理流量的内核版本。") {
-                                    Button("检查更新…", systemImage: "arrow.up.circle") { showCoreUpgrade = true }
+                                TezSettingRow(title: "更新内核", detail: "选择已下载的内核文件，检查后更新。") {
+                                    Button("从文件更新内核…", systemImage: "arrow.up.circle") { showCoreUpgrade = true }
                                         .disabled(store.state != .connected || coreBusy || store.workspaceBusy)
                                 }
                             }
@@ -237,13 +243,13 @@ struct LiveWorkspaceView: View {
                     }
                     if snapshot.core.lifecycle == nil && !LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) {
                         Text("只读连接：当前后台未开放内核控制。")
-                            .font(.caption).foregroundStyle(.secondary).padding(.bottom, 12)
+                            .font(TezType.metadata).foregroundStyle(.secondary).padding(.bottom, 12)
                     }
                     if let coreMessage {
                         LiveCommandFeedback(message: coreMessage, details: coreDetails).padding(.bottom, 12)
                     }
                     if let message = snapshot.core.message {
-                        Text(LiveText.message(message)).font(.caption).foregroundStyle(.secondary)
+                        Text(LiveText.message(message)).font(TezType.metadata).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 12)
                     }
                 }
@@ -259,14 +265,14 @@ struct LiveWorkspaceView: View {
                         LiveMetadataRow(title: "运行来源", value: inspection.source == "service" ? "系统服务" : inspection.source == "process" ? "检测到的进程" : "未确认")
                         ForEach(inspection.processes) { process in
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("\(process.name) · PID \(process.pid)").font(.callout)
-                                Text(process.executable).font(.caption).foregroundStyle(.secondary)
-                                Text("用户 \(process.uid) · 启动于 \(process.startedAt)").font(.caption).foregroundStyle(.secondary)
+                                Text("\(process.name) · PID \(process.pid)").font(TezType.body)
+                                Text(process.executable).font(TezType.metadata).foregroundStyle(.secondary)
+                                Text("用户 \(process.uid) · 启动于 \(process.startedAt)").font(TezType.metadata).foregroundStyle(.secondary)
                             }.textSelection(.enabled).padding(.vertical, 8)
                         }
                     }
                 }
-                .font(.system(size: 13))
+                .font(TezType.body)
             }
             .frame(maxWidth: 700)
             .padding(TezStyle.pageInset)
@@ -428,7 +434,7 @@ private struct LiveMetadataRow: View {
             Spacer(minLength: 8)
             Text(value).multilineTextAlignment(.trailing).textSelection(.enabled)
         }
-        .font(.system(size: 13))
+        .font(TezType.body)
         .padding(.vertical, 15)
     }
 }
@@ -505,9 +511,9 @@ private struct LiveProfilesView: View {
         HStack(spacing: 12) {
             Image(systemName: "doc.on.doc").font(.system(size: 22)).foregroundStyle(TezStyle.accent)
             VStack(alignment: .leading, spacing: 4) {
-                Text("配置与订阅").font(.system(size: 18, weight: .semibold))
+                Text("配置与订阅").font(TezType.page)
                 Text("\(snapshot.profiles.items.filter { $0.type == "remote" || $0.type == "local" }.count) 份配置 · \(snapshot.profiles.items.filter { isEnhancement($0) }.count) 个增强文件")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(TezType.metadata).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
             Button("添加配置", systemImage: "plus") { managementTarget = .create }
@@ -537,7 +543,7 @@ private struct LiveProfilesView: View {
                         ForEach(enhancements) { profileRow($0) }
                     } label: {
                         Text("增强文件（\(enhancements.count)）")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(TezType.body.weight(.medium))
                     }
                     .accessibilityIdentifier("live.profiles.enhancements")
                 }
@@ -555,7 +561,7 @@ private struct LiveProfilesView: View {
             HStack {
                 Text(search.isEmpty ? "\(snapshot.profiles.items.count) 个文件" : "\(filtered.count) 个匹配文件")
                 Spacer()
-            }.font(.system(size: 11)).foregroundStyle(.secondary)
+            }.font(TezType.metadata).foregroundStyle(.secondary)
                 .padding(.horizontal, 14).frame(height: 28)
         }
         .frame(minWidth: 200, idealWidth: 236, maxWidth: 280)
@@ -578,7 +584,7 @@ private struct LiveProfilesView: View {
     private func profileDetails(_ profile: NativeProfileItem) -> some View {
         VStack(alignment: .leading, spacing: 22) {
             VStack(alignment: .leading, spacing: 12) {
-                Text(LiveText.profileName(profile)).font(.system(size: 20, weight: .semibold))
+                Text(LiveText.profileName(profile)).font(TezType.page)
                     .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                 TezStatusLabel(title: profile.uid == snapshot.profiles.current ? "当前配置" : isEnhancement(profile) ? "增强文件" : "非当前配置",
                                tone: profile.uid == snapshot.profiles.current ? .success : .neutral,
@@ -621,7 +627,7 @@ private struct LiveProfilesView: View {
                     TezDetailField(title: "配置标识", value: profile.uid)
                     TezDetailField(title: "读取状态", value: LiveText.state(snapshot.profiles.state))
                 }.padding(.top, 12)
-            }.font(.system(size: 12))
+            }.font(TezType.body)
         }
         .padding(TezStyle.pageInset)
         .frame(maxWidth: 700, alignment: .leading)
@@ -658,7 +664,7 @@ private struct LiveRoutesView: View {
     @State private var switchMessage: String?
     @State private var switchDetails: String?
     @State private var switchTone: TezTone = .neutral
-    @State private var latency = NativeLatencyModel()
+    let latency: NativeLatencyModel
     @State private var latencyURL = "https://www.gstatic.com/generate_204"
     @State private var latencyTimeout = 5000
     @State private var showsChains = false
@@ -666,6 +672,9 @@ private struct LiveRoutesView: View {
     @State private var comparison = NativeRouteComparisonSelection()
     @State private var showsComparison = false
     @State private var measurementEmphasis: Set<String> = []
+    @State private var showsSampler = false
+    @State private var switchChange: NativeRouteSwitchChange?
+    @State private var samplerState = NativeRouteSamplerState()
 
     private var supportsSelection: Bool { store.supports("native_select_route") }
     private var motion: TezMotion { TezMotion(reduced: preferences.reduceMotion || systemReduceMotion) }
@@ -678,12 +687,9 @@ private struct LiveRoutesView: View {
             && rows.filter { $0.member.name == selected.member.name }.count == 1
     }
 
+    private var mode: String? { snapshot.network?.mode.state == "ready" ? snapshot.network?.mode.value : nil }
     private var groups: [NativeProxyGroup] {
-        guard let view = snapshot.proxyView else { return [] }
-        if let global = view.global, !view.groups.contains(where: { $0.name == global.name }) {
-            return [global] + view.groups
-        }
-        return view.groups
+        snapshot.proxyView.map { NativeRoutePresentation.groups(in: $0, mode: mode) } ?? []
     }
     private var group: NativeProxyGroup? { groups.first { $0.name == groupName } ?? groups.first }
     private var rows: [LiveRouteMember] {
@@ -704,27 +710,34 @@ private struct LiveRoutesView: View {
     private var comparisonRows: [LiveRouteMember] {
         comparison.ids.compactMap { id in rows.first { $0.id == id } }
     }
-
     var body: some View {
         if let view = snapshot.proxyView {
             GeometryReader { geometry in
+                let compact = geometry.size.width < 700 || geometry.size.height < 560
                 VStack(spacing: 0) {
-                    currentRail(compact: geometry.size.width < 700)
+                    groupContext(compact: compact)
                     Divider()
-                    filterBar(view)
+                    filterBar
                     Divider()
                     if view.providerState == "unavailable" {
                         HStack {
                             Label("订阅提供方数据不可用", systemImage: "exclamationmark.circle")
                             Spacer()
                         }
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(TezType.metadata).foregroundStyle(.secondary)
                         .padding(.horizontal, TezStyle.pageInset).padding(.vertical, 9)
                         .background(Color(nsColor: .controlBackgroundColor))
                     }
-                    routeList(showProtocol: preferences.showProtocol && geometry.size.width >= 700)
+                    TezInspectorLayout(isPresented: selected != nil, selectionID: selectedID, reservesBottomSpace: true,
+                                       bottomHeight: (compact ? 56 : 88) + (switchMessage != nil || latency.error != nil ? 96 : 0),
+                                       motion: motion) {
+                        routeList(showProtocol: preferences.showProtocol && geometry.size.width >= 700)
+                            .background(TezTableSelectionVisibility(selectionID: selectedID))
+                    } inspector: { side in
+                        if side { sideInspector } else { detailRail(compact: compact) }
+                    }
                     Divider()
-                    detailRail
+                    routeFooter
                 }
             }
             .onChange(of: group?.name) { _, _ in
@@ -732,13 +745,22 @@ private struct LiveRoutesView: View {
                 switchMessage = nil
                 switchDetails = nil
                 comparison.clear()
+                switchChange = nil
+                showsSampler = false
+                samplerState.reset()
             }
             .sheet(isPresented: $showsChains) { NativeProxyChainView(store: store) }
             .sheet(isPresented: $showsComparison) { comparisonSheet }
-            .onChange(of: rows.map(\.id)) { _, ids in comparison.retain(Set(ids)) }
+            .onChange(of: rows.map(\.id)) { _, ids in
+                comparison.retain(Set(ids))
+            }
+            .onChange(of: mode) { _, _ in groupName = nil }
             .onChange(of: snapshot.profiles.current) { _, _ in
                 comparison.clear()
-                latency = NativeLatencyModel()
+                groupName = nil
+                selectedID = nil
+                switchChange = nil
+                samplerState.reset()
             }
             .onChange(of: latency.measuredAt) { old, new in
                 measurementEmphasis = Set(new.keys.filter { old[$0] != new[$0] })
@@ -750,8 +772,13 @@ private struct LiveRoutesView: View {
                 measurementEmphasis = []
             }
             .onChange(of: selectedID) { _, _ in
-                switchMessage = nil
-                switchDetails = nil
+                if !switching {
+                    switchMessage = nil
+                    switchDetails = nil
+                    switchChange = nil
+                }
+                showsSampler = false
+                samplerState.reset()
             }
             .task {
                 guard store.supports("native_get_settings"), let response = try? await store.request("native_get_settings"),
@@ -769,58 +796,24 @@ private struct LiveRoutesView: View {
         }
     }
 
-    private func currentRail(compact: Bool) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
-                .font(.system(size: 23, weight: .regular)).foregroundStyle(TezStyle.accent)
-                .frame(width: 32)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(LiveText.name(group?.now ?? "", fallback: "未提供"))
-                    .font(.system(size: 18, weight: .semibold))
-                    .lineLimit(2).help(group?.now ?? "后台未提供当前选择")
-                    .contentTransition(.opacity)
-                    .animation(motion.feedback, value: group?.now)
-                TezStatusLabel(title: store.state == .connected ? "当前线路" : "上次同步的线路",
-                               tone: store.state == .connected ? .success : .neutral,
-                               symbol: store.state == .connected ? "checkmark.circle.fill" : "clock", motion: motion)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if !compact {
-                VStack(alignment: .trailing, spacing: 5) {
-                    Text(group.map { LiveText.groupType($0.type) } ?? "独立线路").font(.system(size: 12, weight: .medium))
-                    Text("\(rows.count) 个成员").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-        }
-        .padding(.horizontal, TezStyle.pageInset)
-        .frame(height: 72)
-        .background { TezContentMaterial(material: .headerView) }
+    private func groupContext(compact: Bool) -> some View {
+        NativeRouteContextHeader(groups: groups, group: group, groupName: $groupName, mode: mode,
+                                 groupType: group.map { LiveText.groupType($0.type) } ?? "独立线路",
+                                 currentName: NativeRoutePresentation.title(LiveText.name(group?.now ?? "", fallback: "后台未提供当前选择")),
+                                 previewName: selected.flatMap { $0.isCurrent ? nil : $0.name },
+                                 change: switchChange, changeTone: switchTone, connected: store.state == .connected,
+                                 switching: switching, compact: compact, motion: motion)
     }
 
-    private func filterBar(_ view: NativeProxyView) -> some View {
-        HStack(spacing: 12) {
+    private var filterBar: some View {
+        HStack(spacing: 16) {
+          HStack(spacing: 8) {
             TezSearchField(prompt: "搜索线路", text: $search, identifier: "live.routes.search",
                            surface: Color(nsColor: .textBackgroundColor))
-            .frame(maxWidth: .infinity)
-            if !groups.isEmpty {
-                Picker("策略组", selection: Binding(get: { group?.name ?? "" }, set: { groupName = $0 })) {
-                    ForEach(groups) { item in Text(LiveText.name(item.name, fallback: "未命名策略组")).tag(item.name) }
-                }
-                .labelsHidden().pickerStyle(.menu)
-                .frame(maxWidth: 180)
-                .help("查看策略组，不更改后台选择")
-                .accessibilityIdentifier("live.routes.group")
-            }
-            Button("对比线路", systemImage: comparison.ids.isEmpty ? "square.split.2x2" : "square.split.2x2.fill") {
-                showsComparison = true
-            }
-            .labelStyle(.iconOnly).help("对比线路（\(comparison.ids.count)/3）")
-            .accessibilityValue("\(comparison.ids.count) 条候选线路")
-            .accessibilityIdentifier("live.routes.compare")
-            Button("链式代理", systemImage: "link") { showsChains = true }
-                .labelStyle(.iconOnly).help("链式代理管理")
-                .disabled(!store.supports("native_get_proxy_chains"))
-                .accessibilityIdentifier("live.routes.chains")
+            .frame(minWidth: 130, maxWidth: 360)
+          }
+          Spacer(minLength: 0)
+          HStack(spacing: 8) {
             if latency.busy {
                 ProgressView(value: Double(latency.completed), total: Double(max(1, latency.total))).frame(width: 54)
                 Button("停止测速", systemImage: "stop.fill") { latency.stopAfterCurrentBatch() }
@@ -830,8 +823,29 @@ private struct LiveRoutesView: View {
                     .disabled(!canTest(visibleRows))
                     .help("测试当前筛选结果的延迟，不切换线路")
             }
+          }
+          .frame(width: 94, alignment: .trailing)
+          HStack(spacing: 8) {
+            Button("对比线路", systemImage: comparison.ids.isEmpty ? "square.split.2x2" : "square.split.2x2.fill") {
+                showsComparison = true
+            }
+            .labelStyle(.iconOnly).help("对比线路（\(comparison.ids.count)/3）")
+            .accessibilityValue("\(comparison.ids.count) 条候选线路")
+            .accessibilityIdentifier("live.routes.compare")
+            .overlay(alignment: .topTrailing) {
+                if !comparison.ids.isEmpty {
+                    Text("\(comparison.ids.count)").font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 3).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 3))
+                        .offset(x: 4, y: -5).allowsHitTesting(false).accessibilityHidden(true)
+                }
+            }
+            Button("链式代理", systemImage: "link") { showsChains = true }
+                .labelStyle(.iconOnly).help("链式代理管理")
+                .disabled(!store.supports("native_get_proxy_chains"))
+                .accessibilityIdentifier("live.routes.chains")
+          }
         }
-        .font(.system(size: 13))
+        .font(TezType.body)
         .padding(.horizontal, TezStyle.pageInset)
         .frame(height: 48)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -863,12 +877,12 @@ private struct LiveRoutesView: View {
                 }
             }
         }
-        .font(.system(size: 13))
+        .font(TezType.body)
         .accessibilityIdentifier("live.routes.table")
         .contextMenu(forSelectionType: String.self) { ids in
             if let id = ids.first, let row = visibleRows.first(where: { $0.id == id }) {
                 if row.member.kind == "group", groups.contains(where: { $0.name == row.member.name }) {
-                    Button("查看策略组", systemImage: "rectangle.3.group") { groupName = row.member.name }
+                    Button("查看子分组", systemImage: "rectangle.3.group") { groupName = row.member.name }
                 }
                 Button("复制名称", systemImage: "doc.on.doc") {
                     NSPasteboard.general.clearContents()
@@ -893,7 +907,7 @@ private struct LiveRoutesView: View {
     }
 
     private var routeNameColumn: some TableColumnContent<LiveRouteMember, Never> {
-        TableColumn("线路名称") { (row: LiveRouteMember) in
+        TableColumn("线路 / 子分组") { (row: LiveRouteMember) in
             Text(row.name).lineLimit(1).help(row.name)
         }.width(min: 150, ideal: 300)
     }
@@ -913,11 +927,16 @@ private struct LiveRoutesView: View {
     }
 
     private var routeStatusColumn: some TableColumnContent<LiveRouteMember, Never> {
-        TableColumn("状态") { (row: LiveRouteMember) in
-            TezStatusLabel(title: row.isCurrent && store.state != .connected ? "上次使用" : row.status,
+        TableColumn("分组状态") { (row: LiveRouteMember) in
+         Group {
+          if row.isCurrent || !row.isResolved || row.member.kind == "group" {
+            TezStatusLabel(title: row.isCurrent && store.state != .connected ? "上次选择" : row.status,
                            tone: row.isCurrent && row.isResolved && store.state == .connected ? .success : .neutral,
                            symbol: row.isCurrent && row.isResolved ? "checkmark.circle.fill" : nil, motion: motion,
                            inheritsForeground: true)
+                .transition(.opacity)
+          }
+         }.animation(motion.feedback, value: row.isCurrent)
         }.width(110).alignment(.trailing)
     }
 
@@ -930,12 +949,15 @@ private struct LiveRoutesView: View {
     }
 
     private func measurementLabel(_ row: LiveRouteMember) -> some View {
-        TimelineView(.periodic(from: .now, by: 60)) { _ in
-            Text(row.measurement.origin == .none ? "未测速"
-                 : "\(row.measurement.originLabel) · \(row.measurement.relativeAge(at: Date()))")
-                .font(.system(size: 10)).lineLimit(1)
-                .help("\(row.measurement.originLabel)：\(row.measurement.exactTime)")
-                .accessibilityLabel("\(row.measurement.originLabel)，\(row.measurement.exactTime)")
+        Group {
+            if row.measurement.origin != .none {
+                TimelineView(.periodic(from: .now, by: 60)) { _ in
+                    Text("\(row.measurement.originLabel) · \(row.measurement.relativeAge(at: Date()))")
+                        .font(TezType.metadata).lineLimit(1)
+                        .help("\(row.measurement.originLabel)：\(row.measurement.exactTime)")
+                        .accessibilityLabel("\(row.measurement.originLabel)，\(row.measurement.exactTime)")
+                }
+            }
         }
     }
 
@@ -947,12 +969,12 @@ private struct LiveRoutesView: View {
     private var comparisonSheet: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
-                Text("线路对比").font(.system(size: 18, weight: .semibold))
-                Text("\(comparisonRows.count) / 3").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                Text("线路对比").font(TezType.page)
+                Text("\(comparisonRows.count) / 3").font(TezType.metadata).foregroundStyle(.secondary).monospacedDigit()
                 Spacer()
                 Menu {
                     ForEach(rows.filter { !comparison.contains($0.id) }) { row in
-                        Button(row.isCurrent ? "当前线路 · \(row.name)" : row.name) { comparison.add(row.id) }
+                        Button(row.isCurrent ? "此组已选 · \(row.name)" : row.name) { comparison.add(row.id) }
                     }
                 } label: {
                     Label("添加候选", systemImage: "plus")
@@ -988,9 +1010,9 @@ private struct LiveRoutesView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("测速地址：\(latencyURL)").lineLimit(1).help(latencyURL)
                         Text("延迟不代表端到端连接状态。")
-                        Text("切换此策略组的线路可能中断连接。")
+                        Text("更改此分组的选择可能中断相关连接。")
                     }
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(TezType.metadata).foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                     if latency.busy {
                         ProgressView(value: Double(latency.completed), total: Double(max(1, latency.total)))
@@ -1027,7 +1049,7 @@ private struct LiveRoutesView: View {
                                 .labelStyle(.iconOnly).help("移出对比：\(row.name)")
                                 .accessibilityIdentifier("live.routes.compare.remove.\(row.id)")
                         }
-                        TezStatusLabel(title: row.isCurrent && store.state != .connected ? "上次使用" : row.status,
+                        TezStatusLabel(title: row.isCurrent && store.state != .connected ? "上次选择" : row.status,
                                        tone: row.isCurrent && store.state == .connected ? .success : .neutral, motion: motion)
                     }
                     .frame(width: width, alignment: .leading)
@@ -1050,7 +1072,7 @@ private struct LiveRoutesView: View {
                 ForEach(candidates) { row in
                     VStack(alignment: .leading, spacing: 5) {
                         measurementLabel(row)
-                        Text(row.measurement.exactTime).font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text(row.measurement.exactTime).font(TezType.metadata).foregroundStyle(.secondary)
                             .lineLimit(3).textSelection(.enabled)
                     }
                     .frame(width: width, alignment: .leading)
@@ -1072,18 +1094,24 @@ private struct LiveRoutesView: View {
             GridRow {
                 Color.clear.frame(width: 72, height: 1).accessibilityHidden(true)
                 ForEach(candidates) { row in
-                    Button(row.isCurrent ? "当前线路" : "切换线路", systemImage: row.isCurrent ? "checkmark" : "arrow.right") {
+                    let waiting = switching && switchChange?.group == group?.name && switchChange?.target == row.member.name
+                    Button {
                         guard let group else { return }
                         switchRoute(row, in: group)
+                    } label: {
+                        routeSelectionLabel(isCurrent: row.isCurrent, waiting: waiting)
+                            .opacity(waiting ? 0 : 1)
                     }
                     .disabled(!canSwitch(to: row))
-                    .help(row.isCurrent ? "这条线路已经是当前线路" : "切换到 \(row.name)，现有连接可能中断")
+                    .overlay { routeSelectionProgress(waiting: waiting) }
+                    .accessibilityLabel(routeSelectionTitle(isCurrent: row.isCurrent, waiting: waiting))
+                    .help(waiting ? "等待后台确认切换到 \(row.name)" : row.isCurrent ? "此分组已经选中该成员" : "将此分组切换到 \(row.name)，相关连接可能中断")
                     .accessibilityIdentifier("live.routes.compare.select.\(row.id)")
                     .frame(width: width, alignment: .leading)
                 }
             }
         }
-        .font(.system(size: 12))
+        .font(TezType.body)
     }
 
     private func canTest(_ candidates: [LiveRouteMember]) -> Bool {
@@ -1091,11 +1119,12 @@ private struct LiveRoutesView: View {
             && !latency.busy && !switching && !testable(candidates).isEmpty
     }
 
-    private var detailRail: some View {
+    private func detailRail(compact: Bool) -> some View {
+      ScrollView {
         VStack(spacing: 0) {
-            routeDetails
+            routeDetails(compact: compact)
                 .padding(.horizontal, TezStyle.pageInset)
-                .frame(height: 88)
+                .frame(height: compact ? 56 : 88)
             if switchMessage != nil || latency.error != nil {
                 VStack(alignment: .leading, spacing: 8) {
                     if let switchMessage {
@@ -1108,8 +1137,13 @@ private struct LiveRoutesView: View {
                 .padding(.horizontal, TezStyle.pageInset).padding(.bottom, 12)
                 .transition(.opacity)
             }
-            Divider()
-            HStack(spacing: 16) {
+        }
+      }
+      .background { TezContentMaterial(material: .contentBackground) }
+    }
+
+    private var routeFooter: some View {
+        HStack(spacing: 16) {
                 Text(search.isEmpty ? "\(rows.count) 个成员" : "\(visibleRows.count) / \(rows.count) 个成员")
                 Spacer()
                 if latency.total > 0 {
@@ -1118,42 +1152,101 @@ private struct LiveRoutesView: View {
                 }
                 if !supportsSelection { Label("只读", systemImage: "eye") }
             }
-            .font(.system(size: 11)).foregroundStyle(.secondary)
+            .font(TezType.metadata).foregroundStyle(.secondary)
             .padding(.horizontal, TezStyle.pageInset)
             .frame(height: 28)
-        }
-        .background { TezContentMaterial(material: .contentBackground) }
-        .animation(motion.layout, value: switchMessage != nil)
-        .animation(motion.layout, value: latency.error != nil)
     }
 
-    private var routeDetails: some View {
+    private var sideInspector: some View {
+      VStack(spacing: 0) {
+        ScrollView {
+            if let row = selected {
+                VStack(alignment: .leading, spacing: 24) {
+                  VStack(alignment: .leading, spacing: 6) {
+                    TezInspectorHeader(title: row.name, titleFont: TezType.itemTitle) { selectedID = nil }
+                    TezStatusLabel(title: row.isCurrent ? (store.state == .connected ? "此组已选" : "上次选择") : "仅查看，尚未切换",
+                                   tone: row.isCurrent && store.state == .connected ? .success : .neutral, motion: motion)
+                  }
+                  VStack(alignment: .leading, spacing: 8) {
+                    TezDetailField(title: "协议 / 类型", value: row.type)
+                    TezDetailField(title: "来源", value: row.source)
+                  }
+                    sampler(row)
+                    DisclosureGroup("线路详情") {
+                        TezDetailField(title: "UDP", value: row.udp.map { $0 ? "支持" : "不支持" } ?? "未提供")
+                            .padding(.top, 8)
+                        TezDetailField(title: row.measurement.originLabel, value: row.measurement.exactTime)
+                            .padding(.top, 8)
+                    }
+                    .font(TezType.metadata)
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(maxHeight: .infinity)
+        Divider()
+        VStack(alignment: .leading, spacing: 8) {
+            routeActions(showsSample: false)
+            Text("更改此分组的选择可能中断相关连接。")
+                .font(TezType.metadata).foregroundStyle(.secondary)
+            if let switchMessage { LiveCommandFeedback(message: switchMessage, details: switchDetails, tone: switchTone) }
+            if let error = latency.error { TezOperationFeedback(message: error, tone: .error) }
+        }
+        .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("live.routes.actionRail")
+      }
+        .background { TezContentMaterial(material: .contentBackground) }
+        .accessibilityIdentifier("live.routes.sideInspector")
+    }
+
+    private func routeDetails(compact: Bool) -> some View {
         HStack(spacing: 20) {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 8) {
-                    Text(selected == nil ? "未选择线路" : "查看中")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                    if selected?.isCurrent == true {
-                        TezStatusLabel(title: store.state == .connected ? "当前线路" : "上次使用",
-                                       tone: store.state == .connected ? .success : .neutral, motion: motion)
+            VStack(alignment: .leading, spacing: compact ? 5 : 7) {
+                if !compact {
+                    HStack(spacing: 8) {
+                        Text(selected == nil ? "未选择线路" : "查看中")
+                            .font(TezType.metadata).foregroundStyle(.secondary)
+                        if selected?.isCurrent == true {
+                            TezStatusLabel(title: store.state == .connected ? "此组已选" : "上次选择",
+                                           tone: store.state == .connected ? .success : .neutral, motion: motion)
+                        }
                     }
                 }
                 if let row = selected {
-                    Text(row.name).font(.system(size: 14, weight: .semibold))
-                        .lineLimit(2).help(row.name).textSelection(.enabled)
-                    Text("\(row.type) · \(row.source) · UDP \(row.udp.map { $0 ? "支持" : "不支持" } ?? "未提供")")
-                        .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+                    Text(row.name).font(TezType.itemTitle)
+                        .lineLimit(compact ? 1 : 2).help(row.name).textSelection(.enabled)
+                    Text(compact ? "\(row.isCurrent ? (store.state == .connected ? "此组已选" : "上次选择") : "仅查看") · \(row.type) · \(row.source)"
+                         : "\(row.type) · \(row.source) · UDP \(row.udp.map { $0 ? "支持" : "不支持" } ?? "未提供")")
+                        .font(TezType.body).foregroundStyle(.secondary).lineLimit(1)
                         .help("\(row.source)\n\(row.measurement.originLabel)：\(row.measurement.exactTime)")
                 } else {
-                    Text(supportsSelection ? "尚无待切换的线路" : "当前后台未开放线路切换")
-                        .font(.system(size: 13)).foregroundStyle(.secondary)
+                    Text(supportsSelection ? "选择线路以查看详情" : "当前后台未开放线路切换")
+                        .font(TezType.body).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityIdentifier("live.routes.preview")
-            HStack(spacing: 8) {
-                if switching { ProgressView().controlSize(.small) }
+            routeActions(showsSample: selected != nil)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func routeActions(showsSample: Bool) -> some View {
+        HStack(spacing: 8) {
                 if let selected {
+                    if showsSample {
+                        Button("延迟采样", systemImage: "waveform.path") { showsSampler.toggle() }
+                            .labelStyle(.iconOnly).help("查看真实延迟采样与保持读数")
+                            .accessibilityIdentifier("live.routes.sample.open")
+                            .popover(isPresented: $showsSampler, arrowEdge: .bottom) {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Text(selected.name).font(TezType.itemTitle).lineLimit(2).help(selected.name)
+                                    sampler(selected, compact: true)
+                                }
+                                .padding(16).frame(width: 300)
+                            }
+                    }
                     Button(comparison.contains(selected.id) ? "移出对比" : "加入对比",
                            systemImage: comparison.contains(selected.id) ? "pin.fill" : "pin") {
                         toggleComparison(selected)
@@ -1163,15 +1256,61 @@ private struct LiveRoutesView: View {
                     .disabled(!comparison.contains(selected.id) && comparison.isFull)
                     .accessibilityIdentifier("live.routes.pin")
                 }
-                Button(switching ? "正在切换" : "切换线路", systemImage: "arrow.right") { switchRoute() }
+                Button { switchRoute() } label: {
+                    routeSelectionLabel(isCurrent: selected?.isCurrent == true, waiting: switching)
+                        .opacity(switching ? 0 : 1)
+                }
                     .modifier(TezPrimaryActionStyle())
                     .disabled(!canSwitch)
+                    .overlay { routeSelectionProgress(waiting: switching) }
+                    .accessibilityLabel(routeSelectionTitle(isCurrent: selected?.isCurrent == true, waiting: switching))
                     .help(switchHelp)
                     .accessibilityIdentifier("live.routes.select")
             }
             .fixedSize()
+    }
+
+    private func routeSelectionLabel(isCurrent: Bool, waiting: Bool) -> some View {
+        HStack(spacing: 8) {
+            Group {
+                if waiting { ProgressView().controlSize(.small) }
+                else {
+                    Image(systemName: isCurrent ? (store.state == .connected ? "checkmark.circle" : "clock") : "arrow.right")
+                        .contentTransition(motion.symbol)
+                }
+            }.frame(width: 14, height: 14)
+            Text(routeSelectionTitle(isCurrent: isCurrent, waiting: waiting))
+                .font(TezType.body).frame(width: 78)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(motion.feedback, value: isCurrent)
+        .animation(motion.feedback, value: waiting)
+    }
+
+    private func routeSelectionTitle(isCurrent: Bool, waiting: Bool) -> String {
+        waiting ? "等待确认" : isCurrent ? (store.state == .connected ? "此组已选" : "上次选择") : "切换此分组"
+    }
+
+    private func routeSelectionProgress(waiting: Bool) -> some View {
+        // Pending status stays outside the disabled control to retain readable contrast.
+        Group {
+            if waiting {
+                routeSelectionLabel(isCurrent: false, waiting: true)
+                    .foregroundStyle(.primary)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                    .transition(.opacity)
+            }
+        }
+        .animation(motion.feedback, value: waiting)
+    }
+
+    private func sampler(_ row: LiveRouteMember, compact: Bool = false) -> some View {
+        let session = latency.samples[row.member.name] ?? []
+        return NativeRouteSampler(state: samplerState, samples: session.isEmpty ? row.samples : session,
+                                  origin: session.isEmpty ? row.measurement.originLabel : "本次会话",
+                                  testing: latency.testing.contains(row.member.name), canSample: canTest([row]),
+                                  testURL: latencyURL, motion: motion, compact: compact) { testLatency([row]) }
+            .id(row.id)
     }
 
     private var switchHelp: String {
@@ -1180,9 +1319,9 @@ private struct LiveRoutesView: View {
         if switching { return "等待后台确认切换结果" }
         if store.workspaceBusy || latency.busy { return "当前操作完成后可以切换线路" }
         guard let selected else { return "尚未选择线路" }
-        if selected.isCurrent { return "这条线路已经是当前线路" }
-        if !canSwitch { return "当前策略组或成员不支持手动切换" }
-        return "切换到 \(selected.name)，现有连接可能中断"
+        if selected.isCurrent { return "此分组已经选中该成员" }
+        if !canSwitch { return "此分组或成员不支持手动切换" }
+        return "将「\(NativeRoutePresentation.title(group?.name ?? ""))」切换到「\(selected.name)」，相关连接可能中断"
     }
 
     private func switchRoute() {
@@ -1194,6 +1333,8 @@ private struct LiveRoutesView: View {
         guard canSwitch(to: selected) else { return }
         let profileID = snapshot.profiles.current
         switching = true
+        switchChange = NativeRouteSwitchChange(group: group.name, target: selected.member.name)
+        switchTone = .neutral
         switchMessage = nil
         switchDetails = nil
         Task { @MainActor in
@@ -1207,6 +1348,7 @@ private struct LiveRoutesView: View {
                       case .bool(let persisted) = value["persisted"] else {
                     throw BackendWireError.invalid("Invalid native_select_route response")
                 }
+                switchChange?.outcome = applied ? .applied : .notApplied
                 let cleanupIncomplete: Bool
                 if case .object(let cleanup) = value["connectionCleanup"] {
                     cleanupIncomplete = cleanup["requested"] == .bool(true) && cleanup["completed"] != .bool(true)
@@ -1216,25 +1358,26 @@ private struct LiveRoutesView: View {
                 if applied && cleanupIncomplete {
                     switchTone = .warning
                     switchMessage = persisted
-                        ? "线路已切换并保存，但部分旧连接未能关闭。请检查详情。"
-                        : "线路已切换，但选择保存和旧连接清理未完成。请检查详情。"
+                        ? "「\(NativeRoutePresentation.title(group.name))」已切换并保存，但部分旧连接未能关闭。请检查详情。"
+                        : "「\(NativeRoutePresentation.title(group.name))」已切换，但选择保存和旧连接清理未完成。请检查详情。"
                 } else if applied && persisted {
                     switchTone = .success
-                    switchMessage = "已切换到 \(selected.name)，选择已保存。"
+                    switchMessage = "「\(NativeRoutePresentation.title(group.name))」已选择 \(selected.name)，选择已保存。"
                 } else if applied {
                     switchTone = .warning
-                    switchMessage = "线路已切换，但选择未保存。请检查详情；重新启动后此选择可能丢失。"
+                    switchMessage = "「\(NativeRoutePresentation.title(group.name))」已切换，但选择未保存；重新启动后可能丢失。"
                 } else {
                     switchTone = .error
-                    switchMessage = "线路未切换。请检查详情和当前线路。"
+                    switchMessage = "「\(NativeRoutePresentation.title(group.name))」未切换，保留原选择。请检查详情与后台状态。"
                 }
                 if applied {
                     preferences.recordRoute(profileID: profileID, group: group.name, name: selected.member.name)
                 }
                 switchDetails = LiveCommandFeedback.render(result)
             } catch {
+                switchChange?.outcome = .unconfirmed
                 switchTone = .error
-                switchMessage = "切换请求失败。请检查详情和当前线路；不会自动重试。"
+                switchMessage = "「\(NativeRoutePresentation.title(group.name))」切换请求失败。请核对后台选择；不会自动重试。"
                 switchDetails = LiveCommandFeedback.errorDetails(error)
             }
             store.refresh()
@@ -1270,7 +1413,7 @@ struct LiveRouteMember: Identifiable {
     var measuredLatency: NativeLatencyPayload.Result? = nil
     var sessionMeasuredAt: Date? = nil
     var id: String { "\(index):\(member.kind):\(member.recordId ?? member.name)" }
-    var name: String { LiveText.name(member.name, fallback: member.kind == "group" ? "未命名策略组" : "未命名线路") }
+    var name: String { NativeRoutePresentation.title(LiveText.name(member.name, fallback: member.kind == "group" ? "未命名分组" : "未命名线路")) }
     private var node: NativeProxyNode? {
         guard member.kind == "node", let id = member.recordId else { return nil }
         return view.records[id]
@@ -1280,9 +1423,16 @@ struct LiveRouteMember: Identifiable {
         return view.groups.first { $0.name == member.name } ?? (view.global?.name == member.name ? view.global : nil)
     }
     var isResolved: Bool { node != nil || group != nil }
-    var type: String { node?.type ?? group.map { "策略组 · \(LiveText.groupType($0.type))" } ?? "未解析" }
+    var type: String { node?.type ?? group.map { "分组 · \(LiveText.groupType($0.type))" } ?? "未解析" }
     var udp: Bool? { node?.udp ?? group?.udp }
-    private var latest: NativeDelayHistory? { (node?.history ?? group?.history ?? []).last }
+    private var history: [NativeDelayHistory] { node?.history ?? group?.history ?? [] }
+    private var latest: NativeDelayHistory? { history.last }
+    var samples: [NativeLatencySample] {
+        history.suffix(20).map {
+            NativeLatencySample(date: NativeRouteMeasurement(sessionDate: nil, snapshotTime: $0.time).date,
+                                delay: $0.delay > 0 ? $0.delay : nil)
+        }
+    }
     var sortDelay: UInt64? {
         if let measuredLatency {
             guard measuredLatency.error == nil, let delay = measuredLatency.delay, delay > 0 else { return nil }
@@ -1300,11 +1450,11 @@ struct LiveRouteMember: Identifiable {
         if let node {
             return node.source.providerName ?? (node.source.kind == "core" ? "内核" : node.source.kind)
         }
-        return member.kind == "group" ? "策略组" : "未提供"
+        return member.kind == "group" ? "分组" : "未提供"
     }
     var status: String {
-        if isResolved && isCurrent { return "使用中" }
-        if isResolved { return member.kind == "group" ? "嵌套策略组" : "线路" }
+        if isResolved && isCurrent { return "此组已选" }
+        if isResolved { return member.kind == "group" ? "子分组" : "线路" }
         switch member.reason {
         case "provider-unavailable": return "提供方不可用"
         case "ambiguous": return "同名，未解析"
