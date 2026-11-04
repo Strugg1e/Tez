@@ -1,24 +1,20 @@
-# Tez Core Service Extension
+# Tez Core Service
 
-Based on clash-verge-service-ipc v2.7.6, commit
-`b2a7427d6681c8d3780ab83a73f4dc21da2f22d6` from
-https://github.com/clash-verge-rev/clash-verge-service-ipc.
-Upstream authorship and GPL-3.0 licensing are preserved. The library name and
-in-process API remain source-compatible. Tez production uses its own service
-identity (`app.tez.service`), executable (`tez-service`), IPC directory and state
-directory. It does not discover or control the old production service socket.
-Moving a running legacy core requires a separately approved service cutover;
-building or testing this source performs no such cutover.
+Based on [clash-verge-service-ipc](https://github.com/clash-verge-rev/clash-verge-service-ipc) v2.7.6, commit `b2a7427d6681c8d3780ab83a73f4dc21da2f22d6`, under the [GPL-3.0 license](LICENSE).
 
-Protocol 2.6 adds explicit session recovery, compare-and-claim ownership and
-verified, separately approved core upgrades with rollback. None of these routes
-is called automatically against a running legacy service.
+## Tez Integration
 
-Local modifications: Tez lifecycle, receipt/package clients, digest-bound version
-staging and isolated acceptance, 2026-10-29. The extension is advertised for macOS.
+| Surface | Value |
+| --- | --- |
+| macOS service identifier | `app.tez.service` |
+| Executable | `tez-service` |
+| Controller socket | `/var/run/tez-service/service.sock` |
+| Protocol | 2.6 |
 
-The `test` feature disables system-proxy effects. Unit tests retain upstream's
-test-only paths. `TEZ_SERVICE_TEST_ROOT` puts acceptance IPC, state and the core
-execution lock below one new private directory; production builds ignore it.
-Never package or install a test-feature binary.
-This source copy does not install, launch or replace a service.
+The extension adds owner sessions, runtime staging, recovery, compare-and-claim control, verified core upgrades with rollback, and session-only protection. Explicit capability fields advertise the supported extensions.
+
+## Tests
+
+The `test` feature uses isolated state and excludes system-proxy effects. `TEZ_SERVICE_TEST_ROOT` selects a private acceptance directory containing the sockets, state, and execution lock. The acceptance channel uses its own service identifier and paths.
+
+Build, packaging, and test commands are in [the native guide](../README.md).

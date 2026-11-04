@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "contractDigest": "34b5c1cf1bb5f5fec44a5765395c70a998bdf8ba0edfb2b0a40407c886c9de92",
+  "contractDigest": "d997d11dcc60e9a2ffde34d79f68b743dbd4ae8f2cc87f111a3c9d8f54903c11",
   "entries": {
     "command:apply_dns_config": {
       "status": "pending",

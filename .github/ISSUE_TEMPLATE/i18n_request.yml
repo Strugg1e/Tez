@@ -50,9 +50,9 @@ body:
       required: true
 
   - type: input
-    id: verge-version
+    id: tez-version
     attributes:
-      label: 软件版本 / CVR Version
-      description: 请提供你使用的 CVR 具体版本 / Please provide the specific version of CVR you are using
+      label: 软件版本 / Tez Version
+      description: Tez 的版本号和构建号 / Tez version and build number
     validations:
       required: true

@@ -1,6 +1,6 @@
-# CONTRIBUTING — i18n
+# Tez Localization
 
-Thanks for helping localize Clash Verge Rev. This guide reflects the current architecture, where the React frontend and the Tauri backend keep their translation bundles separate. Follow the steps below to keep both sides in sync without stepping on each other.
+The React/Tauri client and shared Rust modules keep their translation bundles separate. The SwiftUI/AppKit interface lives in `native/Sources/TezNative`.
 
 ## Quick workflow
 

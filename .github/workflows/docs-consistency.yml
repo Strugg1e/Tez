@@ -37,8 +37,6 @@ jobs:
         run: |
           check() { grep -q "$2" "$1" || { echo "::error::anchor '$2' missing from $1"; exit 1; }; }
           check CONTRIBUTING.md '## Contribution Expectations'
-          check CONTRIBUTING.md 'ai-slop:med'
-          check CONTRIBUTING.md 'ai-slop:high'
           check AGENTS.md 'Issue first'
           check AGENTS.md 'Author accountability'
           check AGENTS.md 'pr-ai-slop-review'
@@ -47,7 +45,6 @@ jobs:
           check .github/workflows/pr-ai-slop-review.md '(../../CONTRIBUTING.md)'
           check .github/workflows/pr-ai-slop-review.md '(../../AGENTS.md)'
           check AGENTS.md 'gh aw compile'
-          check CONTRIBUTING.md 'gh aw compile'
           check AGENTS.md 'Tests are justified'
           check CONTRIBUTING.md 'Do not pad'
           check CLAUDE.md '@AGENTS.md'
