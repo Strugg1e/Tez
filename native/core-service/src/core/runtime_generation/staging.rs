@@ -164,7 +164,10 @@ pub(crate) async fn stage_runtime(
     };
 
     let core = validate_core_path(&bundle.core_path)?;
-    if Path::new(&running.core_config.core_path) != core.executable() {
+    let executable = core.executable().to_path_buf();
+    #[cfg(target_os = "macos")]
+    let executable = CORE_MANAGER.lock().await.protected_core_for(&executable).await.unwrap_or(executable);
+    if Path::new(&running.core_config.core_path) != executable {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CorePathChanged,
         });

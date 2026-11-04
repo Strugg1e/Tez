@@ -136,6 +136,8 @@ pub(crate) fn active_service_supports_runtime_file_read() -> bool {
 
 pub(crate) fn clear_active_service_session() {
     ACTIVE_SERVICE_SESSION.lock().take();
+    #[cfg(target_os = "macos")]
+    clash_verge_service_ipc::set_session_core_ipc_path(None);
 }
 
 #[cfg(all(feature = "native-host", target_os = "macos"))]

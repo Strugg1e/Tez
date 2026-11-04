@@ -600,7 +600,14 @@ mod tests {
         }
     }
 
-    const LIFECYCLE_COMMANDS: [&str; 5] = ["native_claim_core", "native_prepare_core_upgrade", "native_upgrade_core", "native_get_core_control", "native_install_service"];
+    const LIFECYCLE_COMMANDS: [&str; 6] = [
+        "native_claim_core",
+        "native_prepare_core_upgrade",
+        "native_upgrade_core",
+        "native_get_core_control",
+        "native_install_service",
+        "native_set_session_protection",
+    ];
     const MANAGED_COMMANDS: [&str; 21] = [
         "native_close_connection",
         "native_read_profile",

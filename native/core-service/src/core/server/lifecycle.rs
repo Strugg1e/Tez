@@ -84,6 +84,8 @@ async fn snapshot(owner: &AuthenticatedOwner) -> std::result::Result<CoreSession
         core_path: config.core_config.core_path,
         core_sha256,
         runtime_yaml: yaml,
+        session_protection: CORE_MANAGER.lock().await.session_protection_enabled().await,
+        core_ipc_path: Some(config.core_config.core_ipc_path),
     })
 }
 
@@ -220,6 +222,9 @@ async fn upgrade(
     owner: &AuthenticatedOwner,
     request: &UpgradeCoreRequest,
 ) -> std::result::Result<CoreUpgradeOutcome, ServiceError> {
+    if CORE_MANAGER.lock().await.session_protection_enabled().await {
+        return Err(rejected("Disable session protection before upgrading the core"));
+    }
     require_identity(owner, &request.expected).await?;
     let candidate = verify_candidate(request).await?;
     let identity_gate = CORE_MANAGER.lock().await.identity_gate();
@@ -316,6 +321,39 @@ async fn controller_version(config: &crate::ClashConfig) -> AnyResult<String> {
 }
 
 pub(super) fn routes(router: Router) -> Router {
+    #[cfg(target_os = "macos")]
+    let router = router
+        .get(IpcCommand::SessionProtection.as_ref(), |ctx| async move {
+            let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
+                ControlFlow::Continue(value) => value,
+                ControlFlow::Break(response) => return response,
+            };
+            let _guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
+            };
+            match protection_state(&owner).await {
+                Ok(value) => ok_json(value),
+                Err(error) => service_error(error),
+            }
+        })
+        .post(IpcCommand::SessionProtection.as_ref(), |ctx| async move {
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<crate::SetSessionProtectionRequest>>(&ctx) {
+                    ControlFlow::Continue(value) => value,
+                    ControlFlow::Break(response) => return response,
+                };
+            let _guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
+            };
+            match switch_protection(&owner, &request.payload).await {
+                Ok(value) => ok_json(value),
+                Err(error) => service_error(error),
+            }
+        });
     router
         .post(IpcCommand::StartIdleCore.as_ref(), |ctx| async move {
             super::start_core_request(&ctx, true).await
@@ -383,4 +421,93 @@ pub(super) fn routes(router: Router) -> Router {
                 Err(error) => service_error(error),
             }
         })
+}
+
+#[cfg(target_os = "macos")]
+async fn protection_state(
+    owner: &AuthenticatedOwner,
+) -> std::result::Result<crate::SessionProtectionState, ServiceError> {
+    let current = identity(owner).await?;
+    let manager = CORE_MANAGER.lock().await;
+    let (_, config) = manager.running_core_config().await.ok_or_else(changed)?;
+    Ok(crate::SessionProtectionState {
+        identity: current,
+        enabled: manager.session_protection_enabled().await,
+        core_ipc_path: config.core_config.core_ipc_path,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn switch_protection(
+    owner: &AuthenticatedOwner,
+    request: &crate::SetSessionProtectionRequest,
+) -> std::result::Result<crate::SessionProtectionOutcome, ServiceError> {
+    let gate = CORE_MANAGER.lock().await.identity_gate();
+    let _identity = gate.lock().await;
+    require_identity(owner, &request.expected).await?;
+    let (_, old) = CORE_MANAGER
+        .lock()
+        .await
+        .running_core_config()
+        .await
+        .ok_or_else(changed)?;
+    let enabled = CORE_MANAGER.lock().await.session_protection_enabled().await;
+    if enabled == request.enabled {
+        return Ok(crate::SessionProtectionOutcome {
+            outcome: "unchanged".into(),
+            session: snapshot(owner).await?,
+        });
+    }
+    let prepared = if request.enabled {
+        Some(
+            crate::core::session_protection::SessionCoreCopy::prepare(&old)
+                .await
+                .map_err(|_| rejected("Could not prepare session core"))?,
+        )
+    } else {
+        None
+    };
+    let previous = CORE_MANAGER.lock().await.take_session_protection().await;
+    let mut next = old.clone();
+    if let Some(copy) = prepared.as_ref() {
+        next.core_config.core_path = copy.executable().to_string_lossy().into_owned();
+        next.core_config.core_ipc_path = copy.ipc_path();
+    } else if let Some(copy) = previous.as_ref() {
+        next.core_config.core_path = copy.original_core.clone();
+        next.core_config.core_ipc_path = copy.original_ipc.clone();
+    }
+    let stopped = CORE_MANAGER.lock().await.stop_core().await;
+    if stopped.is_err() {
+        CORE_MANAGER.lock().await.set_session_protection(previous).await;
+        return Err(rejected("Current core did not stop; mode unchanged"));
+    }
+    CORE_MANAGER.lock().await.set_session_protection(prepared).await;
+    let started = CORE_MANAGER
+        .lock()
+        .await
+        .start_core(next.clone(), owner.identity.clone())
+        .await;
+    let healthy = started.is_ok() && controller_version(&next).await.is_ok();
+    let outcome = if healthy {
+        "changed"
+    } else {
+        CORE_MANAGER
+            .lock()
+            .await
+            .stop_core()
+            .await
+            .map_err(|_| rejected("Candidate stop unconfirmed; inspect current core"))?;
+        CORE_MANAGER.lock().await.set_session_protection(previous).await;
+        CORE_MANAGER
+            .lock()
+            .await
+            .start_core(old, owner.identity.clone())
+            .await
+            .map_err(|_| rejected("Previous core restart unconfirmed; inspect current core"))?;
+        "rolled_back"
+    };
+    Ok(crate::SessionProtectionOutcome {
+        outcome: outcome.into(),
+        session: snapshot(owner).await?,
+    })
 }

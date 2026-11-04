@@ -12,8 +12,11 @@ pub use channel::{
     CHANNEL_IDENTITY, ChannelIdentity, MACOS_APP_BUNDLE_ID, MACOS_SERVICE_ID, SERVICE_DISPLAY_NAME, SERVICE_SLUG,
     WINDOWS_SERVICE_NAME,
 };
+#[cfg(target_os = "macos")]
+pub use core::paths::{is_session_core_path, set_session_core_ipc_path};
 pub use core::structure::{
-    ClaimCoreRequest, CoreIdentity, CoreSessionSnapshot, CoreUpgradeOutcome, UpgradeCoreRequest, parse_mihomo_version,
+    ClaimCoreRequest, CoreIdentity, CoreSessionSnapshot, CoreUpgradeOutcome, SessionProtectionOutcome,
+    SessionProtectionState, SetSessionProtectionRequest, UpgradeCoreRequest, parse_mihomo_version,
 };
 pub use core::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,

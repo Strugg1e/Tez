@@ -50,6 +50,8 @@ mod runtime;
 mod runtime_generation;
 #[cfg(feature = "standalone")]
 mod server;
+#[cfg(all(feature = "standalone", target_os = "macos"))]
+mod session_protection;
 #[cfg(feature = "standalone")]
 mod state;
 #[cfg(feature = "standalone")]

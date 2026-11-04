@@ -22,6 +22,8 @@ pub async fn reconcile_service_startup() -> Result<()> {
     info!("Running service startup reconciliation");
 
     let Some(record) = read_core_runtime_record().await? else {
+        #[cfg(target_os = "macos")]
+        crate::core::session_protection::cleanup_orphans()?;
         STARTUP_RECONCILED.store(true, Ordering::Release);
         return Ok(());
     };
@@ -37,6 +39,8 @@ pub async fn reconcile_service_startup() -> Result<()> {
         terminate_process_if_identity(record.pid, &record.identity, CORE_TERM_GRACE).await?;
         cleanup_core_socket(&record.ipc_path).await;
         remove_core_runtime_record().await;
+        #[cfg(target_os = "macos")]
+        crate::core::session_protection::cleanup_orphans()?;
         STARTUP_RECONCILED.store(true, Ordering::Release);
         return Ok(());
     }
@@ -58,6 +62,8 @@ pub async fn reconcile_service_startup() -> Result<()> {
     }
 
     remove_core_runtime_record().await;
+    #[cfg(target_os = "macos")]
+    super::session_protection::cleanup_orphans()?;
     STARTUP_RECONCILED.store(true, Ordering::Release);
     Ok(())
 }

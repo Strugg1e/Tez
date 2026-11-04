@@ -64,7 +64,12 @@ impl NativeData {
                 .await
                 && service_core_is_active(response.code, response.data.as_ref())
             {
-                let path = PathBuf::from(clash_verge_service_ipc::mihomo_ipc_path(&credentials.identity));
+                let path = PathBuf::from(
+                    response
+                        .data
+                        .and_then(|status| status.core_ipc_path)
+                        .unwrap_or_else(|| clash_verge_service_ipc::mihomo_ipc_path(&credentials.identity)),
+                );
                 let client = local_client(&path)?;
                 return Ok((path, Arc::new(client), "service"));
             }

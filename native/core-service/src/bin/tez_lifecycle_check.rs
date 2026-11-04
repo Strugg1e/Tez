@@ -24,6 +24,189 @@ fn proof(generation: u64, token: &str) -> OwnerSessionProof {
     }
 }
 
+#[cfg(target_os = "macos")]
+async fn protection_checks(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    runtime: &RuntimeBundle,
+    current: &CoreSessionSnapshot,
+) -> Result<CoreSessionSnapshot> {
+    let original_hash = management::sha256_file(Path::new(&runtime.core_path))?;
+    let initial = session_protection_state(credentials, session)
+        .await?
+        .data
+        .context("Missing protection state")?;
+    ensure!(
+        !initial.enabled && !current.session_protection,
+        "New session protection was not off"
+    );
+    let mut request = SetSessionProtectionRequest {
+        expected: current.identity.clone(),
+        enabled: true,
+    };
+    request.expected.pid += 1;
+    ensure!(
+        set_session_protection(credentials, session, &request).await?.code != 0,
+        "Stale protection identity accepted"
+    );
+    request.expected = current.identity.clone();
+    ensure!(
+        set_session_protection(credentials, &proof(session.generation, &"f".repeat(64)), &request)
+            .await?
+            .code
+            != 0,
+        "Wrong proof changed protection"
+    );
+    ensure!(
+        get_status(credentials).await?.data.context("Missing status")?.core_pid == Some(current.identity.pid),
+        "Rejected protection request stopped the core"
+    );
+    let enabled = set_session_protection(credentials, session, &request).await?;
+    ensure!(enabled.code == 0, "Enable failed: {}", enabled.message);
+    let enabled = enabled.data.context("Missing enable outcome")?;
+    ensure!(
+        enabled.outcome == "changed"
+            && enabled.session.session_protection
+            && enabled.session.identity.pid != current.identity.pid,
+        "Protection did not restart the owned core"
+    );
+    let protected_path = PathBuf::from(&enabled.session.core_path);
+    ensure!(
+        is_session_core_path(&protected_path) && protected_path.is_file(),
+        "Protected copy missing"
+    );
+    let process = std::process::Command::new("/bin/ps")
+        .args([
+            "-p",
+            &enabled.session.identity.pid.to_string(),
+            "-o",
+            "comm=",
+            "-o",
+            "args=",
+        ])
+        .output()?;
+    let process = String::from_utf8(process.stdout)?.to_lowercase();
+    ensure!(
+        process.contains("tezcore") && !process.contains("mihomo") && !process.contains("clash"),
+        "Keywords remain in process metadata: {process}"
+    );
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=2"])
+        .arg(&protected_path)
+        .output()?;
+    ensure!(
+        signed.status.success() && String::from_utf8_lossy(&signed.stderr).contains("Identifier=app.tez.session.core"),
+        "Copy signature identity incorrect"
+    );
+    ensure!(
+        enabled.session.runtime_yaml == current.runtime_yaml
+            && management::sha256_file(Path::new(&runtime.core_path))? == original_hash,
+        "Protection changed the original core or configuration"
+    );
+    let state = session_protection_state(credentials, session)
+        .await?
+        .data
+        .context("Missing enabled state")?;
+    ensure!(
+        state.enabled && state.core_ipc_path.ends_with("/control.sock"),
+        "Protected socket not reported"
+    );
+    let observer = tokio::process::Command::new(std::env::current_exe()?)
+        .arg("--observe-fixture")
+        .arg(&credentials.app_data_dir)
+        .arg(enabled.session.identity.pid.to_string())
+        .kill_on_drop(true)
+        .output();
+    let observer = tokio::time::timeout(Duration::from_secs(10), observer).await??;
+    ensure!(
+        observer.status.success(),
+        "Separate read-only client lost protected controller: {}",
+        String::from_utf8_lossy(&observer.stderr)
+    );
+    ensure!(
+        load_owner_core(credentials)?.is_none(),
+        "Protection persisted a core preference"
+    );
+    request.expected = enabled.session.identity.clone();
+    let unchanged = set_session_protection(credentials, session, &request)
+        .await?
+        .data
+        .context("Missing unchanged outcome")?;
+    ensure!(
+        unchanged.outcome == "unchanged" && unchanged.session.identity == enabled.session.identity,
+        "Idempotent enable restarted the core"
+    );
+    let staged = stage_runtime(credentials, session, runtime).await?;
+    ensure!(
+        staged.code == 0 && matches!(staged.data, Some(StageRuntimeOutcome::Staged { .. })),
+        "Protected runtime staging requested restart: {}",
+        staged.message
+    );
+    let recovered = recover_core_session(credentials, session)
+        .await?
+        .data
+        .context("Protected recovery failed")?;
+    ensure!(
+        recovered.session_protection
+            && recovered.identity == enabled.session.identity
+            && recovered.core_ipc_path == Some(state.core_ipc_path),
+        "Recovery/staging lost protection or changed the process"
+    );
+    ensure!(
+        unsafe { platform_lib::kill(recovered.identity.pid as i32, platform_lib::SIGTERM) } == 0,
+        "Could not signal protected fixture core"
+    );
+    let mut recovered = recovered;
+    for _ in 0..200 {
+        if let Some(next) = recover_core_session(credentials, session).await?.data
+            && next.identity.pid != recovered.identity.pid
+        {
+            recovered = next;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    ensure!(
+        recovered.session_protection
+            && recovered.identity.pid != enabled.session.identity.pid
+            && protected_path.is_file(),
+        "Watchdog lost the protected session"
+    );
+    request.enabled = false;
+    request.expected = recovered.identity;
+    let original = Path::new(&runtime.core_path);
+    let unavailable = original.with_extension("unavailable");
+    std::fs::rename(original, &unavailable)?;
+    let rollback = set_session_protection(credentials, session, &request).await;
+    std::fs::rename(&unavailable, original)?;
+    let rollback = rollback?;
+    ensure!(rollback.code == 0, "Protection rollback failed: {}", rollback.message);
+    let rollback = rollback.data.context("Missing protection rollback")?;
+    ensure!(
+        rollback.outcome == "rolled_back" && rollback.session.session_protection && protected_path.is_file(),
+        "Failed disable did not retain the protected copy"
+    );
+    request.expected = rollback.session.identity;
+    let disabled = set_session_protection(credentials, session, &request).await?;
+    ensure!(disabled.code == 0, "Disable failed: {}", disabled.message);
+    let disabled = disabled.data.context("Missing disable outcome")?;
+    ensure!(
+        disabled.outcome == "changed"
+            && !disabled.session.session_protection
+            && disabled.session.identity.pid != enabled.session.identity.pid
+            && disabled.session.core_path == current.core_path,
+        "Disable did not restore original core"
+    );
+    ensure!(
+        !protected_path.exists() && management::sha256_file(Path::new(&runtime.core_path))? == original_hash,
+        "Copy retained or original core changed"
+    );
+    println!(
+        "PASS: session protection defaults off; stale identity/token rejected; signed temporary TezCore and keyword-free process arguments; original core/YAML unchanged; separate observer and session recovery; runtime staging without restart; watchdog retains protection; failed disable rolls back; no preference write; disable restores core and removes copy"
+    );
+    Ok(disabled.session)
+}
+
 async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path) -> Result<()> {
     let start = StartClashRequest {
         runtime: RuntimeBundle {
@@ -196,6 +379,10 @@ async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path)
             "Interrupted staging was not recoverable"
         );
     }
+    #[cfg(target_os = "macos")]
+    {
+        claimed = protection_checks(credentials, &session, &start.runtime, &claimed).await?;
+    }
     let before_restart = claimed.identity.clone();
     #[cfg(unix)]
     ensure!(
@@ -365,6 +552,61 @@ async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path)
         load_owner_core(credentials)?.is_some(),
         "Stopping lost the selected version"
     );
+    #[cfg(target_os = "macos")]
+    {
+        let fresh = start_idle_core(credentials, &start)
+            .await?
+            .data
+            .context("Fresh start failed")?;
+        let fresh_proof = proof(fresh.session.generation, &start.proposed_session_token);
+        let fresh = recover_core_session(credentials, &fresh_proof)
+            .await?
+            .data
+            .context("Fresh recovery failed")?;
+        ensure!(!fresh.session_protection, "New session inherited protection");
+        let protected = set_session_protection(
+            credentials,
+            &fresh_proof,
+            &SetSessionProtectionRequest {
+                expected: fresh.identity,
+                enabled: true,
+            },
+        )
+        .await?
+        .data
+        .context("Fresh enable failed")?;
+        let path = PathBuf::from(&protected.session.core_path);
+        ensure!(
+            stop_clash(credentials, &fresh_proof).await?.code == 0 && !path.exists(),
+            "Protected stop retained its copy"
+        );
+        let fresh = start_idle_core(credentials, &start)
+            .await?
+            .data
+            .context("Start after protected stop failed")?;
+        let fresh_proof = proof(fresh.session.generation, &start.proposed_session_token);
+        let fresh = recover_core_session(credentials, &fresh_proof)
+            .await?
+            .data
+            .context("Fresh recovery failed")?;
+        ensure!(!fresh.session_protection, "Protection survived a stopped core session");
+        ensure!(
+            stop_clash(credentials, &fresh_proof).await?.code == 0,
+            "Fresh fixture stop failed"
+        );
+        println!("PASS: stopping a protected core removes its temporary copy; next owned session defaults off");
+        let paths = service_paths()?;
+        let orphan = paths.core_dir().join("session-deadbeef");
+        std::fs::create_dir(&orphan)?;
+        std::fs::write(orphan.join("TezCore"), "abandoned fixture copy")?;
+        std::fs::write(paths.core_runtime_path(), serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(), "ipc_path": paths.runtime_dir().join("absent.sock"),
+            "identity": {"executable": orphan.join("TezCore"), "started_at": 0}
+        }))?)?;
+        reconcile_service_startup().await?;
+        ensure!(!orphan.exists() && !paths.core_runtime_path().exists(), "Stale-record reconciliation retained an orphan copy");
+        println!("PASS: stale runtime record cleanup removes only the abandoned session copy without terminating a mismatched process");
+    }
     println!(
         "PASS: separate-client recovery of pending receipt; private permissions/link/generation checks; root/token rejection; compare-and-claim without restart; displaced proof rejection; watchdog identity race rejection; private signed Mach-O staging without restart; stale identity/hash rejection without stopping; concurrent claim/upgrade serialization; real stable-to-alpha upgrade; failed candidate rollback; selected version persistence; owned stop. No latency tests or external subscriptions."
     );
@@ -375,6 +617,23 @@ async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path)
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 3 && args[0] == "--observe-fixture" {
+        let credentials = test_owner_credentials(&Path::new(&args[1]).canonicalize()?)?;
+        let pid = args[2].to_str().context("Invalid PID")?.parse::<u32>()?;
+        let status = get_status(&credentials)
+            .await?
+            .data
+            .context("Missing observer status")?;
+        ensure!(
+            status.is_active && status.core_pid == Some(pid),
+            "Observer core changed"
+        );
+        let socket = status.core_ipc_path.context("Observer endpoint missing")?;
+        let client = kode_bridge::IpcHttpClient::new(Path::new(&socket))?;
+        let value = client.get("/version").send().await?.json::<serde_json::Value>()?;
+        ensure!(value["version"].is_string(), "Observer controller unavailable");
+        return Ok(());
+    }
     if args.len() == 4 && args[0] == "--recover-fixture" {
         let credentials = test_owner_credentials(&Path::new(&args[1]).canonicalize()?)?;
         let generation = args[2].to_str().context("Invalid generation")?.parse()?;

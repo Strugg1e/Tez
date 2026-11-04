@@ -108,9 +108,10 @@ final class NativeBackendStore {
     @ObservationIgnored private var authorizationResultUnconfirmed = false
     private(set) var serviceSetupInProgress = false
     private(set) var coreUpgradeInProgress = false
+    private(set) var sessionProtectionInProgress = false
 
-    private var authorizationInProgress: Bool { serviceSetupInProgress || coreUpgradeInProgress }
-    private var authorizationLabel: String { coreUpgradeInProgress ? "内核升级" : "后台服务更新" }
+    private var authorizationInProgress: Bool { serviceSetupInProgress || coreUpgradeInProgress || sessionProtectionInProgress }
+    private var authorizationLabel: String { sessionProtectionInProgress ? "会话保护切换" : coreUpgradeInProgress ? "内核升级" : "后台服务更新" }
 
     var requiresManagedShutdown: Bool {
         let managed = mode == .managed || (mode == .automatic && !observerSession)
@@ -475,13 +476,14 @@ final class NativeBackendStore {
             throw NativeBackendError.unavailable("后台正在退出，只允许重试恢复")
         }
         guard !workspaceBusy else { throw NativeBackendError.unavailable("后台正在执行请求，请等待完成") }
-        let humanPaced = command == "native_install_service" || command == "native_upgrade_core"
+        let humanPaced = command == "native_install_service" || command == "native_upgrade_core" || command == "native_set_session_protection"
         if humanPaced {
             guard mode != .attach, state == .connected, capabilities.contains(command), !authorizationInProgress else {
                 throw NativeBackendError.unavailable("当前连接未开放此授权操作")
             }
             serviceSetupInProgress = command == "native_install_service"
             coreUpgradeInProgress = command == "native_upgrade_core"
+            sessionProtectionInProgress = command == "native_set_session_protection"
             authorizationResultUnconfirmed = false
         }
         let serialized = serialWorkspace || humanPaced
@@ -523,7 +525,7 @@ final class NativeBackendStore {
             pending[id] = continuation
             requestCount += 1
             // Administrator authorization is human-paced; a request timeout must not detach its installer.
-            if command != "native_install_service" && command != "native_upgrade_core" {
+            if command != "native_install_service" && command != "native_upgrade_core" && command != "native_set_session_protection" {
                 timers[id] = Task { [weak self, timeout = requestTimeout ?? timeout] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled, let self, token == generation else { return }
@@ -620,6 +622,7 @@ final class NativeBackendStore {
     private func releaseAuthorization() {
         serviceSetupInProgress = false
         coreUpgradeInProgress = false
+        sessionProtectionInProgress = false
         authorizationResultUnconfirmed = false
     }
 

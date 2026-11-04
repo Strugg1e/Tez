@@ -314,6 +314,8 @@ async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig,
 }
 
 pub struct CoreManager {
+    #[cfg(target_os = "macos")]
+    session_protection: Mutex<Option<super::session_protection::SessionCoreCopy>>,
     identity_gate: Arc<Mutex<()>>,
     running_pid: Arc<AtomicU32>,
     running_config: Mutex<Option<ClashConfig>>,
@@ -340,6 +342,8 @@ pub(super) struct CoreStatusSnapshot {
 impl CoreManager {
     fn new() -> Self {
         CoreManager {
+            #[cfg(target_os = "macos")]
+            session_protection: Mutex::new(None),
             identity_gate: Arc::new(Mutex::new(())),
             running_pid: Arc::new(AtomicU32::new(0)),
             running_config: Mutex::new(None),
@@ -367,7 +371,40 @@ impl CoreManager {
         config.clone().map(|config| (pid, config))
     }
 
-    pub(super) fn identity_gate(&self) -> Arc<Mutex<()>> { self.identity_gate.clone() }
+    pub(super) fn identity_gate(&self) -> Arc<Mutex<()>> {
+        self.identity_gate.clone()
+    }
+
+    pub(super) async fn session_protection_enabled(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.session_protection.lock().await.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) async fn take_session_protection(&self) -> Option<super::session_protection::SessionCoreCopy> {
+        self.session_protection.lock().await.take()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) async fn set_session_protection(&self, value: Option<super::session_protection::SessionCoreCopy>) {
+        *self.session_protection.lock().await = value;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) async fn protected_core_for(&self, original: &std::path::Path) -> Option<std::path::PathBuf> {
+        self.session_protection
+            .lock()
+            .await
+            .as_ref()
+            .filter(|copy| std::path::Path::new(&copy.original_core) == original)
+            .map(|copy| copy.executable())
+    }
 
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
         ensure_startup_reconciled()?;
@@ -392,6 +429,9 @@ impl CoreManager {
         execution: Arc<crate::execution::CoreExecutionGuard>,
     ) -> Result<()> {
         info!("Starting core with config: {:?}", config);
+
+        #[cfg(target_os = "macos")]
+        crate::set_session_core_ipc_path(Some((owner.clone(), config.core_config.core_ipc_path.clone())));
 
         prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
         let args = core_args(&config);
@@ -492,6 +532,11 @@ impl CoreManager {
 
         remove_core_runtime_record().await;
         self.after_stop(core_ipc_path).await;
+        #[cfg(target_os = "macos")]
+        {
+            crate::set_session_core_ipc_path(None);
+            self.session_protection.lock().await.take();
+        }
         set_core_lifecycle_state(ServiceLifecycleState::Running);
 
         Ok(())

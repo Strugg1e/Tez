@@ -7,8 +7,8 @@
     <key>CFBundleName</key><string>Tez Preview</string>
     <key>CFBundleDisplayName</key><string>Tez Preview</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.3.10</string>
-    <key>CFBundleVersion</key><string>16</string>
+    <key>CFBundleShortVersionString</key><string>0.3.11</string>
+    <key>CFBundleVersion</key><string>17</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>

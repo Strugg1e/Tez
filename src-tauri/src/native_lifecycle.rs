@@ -121,10 +121,13 @@ fn parse_processes(output: &str) -> Result<Vec<CoreProcess>> {
             name.strip_prefix("tez-").is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
                 && clash_verge_service_ipc::service_paths().is_ok_and(|paths| path.parent() == Some(paths.core_dir().as_path()))
         });
-        if !approved_name && !matches!(
-            Path::new(&executable).file_name().and_then(|name| name.to_str()),
-            Some("mihomo" | "mihomo-alpha" | "verge-mihomo" | "verge-mihomo-alpha")
-        ) {
+        if !approved_name
+            && !clash_verge_service_ipc::is_session_core_path(path)
+            && !matches!(
+                Path::new(&executable).file_name().and_then(|name| name.to_str()),
+                Some("mihomo" | "mihomo-alpha" | "verge-mihomo" | "verge-mihomo-alpha")
+            )
+        {
             continue;
         }
         result.push(CoreProcess {
@@ -148,9 +151,14 @@ async fn processes() -> Result<Vec<CoreProcess>> {
     );
     let processes = parse_processes(std::str::from_utf8(&output.stdout)?)?;
     #[cfg(feature = "native-lifecycle-acceptance")]
-    let processes = processes.into_iter().filter(|process| {
-        clash_verge_service_ipc::service_paths().is_ok_and(|paths| Path::new(&process.executable).parent() == Some(paths.core_dir().as_path()))
-    }).collect();
+    let processes = processes
+        .into_iter()
+        .filter(|process| {
+            clash_verge_service_ipc::service_paths()
+                .is_ok_and(|paths| Path::new(&process.executable).parent() == Some(paths.core_dir().as_path()))
+                || clash_verge_service_ipc::is_session_core_path(Path::new(&process.executable))
+        })
+        .collect();
     Ok(processes)
 }
 

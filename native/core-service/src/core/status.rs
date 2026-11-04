@@ -36,6 +36,16 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
         service_state,
         core_pid,
         core_started_at: core.as_ref().and_then(|core| core.core_started_at),
+        core_ipc_path: if is_active && core_pid.is_some() {
+            CORE_MANAGER
+                .lock()
+                .await
+                .running_core_config()
+                .await
+                .map(|(_, config)| config.core_config.core_ipc_path)
+        } else {
+            None
+        },
         last_core_exit_reason: core.as_ref().and_then(|core| core.last_core_exit_reason.clone()),
         restart_count: core.as_ref().map_or(0, |core| core.restart_count),
         last_recovery_at: core.as_ref().and_then(|core| core.last_recovery_at),

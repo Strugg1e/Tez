@@ -18,6 +18,9 @@ struct NativeLayoutCheck {
         CommandLine.arguments.contains("--route-controls") || Bundle.main.object(forInfoDictionaryKey: "TezLayoutFixtureUI") as? Bool == true
     }
     private static var managedServiceIdle: Bool { CommandLine.arguments.contains("--managed-service-idle") }
+    private static var protectionCheck: Bool { CommandLine.arguments.contains("--protection-check") }
+    private static var oldProtectionService: Bool { CommandLine.arguments.contains("--protection-old-service") }
+    private static var protectionRollback: Bool { CommandLine.arguments.contains("--protection-rollback") }
     static let idleInspection = NativeCoreInspection(state: "stopped", source: "service", canStart: true,
         reason: "idle-service", corePid: nil, serviceGeneration: nil, processes: [],
         serviceProtocol: "2.6", serviceControlAvailable: true)
@@ -27,6 +30,11 @@ struct NativeLayoutCheck {
         processes: [NativeCoreProcess(pid: 123, uid: 0,
             executable: "/Library/Application Support/fixture-service/cores/mihomo", startedAt: "Wed Oct 28 17:33:02 2026")],
         serviceProtocol: "2.5", serviceControlAvailable: false)
+    static let protectedInspection = NativeCoreInspection(state: "runningReadOnly", source: "service", canStart: false,
+        reason: "service-session-unavailable", corePid: 123, serviceGeneration: 42,
+        serviceStartedAt: 1793180000,
+        processes: [NativeCoreProcess(pid: 123, uid: 0, executable: "/fixture/TezCore", startedAt: "Wed Oct 28 17:33:02 2026")],
+        serviceProtocol: "2.6", serviceControlAvailable: true)
     static let profiles = [
         NativeProfileItem(uid: "profile-1", name: "Daily Configuration", type: "remote", updated: 1793000000),
         NativeProfileItem(uid: "profile-2", name: "Research Workspace / Extended Remote Configuration", type: "remote", updated: 1793080000),
@@ -61,7 +69,7 @@ struct NativeLayoutCheck {
             current: "profile-1", items: profiles, message: nil),
             proxyView: NativeProxyView(schemaVersion: 1, orderSource: "core", providerState: "ready",
                 global: group, direct: nil, groups: [policy], records: records, standalone: [], providers: []),
-            core: NativeCoreSnapshot(state: managedServiceIdle ? "unavailable" : "ready", message: nil, source: "service", lifecycle: managedServiceIdle ? nil : inspection),
+            core: NativeCoreSnapshot(state: managedServiceIdle ? "unavailable" : "ready", message: nil, source: "service", lifecycle: managedServiceIdle || protectionCheck ? nil : inspection),
             network: NativeNetworkSnapshot(systemProxy: NativeObservedSwitch(state: "ready", enabled: systemProxy),
                 pac: NativeObservedSwitch(state: "ready", enabled: false), tun: NativeObservedSwitch(state: "ready", enabled: tun),
                 mode: NativeObservedMode(state: "ready", value: mode))))
@@ -79,11 +87,14 @@ struct NativeLayoutCheck {
         var tun = true
         var activityReads = 0
         var closedConnections: Set<String> = []
+        var protection = false
+        var corePID: Int64 = 123
         let capabilities = ["native_continuous_session", "native_subscribe",
             "native_get_snapshot", "native_get_activity", "native_close_connection", "native_get_settings", "native_get_logs", "native_inspect_core", "native_subscription_details",
             "native_claim_core", "native_get_core_control", "native_prepare_core_upgrade", "native_upgrade_core", "native_install_service"]
             + (routeControls ? ["native_select_route", "native_test_latency", "native_patch_settings", "native_set_mode"] : [])
             + (managedServiceIdle ? ["native_prepare_shutdown"] : [])
+            + (protectionCheck ? ["native_prepare_shutdown"] + (oldProtectionService ? [] : ["native_set_session_protection"]) : [])
         try emit(.hello(sessionID: "layout-fixture", capabilities: capabilities))
         while let line = readLine() {
             guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { fatalError() }
@@ -124,12 +135,21 @@ struct NativeLayoutCheck {
                 result = .object(["results": .array(names.enumerated().map { index, name in
                     .object(["name": name, "delay": .integer(Int64(38 + index * 17)), "error": .null])
                 })])
-            case "native_inspect_core": result = try json(managedServiceIdle ? idleInspection : inspection)
+            case "native_inspect_core": result = try json(managedServiceIdle ? idleInspection : protectionCheck ? protectedInspection : inspection)
             case "native_install_service":
                 guard params["confirmed"] == .bool(true), !managedServiceIdle || params["expected"] == .null else { fatalError() }
                 result = .object(["installed": .bool(true), "reconnectRequired": .bool(!managedServiceIdle)])
-            case "native_prepare_shutdown" where managedServiceIdle: result = .object(["safeToExit": .bool(true)])
-            case "native_get_core_control": result = .object(["generation": .integer(42), "pid": .integer(123), "started_at": .integer(1793180000)])
+            case "native_prepare_shutdown" where managedServiceIdle || protectionCheck: result = .object(["safeToExit": .bool(true)])
+            case "native_get_core_control": result = .object(["generation": .integer(42), "pid": .integer(corePID), "started_at": .integer(1793180000),
+                "protectionSupported": .bool(!oldProtectionService), "enabled": oldProtectionService ? .null : .bool(protection)])
+            case "native_set_session_protection" where protectionCheck && !oldProtectionService:
+                guard params["confirmed"] == .bool(true), case .bool(let enabled) = params["enabled"],
+                      case .object(let expected) = params["expected"], expected["pid"] == .integer(corePID) || expected["pid"] == .unsigned(UInt64(corePID)) else { fatalError() }
+                Thread.sleep(forTimeInterval: 1)
+                corePID += 1
+                if !protectionRollback { protection = enabled }
+                result = .object(["generation": .integer(42), "pid": .integer(corePID), "started_at": .integer(1793180000),
+                    "enabled": .bool(protection), "outcome": .string(protectionRollback ? "rolled_back" : "changed")])
             case "native_claim_core": result = .object(["claimed": .bool(true), "reconnectRequired": .bool(true)])
             case "native_prepare_core_upgrade": result = .object(["path": .string("/fixture/tez-" + String(repeating: "a", count: 64)), "sha256": .string(String(repeating: "a", count: 64)), "version": .string("fixture-1")])
             case "native_upgrade_core": result = .object(["outcome": .string("rolled_back"), "pid": .integer(124), "versionSelectionSaved": .bool(true)])
@@ -238,11 +258,13 @@ struct NativeLayoutCheck {
         let defaults = UserDefaults(suiteName: suite)!
         let preferences = TezPreviewPreferences(defaults: defaults)
         let selection = LayoutSelection()
-        if managedServiceIdle { selection.section = .connection }
+        if managedServiceIdle || protectionCheck { selection.section = .connection }
         if Bundle.main.object(forInfoDictionaryKey: "TezProfilesFixtureUI") as? Bool == true { selection.section = .profiles }
         if CommandLine.arguments.contains("--profile-search-check") { selection.section = .profiles }
         let store = NativeBackendStore(helperURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL,
-            arguments: ["--fixture"] + (routeControlsEnabled ? ["--route-controls"] : []) + (managedServiceIdle ? ["--managed-service-idle"] : []), mode: managedServiceIdle ? .automatic : .attach)
+            arguments: ["--fixture"] + (routeControlsEnabled ? ["--route-controls"] : []) + (managedServiceIdle ? ["--managed-service-idle"] : [])
+                + (protectionCheck ? ["--protection-check"] : []) + (oldProtectionService ? ["--protection-old-service"] : [])
+                + (protectionRollback ? ["--protection-rollback"] : []), mode: protectionCheck ? .managed : managedServiceIdle ? .automatic : .attach)
         store.connect()
         for _ in 0..<200 {
             if store.state == .connected { break }
@@ -267,6 +289,30 @@ struct NativeLayoutCheck {
             return
         }
         defer { store.disconnect(); defaults.removePersistentDomain(forName: suite) }
+        if protectionCheck {
+            let initial = try await store.request("native_get_core_control").decoded(NativeProtectionControl.self)
+            precondition(initial.protectionSupported == !oldProtectionService)
+            if !oldProtectionService {
+                precondition(initial.enabled == false && initial.identity != nil)
+                for enabled in [true, false] {
+                    let current = try await store.request("native_get_core_control").decoded(NativeProtectionControl.self)
+                    let task = Task { try await store.request("native_set_session_protection", params: [
+                        "confirmed": .bool(true), "enabled": .bool(enabled), "expected": current.identity!
+                    ], timeout: .milliseconds(10)) }
+                    try await Task.sleep(for: .milliseconds(100))
+                    precondition(store.workspaceBusy && store.sessionProtectionInProgress)
+                    let safe = await store.shutdownForTermination()
+                    precondition(!safe)
+                    let value = try await task.value.decoded(NativeProtectionControl.self)
+                    precondition(value.enabled == (protectionRollback ? false : enabled) && value.pid != current.pid)
+                    precondition(!store.workspaceBusy && !store.sessionProtectionInProgress)
+                }
+            }
+            let safe = await store.shutdownForTermination()
+            precondition(safe)
+            print("PASS: isolated session protection state, confirmed switches, restart feedback gate, no short request timeout, quit exclusion, rollback/old-service capability variants")
+            return
+        }
         if managedServiceIdle {
             await settle(host)
             precondition(store.snapshot?.core.lifecycle == nil && store.snapshot?.core.state == "unavailable")

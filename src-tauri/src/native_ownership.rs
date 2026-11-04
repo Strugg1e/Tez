@@ -17,6 +17,61 @@ pub(crate) async fn supported() -> bool {
         .is_some_and(|info| info.supports_tez_lifecycle())
 }
 
+pub(crate) async fn protection_supported() -> bool {
+    service::get_version()
+        .await
+        .ok()
+        .filter(|response| response.code == 0)
+        .and_then(|response| response.data)
+        .is_some_and(|info| info.supports_tez_lifecycle() && info.session_protection)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectionParams {
+    confirmed: bool,
+    enabled: bool,
+    expected: CoreIdentity,
+}
+
+pub(crate) async fn set_protection(params: Value) -> CmdResult<Value> {
+    let request: ProtectionParams = serde_json::from_value(params).map_err(|_| {
+        CommandFailure::coded(
+            "INVALID_PARAMS",
+            "Expected confirmed mode and current owned core identity",
+        )
+    })?;
+    if !request.confirmed {
+        return Err(CommandFailure::coded(
+            "CORE_CONFIRMATION_REQUIRED",
+            "Changing session protection restarts the core",
+        ));
+    }
+    if !protection_supported().await {
+        return Err(CommandFailure::coded(
+            "SESSION_PROTECTION_UNAVAILABLE",
+            "Update the background service to use session protection",
+        ));
+    }
+    let result = CoreManager::global()
+        .set_native_session_protection(&service::SetSessionProtectionRequest {
+            expected: request.expected,
+            enabled: request.enabled,
+        })
+        .await
+        .map_err(|_| {
+            CommandFailure::coded(
+                "SESSION_PROTECTION_UNCONFIRMED",
+                "Mode change was not confirmed; inspect the current core before retrying",
+            )
+        })?;
+    Ok(
+        json!({"outcome":result.outcome,"enabled":result.session.session_protection,
+        "generation":result.session.identity.generation,"pid":result.session.identity.pid,
+        "started_at":result.session.identity.started_at}),
+    )
+}
+
 pub(crate) async fn recover() -> Option<OwnerSessionProof> {
     if !supported().await {
         return None;
@@ -324,7 +379,21 @@ pub(crate) async fn control_state(params: Value) -> CmdResult<Value> {
             status.is_active && status.active_generation == Some(proof.generation),
             "Service session changed"
         );
-        Ok(json!({"generation":proof.generation,"pid":status.core_pid,"started_at":status.core_started_at}))
+        let supported = protection_supported().await;
+        let (pid, started_at, enabled) = if supported {
+            let state = service::session_protection_state(&credentials, &proof).await?;
+            ensure!(state.code == 0, "Session protection status unavailable");
+            let state = state.data.context("Missing session protection state")?;
+            (
+                Some(state.identity.pid),
+                Some(state.identity.started_at),
+                Some(state.enabled),
+            )
+        } else {
+            (status.core_pid, status.core_started_at, None)
+        };
+        Ok(json!({"generation":proof.generation,"pid":pid,"started_at":started_at,
+            "protectionSupported":supported,"enabled":enabled}))
     }
     .await;
     result.map_err(|_| CommandFailure::coded("CORE_CONTROL_UNAVAILABLE", "Owned core identity could not be confirmed"))
@@ -381,8 +450,10 @@ mod tests {
             assert!(claim(value.clone()).await.is_err());
             assert!(install_service(value.clone()).await.is_err());
             assert!(install_managed_service(value.clone()).await.is_err());
+            assert!(set_protection(value.clone()).await.is_err());
             assert!(upgrade(value).await.is_err());
         }
+        assert!(set_protection(json!({"confirmed":false,"enabled":true,"expected":{"generation":1,"pid":1,"started_at":1}})).await.is_err());
         assert!(control_state(json!({"unexpected":true})).await.is_err());
     }
 

@@ -31,6 +31,8 @@ pub enum IpcCommand {
     StartIdleCore,
     #[strum(serialize = "/tez/core/upgrade")]
     UpgradeCore,
+    #[strum(serialize = "/tez/core/session-protection")]
+    SessionProtection,
     #[strum(serialize = "/system-proxy")]
     SetSystemProxy,
     #[strum(serialize = "/writer")]

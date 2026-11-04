@@ -405,6 +405,14 @@ pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, Servic
     let source = std::fs::canonicalize(client_path)
         .map_err(|error| invalid_asset(format!("failed to canonicalize core: {error}")))?;
     let requested = canonical_regular_file(&source, "core")?;
+    #[cfg(target_os = "macos")]
+    if crate::is_session_core_path(&requested) {
+        require_trusted_core_location(&requested)?;
+        return Ok(ResolvedCore {
+            executable: requested.clone(),
+            requested,
+        });
+    }
     // Integration tests stage cores in temporary directories that no installer has approved.
     if cfg!(feature = "test") {
         return Ok(ResolvedCore {

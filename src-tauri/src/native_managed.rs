@@ -277,6 +277,10 @@ fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
         return tauri::async_runtime::block_on(crate::native_ownership::upgrade(params));
     }
     #[cfg(target_os = "macos")]
+    if command == "native_set_session_protection" {
+        return tauri::async_runtime::block_on(crate::native_ownership::set_protection(params));
+    }
+    #[cfg(target_os = "macos")]
     if command == "native_install_service" {
         return tauri::async_runtime::block_on(crate::native_ownership::install_managed_service(params));
     }
@@ -363,9 +367,13 @@ impl ManagedRecovery {
             if crate::native_workspace::mutates(command) { self.cleanup_owed = true; }
         }
         if crate::native_proxy::COMMANDS.contains(&command) {
-            if crate::native_proxy::parse(command,params.clone())?.is_some() { self.cleanup_owed = true; }
+            if crate::native_proxy::parse(command, params.clone())?.is_some() {
+                self.cleanup_owed = true;
+            }
         }
-        if crate::native_chain::COMMANDS.contains(&command) { crate::native_chain::validate(command,params.clone())?; }
+        if crate::native_chain::COMMANDS.contains(&command) {
+            crate::native_chain::validate(command, params.clone())?;
+        }
         execute(command, params)
     }
 
@@ -521,6 +529,9 @@ fn run_stdio_with(restored: Option<clash_verge_service_ipc::OwnerSessionProof>) 
                             let mut capabilities = CAPABILITIES.to_vec();
                             if tauri::async_runtime::block_on(crate::native_ownership::supported()) {
                                 capabilities.extend(["native_upgrade_core", "native_prepare_core_upgrade", "native_get_core_control"]);
+                                if tauri::async_runtime::block_on(crate::native_ownership::protection_supported()) {
+                                    capabilities.push("native_set_session_protection");
+                                }
                                 if crate::native_ownership::service_tools_available() {
                                     capabilities.extend(["native_install_service", "native_inspect_core"]);
                                 }

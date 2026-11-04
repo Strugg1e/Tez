@@ -319,6 +319,37 @@ pub async fn upgrade_owned_core(
     .await
 }
 
+pub async fn session_protection_state(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+) -> Result<Response<crate::SessionProtectionState>> {
+    protected_call(
+        Verb::Get,
+        IpcCommand::SessionProtection,
+        credentials,
+        Some(session),
+        (),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+pub async fn set_session_protection(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    request: &crate::SetSessionProtectionRequest,
+) -> Result<Response<crate::SessionProtectionOutcome>> {
+    protected_call(
+        Verb::Post,
+        IpcCommand::SessionProtection,
+        credentials,
+        Some(session),
+        request.clone(),
+        Some(Duration::from_secs(60)),
+    )
+    .await
+}
+
 pub async fn update_writer(
     credentials: &OwnerCredentials,
     session: &OwnerSessionProof,

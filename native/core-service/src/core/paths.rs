@@ -221,6 +221,12 @@ pub(crate) fn unix_mihomo_ipc_path(runtime_root: &Path, uid: u32) -> PathBuf {
 }
 
 pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
+    #[cfg(target_os = "macos")]
+    if let Some((owner, path)) = SESSION_CORE_IPC.lock().expect("session IPC lock").as_ref() {
+        if owner == identity {
+            return path.clone();
+        }
+    }
     match identity {
         OwnerIdentity::Unix { uid: _uid, .. } => {
             #[cfg(windows)]
@@ -254,6 +260,26 @@ pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
             format!(r"\\.\pipe\mihomo-{}-{}", channel_id, owner_key(identity))
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+static SESSION_CORE_IPC: std::sync::Mutex<Option<(OwnerIdentity, String)>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+pub fn set_session_core_ipc_path(value: Option<(OwnerIdentity, String)>) {
+    *SESSION_CORE_IPC.lock().expect("session IPC lock") = value;
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_session_core_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "TezCore")
+        && path.parent().is_some_and(|directory| {
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("session-"))
+                && service_paths().is_ok_and(|paths| directory.parent() == Some(paths.core_dir().as_path()))
+        })
 }
 
 #[cfg(test)]

@@ -195,6 +195,7 @@ struct LiveWorkspaceView: View {
                         Text(inspection.explanation).font(TezType.body).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    NativeSessionProtectionView(store: store, coreState: snapshot.core.state)
                     if store.serviceSetupInProgress {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)

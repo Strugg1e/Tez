@@ -41,6 +41,8 @@ pub struct ProtocolInfo {
     pub min_client_revision: u16,
     #[serde(default)]
     pub tez_lifecycle: bool,
+    #[serde(default)]
+    pub session_protection: bool,
 }
 
 impl ProtocolInfo {
@@ -53,6 +55,7 @@ impl ProtocolInfo {
             protocol: ProtocolVersion::current(),
             min_client_revision: crate::MIN_SUPPORTED_CLIENT_REVISION,
             tez_lifecycle: cfg!(target_os = "macos"),
+            session_protection: cfg!(target_os = "macos"),
         }
     }
 
@@ -188,6 +191,30 @@ pub struct CoreSessionSnapshot {
     pub core_path: String,
     pub core_sha256: String,
     pub runtime_yaml: String,
+    #[serde(default)]
+    pub session_protection: bool,
+    #[serde(default)]
+    pub core_ipc_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSessionProtectionRequest {
+    pub expected: CoreIdentity,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionProtectionState {
+    pub identity: CoreIdentity,
+    pub enabled: bool,
+    pub core_ipc_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionProtectionOutcome {
+    pub outcome: String,
+    pub session: CoreSessionSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +382,8 @@ pub struct ServiceStatusSnapshot {
     pub service_state: ServiceLifecycleState,
     pub core_pid: Option<u32>,
     pub core_started_at: Option<u64>,
+    #[serde(default)]
+    pub core_ipc_path: Option<String>,
     pub last_core_exit_reason: Option<String>,
     pub restart_count: u32,
     pub last_recovery_at: Option<u64>,
