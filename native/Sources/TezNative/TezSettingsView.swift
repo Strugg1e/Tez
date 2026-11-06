@@ -99,6 +99,7 @@ struct TezSettingsView: View {
                 Button("恢复界面默认值…", systemImage: "arrow.counterclockwise") { confirmsReset = true }
                     .disabled(isDefault)
             }.padding(16)
+                .tezWindowDragBackground("tez.window.drag.footer")
         }
     }
 

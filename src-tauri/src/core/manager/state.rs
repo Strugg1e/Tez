@@ -98,7 +98,7 @@ impl CoreManager {
         if let Some(path) = &snapshot.core_ipc_path {
             clash_verge_service_ipc::set_session_core_ipc_path(Some((credentials.identity.clone(), path.clone())));
         }
-        Config::restore_native_runtime(&snapshot.runtime_yaml).await?;
+        Config::restore_native_runtime(snapshot.runtime_base_yaml.as_deref().unwrap_or(&snapshot.runtime_yaml)).await?;
         handle::Handle::app_handle().mihomo().update_socket_path(dirs::path_to_str(&dirs::ipc_path()?)?.to_owned())?;
         service::adopt_native_service_session(proof);
         if !snapshot.session_protection {
@@ -170,6 +170,68 @@ impl CoreManager {
         self.restore_selected_nodes().await;
         Ok(outcome)
     }
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    pub(crate) async fn set_native_runtime_protection(
+        &self, request: &clash_verge_service_ipc::RuntimeProtectionRequest,
+    ) -> Result<clash_verge_service_ipc::SessionProtectionOutcome> {
+        let write = Config::lock_config_write().await;
+        let _update = self.claim_config_update(&write)?;
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.apply_native_runtime_protection(request).await
+    }
+
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    async fn apply_native_runtime_protection(
+        &self, request: &clash_verge_service_ipc::RuntimeProtectionRequest,
+    ) -> Result<clash_verge_service_ipc::SessionProtectionOutcome> {
+        anyhow::ensure!(matches!(*self.get_running_mode(), RunningMode::Service), "No owned service core");
+        let runtime = Config::runtime().await;
+        let previous_runtime = runtime.data_arc();
+        let credentials = crate::core::owner_identity::current_owner_credentials()?;
+        let proof = service::active_service_session()?;
+        let response = clash_verge_service_ipc::set_runtime_protection(&credentials, &proof, request).await?;
+        anyhow::ensure!(response.code == 0, "Runtime protection was refused: {}", response.message);
+        let outcome = response.data.context("Service omitted runtime protection outcome")?;
+        if let Some(path) = &outcome.session.core_ipc_path {
+            clash_verge_service_ipc::set_session_core_ipc_path(Some((credentials.identity, path.clone())));
+        }
+        handle::Handle::app_handle().mihomo().update_socket_path(dirs::path_to_str(&dirs::ipc_path()?)?.to_owned())?;
+        self.complete_native_runtime_protection(&runtime, &previous_runtime, outcome.outcome == "rolled_back" && request.runtime.is_some());
+        self.restore_selected_nodes().await;
+        Ok(outcome)
+    }
+
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    pub(super) fn complete_native_runtime_protection(
+        &self, runtime: &clash_verge_draft::Draft<crate::config::runtime::IRuntime>,
+        previous: &crate::config::runtime::IRuntime, rolled_back: bool,
+    ) {
+        if rolled_back { runtime.edit_draft(|draft| *draft = previous.clone()); }
+        self.mark_core_ready();
+    }
+
+    /// Caller owns lifecycle serialization. Protected restarts retain the same service session.
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    pub(super) async fn restart_native_protected(&self, config_file: &Path) -> Result<bool> {
+        if !matches!(*self.get_running_mode(), RunningMode::Service) { return Ok(false); }
+        let version = clash_verge_service_ipc::get_version().await?;
+        if !version.data.is_some_and(|info| info.runtime_protection) { return Ok(false); }
+        let credentials = crate::core::owner_identity::current_owner_credentials()?;
+        let proof = service::active_service_session()?;
+        let response = clash_verge_service_ipc::session_protection_state(&credentials, &proof).await?;
+        anyhow::ensure!(response.code == 0, "Protection state unavailable before restart");
+        let state = response.data.context("Protection state missing before restart")?;
+        if !state.enabled && !state.transport_enabled { return Ok(false); }
+        let runtime = service::collect_service_runtime_bundle(config_file).await?;
+        let outcome = self.apply_native_runtime_protection(&clash_verge_service_ipc::RuntimeProtectionRequest {
+            expected: state.identity, process_enabled: state.enabled, transport_enabled: state.transport_enabled,
+            restart: true, runtime: Some(runtime),
+        }).await?;
+        anyhow::ensure!(outcome.outcome != "rolled_back", "Configuration restart failed; previous protection modes restored");
+        self.apply_proxy_after_start().await?;
+        Ok(true)
+    }
+
     /// Restores profile selections before callers enable the system proxy.
     /// The bounded first pass continues in the background, and later calls supersede earlier ones.
     async fn restore_selected_nodes(&self) {

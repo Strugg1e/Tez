@@ -751,8 +751,28 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(guard) => guard,
                     ControlFlow::Break(response) => return response,
                 };
-            match stage_runtime(&owner, &request.payload).await {
-                Ok(outcome) => ok_json(outcome),
+            let mut bundle = request.payload;
+            let base = bundle.yaml.clone();
+            let protected = CORE_MANAGER.lock().await.transport_base().await.is_some();
+            if protected {
+                bundle.yaml = match crate::protection::render_transport(&base) {
+                    Ok(yaml) => yaml,
+                    Err(_) => return service_error(ServiceError::new(crate::ServiceErrorCode::CoreUpgradeRejected, "Transport overlay could not be prepared")),
+                };
+            }
+            match stage_runtime(&owner, &bundle).await {
+                Ok(outcome) => {
+                    if protected && matches!(outcome, crate::StageRuntimeOutcome::Staged { .. }) {
+                        #[cfg(target_os = "macos")]
+                        {
+                        let path = service_paths().map_err(|error| ServiceError::new(crate::ServiceErrorCode::InvalidRuntimeAsset, error.to_string()));
+                        let path = match path { Ok(paths) => paths.for_owner(&owner.identity).runtime_dir().join("config.yaml"), Err(error) => return service_error(error) };
+                        if let Err(error) = lifecycle::write_protection_yaml(path.to_str().unwrap_or_default(), &base).await { return service_error(error); }
+                        }
+                        CORE_MANAGER.lock().await.set_transport_base(Some(base)).await;
+                    }
+                    ok_json(outcome)
+                },
                 Err(error) => service_error(error),
             }
         })

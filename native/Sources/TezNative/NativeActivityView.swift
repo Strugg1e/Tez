@@ -107,6 +107,7 @@ struct NativeActivityView: View {
             TezMetric(title: "内存", value: NativeActivityFormat.bytes(model.snapshot?.connections.memory), symbol: "memorychip", motion: motion)
         }
         .padding(.horizontal, TezStyle.pageInset).frame(height: 68)
+        .tezWindowDragBackground("tez.window.drag.summary")
         .background { TezContentMaterial(material: .headerView) }
     }
 
@@ -131,6 +132,7 @@ struct NativeActivityView: View {
             }
         }
         .padding(.horizontal, TezStyle.pageInset).frame(height: 48)
+        .tezWindowDragBackground("tez.window.drag.filter")
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
@@ -272,7 +274,7 @@ struct NativeActivityView: View {
     }
 
     private func details(side: Bool) -> some View {
-        ScrollView {
+        TezPageScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 switch tab {
                 case .connections:
@@ -426,6 +428,7 @@ struct NativeActivityView: View {
         }
         .font(TezType.metadata).foregroundStyle(.secondary)
         .padding(.horizontal, TezStyle.pageInset).frame(height: 28)
+        .tezWindowDragBackground("tez.window.drag.footer")
     }
 
     private var visibleCount: Int { switch tab { case .connections: connections.count; case .rules: rules.count; case .providers: providers.count } }

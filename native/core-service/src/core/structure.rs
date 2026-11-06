@@ -43,6 +43,8 @@ pub struct ProtocolInfo {
     pub tez_lifecycle: bool,
     #[serde(default)]
     pub session_protection: bool,
+    #[serde(default)]
+    pub runtime_protection: bool,
 }
 
 impl ProtocolInfo {
@@ -56,6 +58,7 @@ impl ProtocolInfo {
             min_client_revision: crate::MIN_SUPPORTED_CLIENT_REVISION,
             tez_lifecycle: cfg!(target_os = "macos"),
             session_protection: cfg!(target_os = "macos"),
+            runtime_protection: cfg!(target_os = "macos"),
         }
     }
 
@@ -194,6 +197,10 @@ pub struct CoreSessionSnapshot {
     #[serde(default)]
     pub session_protection: bool,
     #[serde(default)]
+    pub transport_protection: bool,
+    #[serde(default)]
+    pub runtime_base_yaml: Option<String>,
+    #[serde(default)]
     pub core_ipc_path: Option<String>,
 }
 
@@ -209,6 +216,21 @@ pub struct SessionProtectionState {
     pub identity: CoreIdentity,
     pub enabled: bool,
     pub core_ipc_path: String,
+    #[serde(default)]
+    pub transport_enabled: bool,
+    #[serde(default)]
+    pub transport_report: Option<crate::protection::TransportReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProtectionRequest {
+    pub expected: CoreIdentity,
+    pub process_enabled: bool,
+    pub transport_enabled: bool,
+    #[serde(default)]
+    pub restart: bool,
+    pub runtime: Option<RuntimeBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +467,21 @@ mod tests {
         MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, RuntimeBundle, ServiceErrorCode,
         StartClashRequest, owner_key,
     };
+
+    #[test]
+    fn older_protection_wire_defaults_transport_to_off() {
+        let state: super::SessionProtectionState = serde_json::from_value(serde_json::json!({
+            "identity":{"generation":1,"pid":2,"started_at":3}, "enabled":true, "core_ipc_path":"fixture.sock"
+        })).unwrap();
+        assert!(state.enabled && !state.transport_enabled && state.transport_report.is_none());
+        let mut protocol = serde_json::to_value(ProtocolInfo::current()).unwrap();
+        protocol.as_object_mut().unwrap().remove("runtime_protection");
+        assert!(!serde_json::from_value::<ProtocolInfo>(protocol).unwrap().runtime_protection);
+        let snapshot: super::CoreSessionSnapshot = serde_json::from_value(serde_json::json!({
+            "identity":{"generation":1,"pid":2,"started_at":3}, "core_path":"fixture", "core_sha256":"fixture", "runtime_yaml":"proxies: []"
+        })).unwrap();
+        assert!(!snapshot.transport_protection && snapshot.runtime_base_yaml.is_none());
+    }
 
     #[test]
     fn tez_lifecycle_requires_an_explicit_extension_not_just_a_future_revision() {

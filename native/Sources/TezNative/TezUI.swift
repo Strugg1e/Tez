@@ -98,13 +98,27 @@ struct TezFieldAnchor: ViewModifier {
     }
 }
 
+struct TezPageScrollView<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollView {
+                content
+                    .frame(maxWidth: .infinity, minHeight: geometry.size.height, alignment: .topLeading)
+                    .tezWindowDragBackground("tez.window.drag.page")
+            }
+        }
+    }
+}
+
 struct TezSettingsPage<Content: View>: View {
     let title: String
     let summary: String
     @ViewBuilder let content: Content
 
     var body: some View {
-        ScrollView {
+        TezPageScrollView {
             VStack(alignment: .leading, spacing: 26) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(title).font(TezType.page)
@@ -487,6 +501,7 @@ struct TezConnectionPresentation {
     var coreTitle: String {
         guard state == .connected else { return "内核状态未确认" }
         switch coreState {
+        case "stopped": return "内核已停止"
         case "ready": return "内核运行中"
         case "unavailable": return "内核不可用"
         case "error": return "内核读取失败"
@@ -527,6 +542,7 @@ struct TezConnectionBar: View {
         }
         .padding(.horizontal, TezStyle.pageInset)
         .padding(.vertical, presentation.state == .connected && error == nil ? 6 : 12)
+        .tezWindowDragBackground("tez.window.drag.status")
         .background(Color(nsColor: .controlBackgroundColor))
         .accessibilityIdentifier("live.connection.status")
     }

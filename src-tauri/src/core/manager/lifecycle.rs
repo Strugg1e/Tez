@@ -527,6 +527,8 @@ impl CoreManager {
     }
 
     pub(super) async fn replace_service_core_with_config(&self, config_file: &Path) -> Result<()> {
+        #[cfg(all(feature = "native-host", target_os = "macos"))]
+        if self.restart_native_protected(config_file).await? { return Ok(()); }
         run_service_config_replacement_transition(
             cfg!(target_os = "macos"),
             proxy_control::stop_guard,
@@ -784,6 +786,11 @@ impl CoreManager {
 
     pub(crate) async fn restart_core_during_config_update(&self) -> Result<()> {
         let _life = self.lifecycle_lock.lock().await;
+        #[cfg(all(feature = "native-host", target_os = "macos"))]
+        if matches!(*self.get_running_mode(), RunningMode::Service) {
+            let config_file = Config::generate_file().await?;
+            if self.restart_native_protected(&config_file).await? { return Ok(()); }
+        }
         let proxy_intent = self.proxy_stop_intent().await;
         run_core_replacement_transition(
             || self.controlled_stop_core_with_intent(proxy_intent),

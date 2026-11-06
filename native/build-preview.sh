@@ -64,6 +64,7 @@ fi
 swift build --configuration release --scratch-path "$SWIFT_SCRATCH"
 BIN_DIR="$(swift build --configuration release --scratch-path "$SWIFT_SCRATCH" --show-bin-path)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$ROOT/../LICENSE" "$APP/Contents/Resources/LICENSE.txt"
 EXECUTABLE=TezNativePreview
 if [[ "$STANDALONE" == 1 ]]; then EXECUTABLE=Tez; fi
 cp "$BIN_DIR/TezNativePreview" "$APP/Contents/MacOS/$EXECUTABLE"

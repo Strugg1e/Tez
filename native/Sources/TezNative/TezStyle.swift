@@ -152,10 +152,13 @@ struct TezWindowSurface: NSViewRepresentable {
 }
 
 struct TezWindowDragRegion: NSViewRepresentable {
+    var identifier = "tez.window.drag"
+    var showsHint = true
+
     func makeNSView(context: Context) -> NSView {
         let view = DragRegionView()
-        view.identifier = NSUserInterfaceItemIdentifier("tez.window.drag")
-        view.toolTip = "拖动窗口"
+        view.identifier = NSUserInterfaceItemIdentifier(identifier)
+        view.toolTip = showsHint ? "拖动窗口" : nil
         view.setAccessibilityElement(true)
         view.setAccessibilityRole(.group)
         view.setAccessibilityLabel("窗口拖动区域")
@@ -191,6 +194,13 @@ struct TezWindowDragRegion: NSViewRepresentable {
             let after = window.frame.origin
             setAccessibilityValue("drag delta: \(Int(after.x - before.x)), \(Int(after.y - before.y)); movable: \(window.isMovable)")
         }
+    }
+}
+
+extension View {
+    func tezWindowDragBackground(_ identifier: String = "tez.window.drag.background") -> some View {
+        // Place this inside native panes and scroll documents, not behind their containers.
+        background(TezWindowDragRegion(identifier: identifier, showsHint: false).accessibilityHidden(true))
     }
 }
 

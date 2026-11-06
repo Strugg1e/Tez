@@ -4,13 +4,13 @@
 
 原生 macOS 网络代理客户端。SwiftUI 与 AppKit 构建界面，Rust 管理配置和连接，Mihomo 提供代理内核。
 
-[下载](https://github.com/Strugg1e/Tez/releases) · [更新日志](Changelog.md) · [构建指南](native/README.md)
+[下载](https://github.com/Strugg1e/Tez/releases/latest) · [更新日志](Changelog.md) · [构建指南](native/README.md)
 
 ## 安装
 
 支持 **Apple Silicon，macOS 14 或更高版本**。
 
-1. 从 [Releases](https://github.com/Strugg1e/Tez/releases) 下载 `Tez-0.3.11-macos-arm64.zip`。
+1. 从[最新版本](https://github.com/Strugg1e/Tez/releases/latest)下载 Apple Silicon ZIP。
 2. 解压后将 `Tez.app` 放入“应用程序”。
 3. 打开 Tez，在“连接”页配置后台服务，添加订阅或本地配置。
 
@@ -20,7 +20,7 @@
 
 | 页面 | 常用操作 |
 | --- | --- |
-| 连接 | 系统代理、PAC、TUN、分流模式、内核启停与会话保护 |
+| 连接 | 系统代理、PAC、TUN、分流模式、内核启停、本机保护与传输保护 |
 | 线路 | 策略组切换、节点搜索、延迟采样、线路对比与代理链 |
 | 配置 | 订阅导入与更新、本地 YAML 编辑、配置切换与排序 |
 | 活动 | 查看连接来源应用、进程、命中规则与实际出口，搜索规则和日志 |
@@ -30,9 +30,11 @@
 
 界面支持深浅色外观、紧凑窗口和减少动态效果。常用操作留在首层，维护工具与低频选项收进展开区。
 
-### 会话保护
+### 运行时保护
 
-在“连接 → 内核与服务”中切换。保护模式默认关闭，使用临时内核副本运行，随内核会话结束。开启和关闭前均确认重启；切换失败时恢复原内核与保护状态。
+“连接 → 内核与服务”提供两个独立开关。本机保护使用临时内核副本；传输保护为兼容节点补充 Chrome 风格 TLS 握手，保留已有指纹。节点覆盖范围和 DNS 配置检查在同处查看。
+
+两项默认关闭，仅本次内核会话有效。可以一起调整，确认一次后重启内核并应用设置。悬停开关可查看原理和作用范围。
 
 ## 开发
 

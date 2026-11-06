@@ -18,9 +18,18 @@ struct NativeLayoutCheck {
         CommandLine.arguments.contains("--route-controls") || Bundle.main.object(forInfoDictionaryKey: "TezLayoutFixtureUI") as? Bool == true
     }
     private static var managedServiceIdle: Bool { CommandLine.arguments.contains("--managed-service-idle") }
-    private static var protectionCheck: Bool { CommandLine.arguments.contains("--protection-check") }
-    private static var oldProtectionService: Bool { CommandLine.arguments.contains("--protection-old-service") }
-    private static var protectionRollback: Bool { CommandLine.arguments.contains("--protection-rollback") }
+    private static var protectionCheck: Bool {
+        CommandLine.arguments.contains("--protection-check") || Bundle.main.object(forInfoDictionaryKey: "TezProtectionFixtureUI") as? Bool == true
+    }
+    private static var oldProtectionService: Bool {
+        CommandLine.arguments.contains("--protection-old-service") || Bundle.main.object(forInfoDictionaryKey: "TezProtectionOldServiceFixtureUI") as? Bool == true
+    }
+    private static var protectionRollback: Bool {
+        CommandLine.arguments.contains("--protection-rollback") || Bundle.main.object(forInfoDictionaryKey: "TezProtectionRollbackFixtureUI") as? Bool == true
+    }
+    private static var coreLifecycleCheck: Bool {
+        CommandLine.arguments.contains("--core-lifecycle-check") || Bundle.main.object(forInfoDictionaryKey: "TezCoreLifecycleFixtureUI") as? Bool == true
+    }
     static let idleInspection = NativeCoreInspection(state: "stopped", source: "service", canStart: true,
         reason: "idle-service", corePid: nil, serviceGeneration: nil, processes: [],
         serviceProtocol: "2.6", serviceControlAvailable: true)
@@ -47,7 +56,7 @@ struct NativeLayoutCheck {
         try JSONDecoder().decode(BackendJSON.self, from: JSONEncoder().encode(value))
     }
 
-    static func snapshot(current: String? = nil, groupCurrent: String? = nil, revision: String = "1", mode: String = "global", systemProxy: Bool = true, tun: Bool = true) throws -> BackendJSON {
+    static func snapshot(current: String? = nil, groupCurrent: String? = nil, revision: String = "1", mode: String = "global", systemProxy: Bool = true, tun: Bool = true, coreOverride: NativeCoreSnapshot? = nil) throws -> BackendJSON {
         let names = (1...24).map { $0 == 2 ? "Tokyo Residential - Long Route Name 02" : "Tokyo \(String(format: "%02d", $0))" }
         let records = Dictionary(uniqueKeysWithValues: names.enumerated().map { index, name in
             let id = "node-\(index)"
@@ -69,7 +78,7 @@ struct NativeLayoutCheck {
             current: "profile-1", items: profiles, message: nil),
             proxyView: NativeProxyView(schemaVersion: 1, orderSource: "core", providerState: "ready",
                 global: group, direct: nil, groups: [policy], records: records, standalone: [], providers: []),
-            core: NativeCoreSnapshot(state: managedServiceIdle ? "unavailable" : "ready", message: nil, source: "service", lifecycle: managedServiceIdle || protectionCheck ? nil : inspection),
+            core: coreOverride ?? NativeCoreSnapshot(state: managedServiceIdle ? "unavailable" : "ready", message: nil, source: "service", lifecycle: managedServiceIdle || protectionCheck ? nil : inspection),
             network: NativeNetworkSnapshot(systemProxy: NativeObservedSwitch(state: "ready", enabled: systemProxy),
                 pac: NativeObservedSwitch(state: "ready", enabled: false), tun: NativeObservedSwitch(state: "ready", enabled: tun),
                 mode: NativeObservedMode(state: "ready", value: mode))))
@@ -88,13 +97,35 @@ struct NativeLayoutCheck {
         var activityReads = 0
         var closedConnections: Set<String> = []
         var protection = false
+        var transportProtection = false
+        let transportReport: BackendJSON = .object([
+            "nodes": .array([
+                .object(["name": .string("Tokyo TLS"), "protocol": .string("vless"), "status": .string("eligible")]),
+                .object(["name": .string("Frankfurt · Subscription preset"), "protocol": .string("trojan"), "status": .string("existing")]),
+                .object(["name": .string("Hong Kong Shadowsocks"), "protocol": .string("ss"), "status": .string("unsupported")])]),
+            "dynamicProviders": .integer(1), "dns": .object(["enabled": .bool(true), "encryptedResolvers": .integer(2),
+                "otherResolvers": .integer(1), "followsRules": .bool(false), "nodeResolverConfigured": .bool(false)])])
         var corePID: Int64 = 123
+        var serviceAvailable = false
+        var coreRunning = false
+        var installAttempts = 0
+        func coreInspection() -> NativeCoreInspection {
+            if !serviceAvailable {
+                return NativeCoreInspection(state: "unknown", source: "unknown", canStart: false, reason: "service-unavailable",
+                    corePid: nil, serviceGeneration: nil, processes: [])
+            }
+            if !coreRunning { return idleInspection }
+            return NativeCoreInspection(state: "running", source: "service", canStart: false, reason: "owned-service",
+                corePid: UInt32(corePID), serviceGeneration: 42, serviceStartedAt: 1793180000, processes: [],
+                serviceProtocol: "2.6", serviceControlAvailable: true)
+        }
         let capabilities = ["native_continuous_session", "native_subscribe",
             "native_get_snapshot", "native_get_activity", "native_close_connection", "native_get_settings", "native_get_logs", "native_inspect_core", "native_subscription_details",
             "native_claim_core", "native_get_core_control", "native_prepare_core_upgrade", "native_upgrade_core", "native_install_service"]
             + (routeControls ? ["native_select_route", "native_test_latency", "native_patch_settings", "native_set_mode"] : [])
             + (managedServiceIdle ? ["native_prepare_shutdown"] : [])
-            + (protectionCheck ? ["native_prepare_shutdown"] + (oldProtectionService ? [] : ["native_set_session_protection"]) : [])
+            + (protectionCheck ? ["native_prepare_shutdown"] + (oldProtectionService ? [] : ["native_set_session_protection", "native_set_runtime_protection"]) : [])
+            + (coreLifecycleCheck ? ["native_prepare_shutdown", "native_core_start", "native_core_stop", "native_core_restart"] : [])
         try emit(.hello(sessionID: "layout-fixture", capabilities: capabilities))
         while let line = readLine() {
             guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { fatalError() }
@@ -104,7 +135,26 @@ struct NativeLayoutCheck {
                 guard case .string(let id) = params["id"], id.hasPrefix("connection-") else { fatalError() }
                 closedConnections.insert(id)
                 result = .object(["closed": .bool(true), "id": .string(id)])
-            case "native_subscribe", "native_get_snapshot": result = try snapshot(current: selections["GLOBAL"], groupCurrent: selections["Daily Policy"], revision: String(revision), mode: mode, systemProxy: systemProxy, tun: tun)
+            case "native_subscribe", "native_get_snapshot":
+                result = try snapshot(current: selections["GLOBAL"], groupCurrent: selections["Daily Policy"], revision: String(revision), mode: mode, systemProxy: systemProxy, tun: tun,
+                    coreOverride: coreLifecycleCheck ? NativeCoreSnapshot(state: coreRunning ? "ready" : "unavailable", message: nil, source: "service", lifecycle: coreInspection()) : nil)
+            case "native_inspect_core" where coreLifecycleCheck: result = try json(coreInspection())
+            case "native_install_service" where coreLifecycleCheck:
+                installAttempts += 1
+                if installAttempts == 1 {
+                    serviceAvailable = true; revision += 1
+                    try emit(.response(id: id, outcome: .error(.init(detail: "Installation failed; the background service was restored: Timed out waiting for the service to release its owner lock", code: .string("SERVICE_INSTALL_FAILED"), operation: nil))))
+                    continue
+                }
+                serviceAvailable = true; revision += 1
+                result = .object(["installed": .bool(true), "reconnectRequired": .bool(false)])
+            case _ where coreLifecycleCheck && ["native_core_start", "native_core_stop", "native_core_restart"].contains(command):
+                Thread.sleep(forTimeInterval: 0.25)
+                coreRunning = command != "native_core_stop"
+                if coreRunning { corePID += 1 }
+                revision += 1
+                result = .object(["mode": .string(coreRunning ? "Service" : "NotRunning")])
+            case "native_prepare_shutdown" where coreLifecycleCheck: result = .object(["safeToExit": .bool(true)])
             case "native_set_mode" where routeControls:
                 guard case .string(let value) = params["mode"] else { fatalError() }
                 mode = value; revision += 1
@@ -141,7 +191,19 @@ struct NativeLayoutCheck {
                 result = .object(["installed": .bool(true), "reconnectRequired": .bool(!managedServiceIdle)])
             case "native_prepare_shutdown" where managedServiceIdle || protectionCheck: result = .object(["safeToExit": .bool(true)])
             case "native_get_core_control": result = .object(["generation": .integer(42), "pid": .integer(corePID), "started_at": .integer(1793180000),
-                "protectionSupported": .bool(!oldProtectionService), "enabled": oldProtectionService ? .null : .bool(protection)])
+                "protectionSupported": .bool(!oldProtectionService), "enabled": oldProtectionService ? .null : .bool(protection),
+                "transportSupported": .bool(!oldProtectionService), "transportEnabled": .bool(transportProtection), "transportReport": transportReport])
+            case "native_set_runtime_protection" where protectionCheck && !oldProtectionService:
+                guard params["confirmed"] == .bool(true), case .bool(let process) = params["processEnabled"],
+                      case .bool(let transport) = params["transportEnabled"], case .object(let expected) = params["expected"],
+                      expected["pid"] == .integer(corePID) || expected["pid"] == .unsigned(UInt64(corePID)) else { fatalError() }
+                Thread.sleep(forTimeInterval: 1)
+                corePID += 1
+                if !protectionRollback { protection = process; transportProtection = transport }
+                result = .object(["generation": .integer(42), "pid": .integer(corePID), "started_at": .integer(1793180000),
+                    "protectionSupported": .bool(true), "enabled": .bool(protection), "transportSupported": .bool(true),
+                    "transportEnabled": .bool(transportProtection), "transportReport": transportReport,
+                    "outcome": .string(protectionRollback ? "rolled_back" : "changed")])
             case "native_set_session_protection" where protectionCheck && !oldProtectionService:
                 guard params["confirmed"] == .bool(true), case .bool(let enabled) = params["enabled"],
                       case .object(let expected) = params["expected"], expected["pid"] == .integer(corePID) || expected["pid"] == .unsigned(UInt64(corePID)) else { fatalError() }
@@ -258,13 +320,14 @@ struct NativeLayoutCheck {
         let defaults = UserDefaults(suiteName: suite)!
         let preferences = TezPreviewPreferences(defaults: defaults)
         let selection = LayoutSelection()
-        if managedServiceIdle || protectionCheck { selection.section = .connection }
+        if managedServiceIdle || protectionCheck || coreLifecycleCheck { selection.section = .connection }
         if Bundle.main.object(forInfoDictionaryKey: "TezProfilesFixtureUI") as? Bool == true { selection.section = .profiles }
         if CommandLine.arguments.contains("--profile-search-check") { selection.section = .profiles }
         let store = NativeBackendStore(helperURL: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL,
             arguments: ["--fixture"] + (routeControlsEnabled ? ["--route-controls"] : []) + (managedServiceIdle ? ["--managed-service-idle"] : [])
                 + (protectionCheck ? ["--protection-check"] : []) + (oldProtectionService ? ["--protection-old-service"] : [])
-                + (protectionRollback ? ["--protection-rollback"] : []), mode: protectionCheck ? .managed : managedServiceIdle ? .automatic : .attach)
+                + (protectionRollback ? ["--protection-rollback"] : []) + (coreLifecycleCheck ? ["--core-lifecycle-check"] : []),
+            mode: protectionCheck || coreLifecycleCheck ? .managed : managedServiceIdle ? .automatic : .attach)
         store.connect()
         for _ in 0..<200 {
             if store.state == .connected { break }
@@ -274,7 +337,8 @@ struct NativeLayoutCheck {
         let root = LiveWorkspaceView(store: store, selection: Binding(get: { selection.section }, set: { selection.section = $0 }))
             .environment(preferences).preferredColorScheme(preferences.appearance.colorScheme)
         let host = NSHostingView(rootView: root)
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 1040, height: 700),
+        let compact = Bundle.main.object(forInfoDictionaryKey: "TezCompactFixtureUI") as? Bool == true
+        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: compact ? 800 : 1040, height: compact ? 560 : 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Tez Layout Check"
         window.toolbarStyle = .unified
@@ -289,6 +353,38 @@ struct NativeLayoutCheck {
             return
         }
         defer { store.disconnect(); defaults.removePersistentDomain(forName: suite) }
+        if coreLifecycleCheck {
+            precondition(store.snapshot?.core.lifecycle?.reason == "service-unavailable")
+            do {
+                _ = try await store.installService(params: ["confirmed": .bool(true), "expected": .null])
+                fatalError("Injected installation failure must surface")
+            } catch NativeBackendError.remote(let error) {
+                precondition(error.detail.contains("owner lock"))
+            }
+            precondition(!store.workspaceBusy && store.state == .connected)
+            precondition(store.serviceCapabilitiesNeedRefresh, "a partial installation can change the restored service capabilities")
+            _ = try await store.installService(params: ["confirmed": .bool(true), "expected": .null])
+            store.refresh()
+            for _ in 0..<200 {
+                if store.snapshot?.core.lifecycle?.state == "stopped" { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            precondition(store.snapshot?.core.lifecycle?.state == "stopped", "installation must not start the core")
+            for command in ["native_core_start", "native_core_stop", "native_core_start", "native_core_restart", "native_core_stop"] {
+                _ = try await store.request(command, serialWorkspace: true)
+                store.refresh()
+                let state = command == "native_core_stop" ? "stopped" : "running"
+                for _ in 0..<200 {
+                    if store.snapshot?.core.lifecycle?.state == state { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                precondition(store.snapshot?.core.lifecycle?.state == state)
+            }
+            let closed = await store.shutdownForTermination()
+            precondition(closed)
+            print("PASS: unavailable service, visible installation failure, explicit retry without auto-start, start-stop-start-restart-stop and safe shutdown")
+            return
+        }
         if protectionCheck {
             let initial = try await store.request("native_get_core_control").decoded(NativeProtectionControl.self)
             precondition(initial.protectionSupported == !oldProtectionService)
@@ -305,6 +401,21 @@ struct NativeLayoutCheck {
                     precondition(!safe)
                     let value = try await task.value.decoded(NativeProtectionControl.self)
                     precondition(value.enabled == (protectionRollback ? false : enabled) && value.pid != current.pid)
+                    precondition(!store.workspaceBusy && !store.sessionProtectionInProgress)
+                }
+                for enabled in [true, false] {
+                    let current = try await store.request("native_get_core_control").decoded(NativeProtectionControl.self)
+                    let task = Task { try await store.request("native_set_runtime_protection", params: [
+                        "confirmed": .bool(true), "processEnabled": .bool(enabled), "transportEnabled": .bool(enabled), "expected": current.identity!
+                    ], timeout: .milliseconds(10)) }
+                    try await Task.sleep(for: .milliseconds(100))
+                    precondition(store.workspaceBusy && store.sessionProtectionInProgress)
+                    let safe = await store.shutdownForTermination()
+                    precondition(!safe)
+                    let value = try await task.value.decoded(NativeProtectionControl.self)
+                    precondition(value.enabled == (protectionRollback ? false : enabled)
+                        && value.transportEnabled == (protectionRollback ? false : enabled) && value.pid != current.pid)
+                    precondition(value.transportReport?.eligible == 1 && value.transportReport?.unsupported == 1)
                     precondition(!store.workspaceBusy && !store.sessionProtectionInProgress)
                 }
             }

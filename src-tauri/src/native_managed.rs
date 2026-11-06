@@ -281,6 +281,10 @@ fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
         return tauri::async_runtime::block_on(crate::native_ownership::set_protection(params));
     }
     #[cfg(target_os = "macos")]
+    if command == "native_set_runtime_protection" {
+        return tauri::async_runtime::block_on(crate::native_ownership::set_runtime_protection(params));
+    }
+    #[cfg(target_os = "macos")]
     if command == "native_install_service" {
         return tauri::async_runtime::block_on(crate::native_ownership::install_managed_service(params));
     }
@@ -290,7 +294,7 @@ fn dispatch(command: &str, params: Value) -> CmdResult<Value> {
             return Err(CommandFailure::coded("INVALID_PARAMS", "Core inspection requires empty params"));
         }
         return tauri::async_runtime::block_on(async {
-            serde_json::to_value(crate::native_lifecycle::inspect().await).map_err(CommandFailure::plain)
+            serde_json::to_value(crate::native_lifecycle::inspect_managed().await).map_err(CommandFailure::plain)
         });
     }
     #[cfg(target_os = "macos")]
@@ -531,15 +535,33 @@ fn run_stdio_with(restored: Option<clash_verge_service_ipc::OwnerSessionProof>) 
                                 capabilities.extend(["native_upgrade_core", "native_prepare_core_upgrade", "native_get_core_control"]);
                                 if tauri::async_runtime::block_on(crate::native_ownership::protection_supported()) {
                                     capabilities.push("native_set_session_protection");
+                                    if tauri::async_runtime::block_on(crate::native_ownership::runtime_protection_supported()) {
+                                        capabilities.push("native_set_runtime_protection");
+                                    }
                                 }
                                 if crate::native_ownership::service_tools_available() {
                                     capabilities.extend(["native_install_service", "native_inspect_core"]);
                                 }
                             }
+                            let inspection_dirty = std::cell::Cell::new(true);
+                            let inspection_cache = RefCell::new(None::<(std::time::Instant, crate::native_lifecycle::Inspection)>);
                             crate::native_host::serve_managed_with_activity(
-                                || Ok(tauri::async_runtime::block_on(data.snapshot())),
+                                || tauri::async_runtime::block_on(async {
+                                    if inspection_dirty.replace(false) || inspection_cache.borrow().as_ref()
+                                        .is_none_or(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(5)) {
+                                        let inspection = crate::native_lifecycle::inspect_managed().await;
+                                        *inspection_cache.borrow_mut() = Some((std::time::Instant::now(), inspection));
+                                    }
+                                    let mut snapshot = data.snapshot().await;
+                                    crate::native_lifecycle::attach_to_snapshot(&mut snapshot, &inspection_cache.borrow().as_ref().unwrap().1);
+                                    Ok(snapshot)
+                                }),
                                 |query| Ok(tauri::async_runtime::block_on(activity_data.activity_query(query))),
-                                move |command, params| {
+                                |command, params| {
+                                    if matches!(command, "native_core_start" | "native_core_stop" | "native_core_restart"
+                                        | "native_install_service" | "native_inspect_core" | "native_set_session_protection" | "native_set_runtime_protection" | "native_upgrade_core") {
+                                        inspection_dirty.set(true);
+                                    }
                                     #[cfg(feature = "native-lifecycle-acceptance")]
                                     if command == "native_core_restart" || (command == "native_core_start" && matches!(*CoreManager::global().get_running_mode(), RunningMode::NotRunning)) {
                                         return Err(CommandFailure::coded("ACCEPTANCE_START_REFUSED", "Acceptance package only recovers its isolated running core"));

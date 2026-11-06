@@ -116,7 +116,13 @@ pub(crate) fn run_inspection_attach(initial: crate::native_lifecycle::Inspection
     };
     let mut handler = |command: &str, params: Value| {
         if command == "native_claim_core" && claim_capable { return runtime.block_on(crate::native_ownership::claim(params)); }
-        if command == "native_install_service" && install_capable { return runtime.block_on(crate::native_ownership::install_service(params)); }
+        if command == "native_install_service" && install_capable {
+            let result = runtime.block_on(crate::native_ownership::install_service(params));
+            // Installation may change service availability even when it returns an error.
+            let next = runtime.block_on(crate::native_lifecycle::inspect());
+            *cached.borrow_mut() = (Instant::now(), next);
+            return result;
+        }
         validate_inspection(command, &params)?;
         let next = runtime.block_on(crate::native_lifecycle::inspect());
         let value = serde_json::to_value(&next).map_err(CommandFailure::plain)?;

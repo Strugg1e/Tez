@@ -200,11 +200,32 @@ pub(crate) async fn inspect() -> Inspection {
     if let Some(protocol) = protocol {
         inspection.service_protocol = Some(protocol.protocol.header_value());
         inspection.service_control_available = protocol.supports_tez_lifecycle();
-        if inspection.state == "runningReadOnly" && inspection.source == "service" && !inspection.service_control_available {
+        if inspection.source == "service" && !inspection.service_control_available {
+            inspection.can_start = false;
             inspection.reason = "service-upgrade-required";
+        } else if inspection.reason == "service-unavailable" {
+            inspection.reason = "service-status-unavailable";
         }
     }
     inspection
+}
+
+pub(crate) async fn inspect_managed() -> Inspection {
+    let mut inspection = inspect().await;
+    let generation = crate::core::service::active_service_session().ok().map(|proof| proof.generation);
+    mark_managed_ownership(&mut inspection, generation);
+    inspection
+}
+
+fn mark_managed_ownership(inspection: &mut Inspection, generation: Option<u64>) {
+    if generation.is_none() || generation != inspection.service_generation || inspection.source != "service" {
+        return;
+    }
+    match inspection.state {
+        "runningReadOnly" => { inspection.state = "running"; inspection.reason = "owned-service"; }
+        "recovering" => { inspection.state = "recoveringOwned"; inspection.reason = "owned-service-recovering"; }
+        _ => {}
+    }
 }
 
 pub(crate) async fn require_start_admission() -> Result<()> {
@@ -314,6 +335,21 @@ pub fn run_inspection() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_control_requires_the_current_service_session() {
+        let mut inspection = classify(Some(ServiceObservation {
+            active: true, generation: Some(42), pid: Some(123), desired_running: true,
+        }), Some(vec![process(123)]));
+        mark_managed_ownership(&mut inspection, Some(41));
+        assert_eq!(inspection.state, "runningReadOnly");
+        mark_managed_ownership(&mut inspection, Some(42));
+        assert_eq!(inspection.state, "running");
+        assert_eq!(inspection.reason, "owned-service");
+        let mut idle = classify(Some(idle()), Some(vec![]));
+        mark_managed_ownership(&mut idle, None);
+        assert_eq!(idle.state, "stopped");
+    }
 
     #[test]
     fn upgraded_content_addressed_core_is_discovered_in_approved_directory() -> Result<()> {

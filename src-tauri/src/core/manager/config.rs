@@ -474,6 +474,29 @@ mod tests {
     use clash_verge_service_ipc::{StageRejection, StageRuntimeOutcome};
     use std::{cell::Cell, time::Duration};
 
+    #[cfg(all(feature = "native-host", target_os = "macos"))]
+    #[test]
+    fn a_protected_rollback_does_not_publish_the_failed_runtime() -> anyhow::Result<()> {
+        use crate::{config::runtime::IRuntime, core::CoreManager};
+        use clash_verge_draft::{Draft, DraftTransaction};
+        for rolled_back in [true, false] {
+            let manager = CoreManager::default();
+            manager.mark_core_ready();
+            let generation = manager.current_core_readiness_generation();
+            let runtime = Draft::new(IRuntime::default());
+            let previous = runtime.data_arc();
+            let transaction = DraftTransaction::begin(vec![&runtime])?;
+            runtime.edit_draft(|draft| { draft.exists_keys.insert("failed-candidate".into()); });
+            manager.complete_native_runtime_protection(&runtime, &previous, rolled_back);
+            let result = Err(anyhow::anyhow!("restart failed or proxy restore failed"));
+            manager.retain_applied_runtime(&runtime, generation, &result);
+            transaction.rollback();
+            assert_eq!(runtime.data_arc().exists_keys.contains("failed-candidate"), !rolled_back);
+            assert!(manager.current_core_readiness_generation().is_some());
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_ready_replacement_keeps_the_applied_runtime_when_proxy_restore_fails() -> anyhow::Result<()> {
         use crate::{config::runtime::IRuntime, core::CoreManager};

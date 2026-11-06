@@ -109,6 +109,7 @@ final class NativeBackendStore {
     private(set) var serviceSetupInProgress = false
     private(set) var coreUpgradeInProgress = false
     private(set) var sessionProtectionInProgress = false
+    private(set) var serviceCapabilitiesNeedRefresh = false
 
     private var authorizationInProgress: Bool { serviceSetupInProgress || coreUpgradeInProgress || sessionProtectionInProgress }
     private var authorizationLabel: String { sessionProtectionInProgress ? "会话保护切换" : coreUpgradeInProgress ? "内核升级" : "后台服务更新" }
@@ -120,6 +121,33 @@ final class NativeBackendStore {
     var blocksTermination: Bool { authorizationInProgress || requiresManagedShutdown }
     var isReadOnlyConnection: Bool {
         mode == .attach || (mode == .automatic && observerSession)
+    }
+
+    var canResumeCoreManagement: Bool {
+        mode == .automatic && state == .connected && !workspaceBusy && !authorizationInProgress
+            && (observerSession || serviceCapabilitiesNeedRefresh)
+            && snapshot?.core.lifecycle?.canStart == true
+    }
+
+    func resumeCoreManagement() async throws {
+        guard canResumeCoreManagement else {
+            throw NativeBackendError.unavailable("启动条件尚未确认，请重新检测内核。")
+        }
+        if requiresManagedShutdown {
+            guard await shutdownForTermination() else {
+                throw NativeBackendError.unavailable("旧管理后台尚未安全退出，未启动新的管理后台。")
+            }
+        } else { disconnect() }
+        connect()
+        let deadline = ContinuousClock.now + .seconds(35)
+        while state == .connecting && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard state == .connected, !isReadOnlyConnection, supports("native_core_start") else {
+            throw NativeBackendError.unavailable(errorMessage ?? "管理连接未恢复，未发送内核启动请求。请重新检测状态。")
+        }
+        _ = try await request("native_core_start", serialWorkspace: true)
+        refresh()
     }
 
     init(mode: NativeBackendMode = .attach) {
@@ -250,7 +278,19 @@ final class NativeBackendStore {
         guard mode != .attach, state == .connected, supports("native_install_service"), !authorizationInProgress else {
             throw NativeBackendError.unavailable("当前连接未开放后台服务更新")
         }
-        return try await request("native_install_service", params: params, serialWorkspace: true)
+        let result: BackendJSON
+        do {
+            result = try await request("native_install_service", params: params, serialWorkspace: true)
+        } catch {
+            if case NativeBackendError.remote(let remote) = error, remote.code == .string("SERVICE_INSTALL_FAILED") {
+                serviceCapabilitiesNeedRefresh = true
+            }
+            throw error
+        }
+        if case .object(let fields) = result, fields["installed"] == .bool(true) {
+            serviceCapabilitiesNeedRefresh = true
+        }
+        return result
     }
 
     func upgradeCore(params: [String: BackendJSON]) async throws -> BackendJSON {
@@ -270,6 +310,7 @@ final class NativeBackendStore {
     }
 
     private func resetSession() {
+        serviceCapabilitiesNeedRefresh = false
         generation = UUID()
         helloTimer?.cancel()
         helloTimer = nil
@@ -476,14 +517,14 @@ final class NativeBackendStore {
             throw NativeBackendError.unavailable("后台正在退出，只允许重试恢复")
         }
         guard !workspaceBusy else { throw NativeBackendError.unavailable("后台正在执行请求，请等待完成") }
-        let humanPaced = command == "native_install_service" || command == "native_upgrade_core" || command == "native_set_session_protection"
+        let humanPaced = command == "native_install_service" || command == "native_upgrade_core" || command == "native_set_session_protection" || command == "native_set_runtime_protection"
         if humanPaced {
             guard mode != .attach, state == .connected, capabilities.contains(command), !authorizationInProgress else {
                 throw NativeBackendError.unavailable("当前连接未开放此授权操作")
             }
             serviceSetupInProgress = command == "native_install_service"
             coreUpgradeInProgress = command == "native_upgrade_core"
-            sessionProtectionInProgress = command == "native_set_session_protection"
+            sessionProtectionInProgress = command == "native_set_session_protection" || command == "native_set_runtime_protection"
             authorizationResultUnconfirmed = false
         }
         let serialized = serialWorkspace || humanPaced
@@ -525,7 +566,7 @@ final class NativeBackendStore {
             pending[id] = continuation
             requestCount += 1
             // Administrator authorization is human-paced; a request timeout must not detach its installer.
-            if command != "native_install_service" && command != "native_upgrade_core" && command != "native_set_session_protection" {
+            if command != "native_install_service" && command != "native_upgrade_core" && command != "native_set_session_protection" && command != "native_set_runtime_protection" {
                 timers[id] = Task { [weak self, timeout = requestTimeout ?? timeout] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled, let self, token == generation else { return }

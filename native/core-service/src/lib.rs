@@ -16,7 +16,7 @@ pub use channel::{
 pub use core::paths::{is_session_core_path, set_session_core_ipc_path};
 pub use core::structure::{
     ClaimCoreRequest, CoreIdentity, CoreSessionSnapshot, CoreUpgradeOutcome, SessionProtectionOutcome,
-    SessionProtectionState, SetSessionProtectionRequest, UpgradeCoreRequest, parse_mihomo_version,
+    RuntimeProtectionRequest, SessionProtectionState, SetSessionProtectionRequest, UpgradeCoreRequest, parse_mihomo_version,
 };
 pub use core::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
@@ -27,6 +27,7 @@ pub use core::{
     StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{CORE_DISPLACED_EXTENSION, CORE_STAGING_EXTENSION, OwnerPaths, ServicePaths, service_paths};
+pub mod protection;
 
 #[cfg(feature = "standalone")]
 pub use core::{

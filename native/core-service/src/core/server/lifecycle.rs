@@ -79,12 +79,17 @@ async fn snapshot(owner: &AuthenticatedOwner) -> std::result::Result<CoreSession
     }
     let core_sha256 =
         crate::management::sha256_file(Path::new(&config.core_config.core_path)).map_err(|_| changed())?;
+    let manager = CORE_MANAGER.lock().await;
+    let process_enabled = manager.session_protection_enabled().await;
+    let transport_base = manager.transport_base().await;
     Ok(CoreSessionSnapshot {
         identity: current,
         core_path: config.core_config.core_path,
         core_sha256,
         runtime_yaml: yaml,
-        session_protection: CORE_MANAGER.lock().await.session_protection_enabled().await,
+        session_protection: process_enabled,
+        transport_protection: transport_base.is_some(),
+        runtime_base_yaml: transport_base,
         core_ipc_path: Some(config.core_config.core_ipc_path),
     })
 }
@@ -222,8 +227,12 @@ async fn upgrade(
     owner: &AuthenticatedOwner,
     request: &UpgradeCoreRequest,
 ) -> std::result::Result<CoreUpgradeOutcome, ServiceError> {
-    if CORE_MANAGER.lock().await.session_protection_enabled().await {
-        return Err(rejected("Disable session protection before upgrading the core"));
+    let protected = {
+        let manager = CORE_MANAGER.lock().await;
+        manager.session_protection_enabled().await || manager.transport_base().await.is_some()
+    };
+    if protected {
+        return Err(rejected("Disable runtime protections before upgrading the core"));
     }
     require_identity(owner, &request.expected).await?;
     let candidate = verify_candidate(request).await?;
@@ -353,6 +362,20 @@ pub(super) fn routes(router: Router) -> Router {
                 Ok(value) => ok_json(value),
                 Err(error) => service_error(error),
             }
+        })
+        .post(IpcCommand::RuntimeProtection.as_ref(), |ctx| async move {
+            let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<crate::RuntimeProtectionRequest>>(&ctx) {
+                ControlFlow::Continue(value) => value,
+                ControlFlow::Break(response) => return response,
+            };
+            let _guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
+            };
+            match switch_runtime_protection(&owner, &request.payload).await {
+                Ok(value) => ok_json(value),
+                Err(error) => service_error(error),
+            }
         });
     router
         .post(IpcCommand::StartIdleCore.as_ref(), |ctx| async move {
@@ -430,10 +453,15 @@ async fn protection_state(
     let current = identity(owner).await?;
     let manager = CORE_MANAGER.lock().await;
     let (_, config) = manager.running_core_config().await.ok_or_else(changed)?;
+    let base = manager.transport_base().await;
+    let yaml = if let Some(base) = &base { base.clone() }
+        else { tokio::fs::read_to_string(&config.core_config.config_path).await.map_err(|_| changed())? };
     Ok(crate::SessionProtectionState {
         identity: current,
         enabled: manager.session_protection_enabled().await,
         core_ipc_path: config.core_config.core_ipc_path,
+        transport_enabled: base.is_some(),
+        transport_report: crate::protection::inspect_transport(&yaml).ok(),
     })
 }
 
@@ -441,6 +469,27 @@ async fn protection_state(
 async fn switch_protection(
     owner: &AuthenticatedOwner,
     request: &crate::SetSessionProtectionRequest,
+) -> std::result::Result<crate::SessionProtectionOutcome, ServiceError> {
+    let transport_enabled = CORE_MANAGER.lock().await.transport_base().await.is_some();
+    switch_runtime_protection(owner, &crate::RuntimeProtectionRequest {
+        expected: request.expected.clone(), process_enabled: request.enabled, transport_enabled,
+        restart: false, runtime: None,
+    }).await
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn write_protection_yaml(path: &str, yaml: &str) -> std::result::Result<(), ServiceError> {
+    let path = Path::new(path);
+    crate::core::runtime_generation::write_atomically(path, yaml.as_bytes()).await
+        .map_err(|_| rejected("Could not publish runtime protection configuration"))?;
+    crate::core::platform_security::secure_private_service_file_if_exists(path)
+        .map_err(|_| rejected("Could not secure runtime protection configuration"))
+}
+
+#[cfg(target_os = "macos")]
+async fn switch_runtime_protection(
+    owner: &AuthenticatedOwner,
+    request: &crate::RuntimeProtectionRequest,
 ) -> std::result::Result<crate::SessionProtectionOutcome, ServiceError> {
     let gate = CORE_MANAGER.lock().await.identity_gate();
     let _identity = gate.lock().await;
@@ -452,41 +501,70 @@ async fn switch_protection(
         .await
         .ok_or_else(changed)?;
     let enabled = CORE_MANAGER.lock().await.session_protection_enabled().await;
-    if enabled == request.enabled {
+    let previous_base = CORE_MANAGER.lock().await.transport_base().await;
+    if enabled == request.process_enabled && previous_base.is_some() == request.transport_enabled && !request.restart && request.runtime.is_none() {
         return Ok(crate::SessionProtectionOutcome {
             outcome: "unchanged".into(),
             session: snapshot(owner).await?,
         });
     }
-    let prepared = if request.enabled {
-        Some(
-            crate::core::session_protection::SessionCoreCopy::prepare(&old)
-                .await
-                .map_err(|_| rejected("Could not prepare session core"))?,
-        )
-    } else {
-        None
-    };
+    let old_yaml = snapshot(owner).await?.runtime_yaml;
+    let base = request.runtime.as_ref().map(|runtime| runtime.yaml.as_str())
+        .or(previous_base.as_deref()).unwrap_or(&old_yaml).to_owned();
+    if request.transport_enabled && previous_base.is_none() {
+        let report = crate::protection::inspect_transport(&base).map_err(|_| rejected("Transport configuration is invalid"))?;
+        if report.dynamic_providers == 0 && !report.nodes.iter().any(|node| node.status != "unsupported") {
+            return Err(rejected("No compatible TLS nodes; transport protection was not enabled"));
+        }
+    }
+    let effective = if request.transport_enabled { crate::protection::render_transport(&base)
+        .map_err(|_| rejected("Could not prepare transport configuration"))? } else { base.clone() };
+    let bundle = request.runtime.clone();
+    let prepared_runtime = if let Some(bundle) = &bundle { Some(prepare_runtime(owner, bundle).await?) } else { None };
     let previous = CORE_MANAGER.lock().await.take_session_protection().await;
-    let mut next = old.clone();
-    if let Some(copy) = prepared.as_ref() {
+    let mut next = prepared_runtime.as_ref().map(|prepared| prepared.clash_config().clone()).unwrap_or_else(|| old.clone());
+    if let Some(copy) = previous.as_ref() {
+        if prepared_runtime.is_none() {
+            next.core_config.core_path = copy.original_core.clone();
+            next.core_config.core_ipc_path = copy.original_ipc.clone();
+        }
+    }
+    let prepared = if request.process_enabled {
+        if let Some(copy) = previous.as_ref().filter(|copy| copy.original_core == next.core_config.core_path) { Some(copy.clone()) }
+        else {
+            match crate::core::session_protection::SessionCoreCopy::prepare(&next).await {
+                Ok(copy) => Some(std::sync::Arc::new(copy)),
+                Err(_) => { CORE_MANAGER.lock().await.set_session_protection(previous).await; return Err(rejected("Could not prepare session core")); }
+            }
+        }
+    } else { None };
+    if let Some(copy) = &prepared {
         next.core_config.core_path = copy.executable().to_string_lossy().into_owned();
         next.core_config.core_ipc_path = copy.ipc_path();
-    } else if let Some(copy) = previous.as_ref() {
-        next.core_config.core_path = copy.original_core.clone();
-        next.core_config.core_ipc_path = copy.original_ipc.clone();
     }
+    let base_path = Path::new(&next.core_config.config_dir).join("config.yaml");
+    next.core_config.config_path = if request.transport_enabled {
+        Path::new(&next.core_config.config_dir).join(crate::core::runtime_generation::SESSION_CONFIG_FILE_NAME)
+    } else { base_path.clone() }.to_string_lossy().into_owned();
     let stopped = CORE_MANAGER.lock().await.stop_core().await;
     if stopped.is_err() {
         CORE_MANAGER.lock().await.set_session_protection(previous).await;
         return Err(rejected("Current core did not stop; mode unchanged"));
     }
-    CORE_MANAGER.lock().await.set_session_protection(prepared).await;
-    let started = CORE_MANAGER
+    CORE_MANAGER.lock().await.set_session_protection(prepared.clone()).await;
+    CORE_MANAGER.lock().await.set_transport_base(request.transport_enabled.then_some(base.clone())).await;
+    let mut backup = if let Some(prepared) = &prepared_runtime { prepared.backup().await.map(Some) } else { Ok(None) };
+    let written = async {
+        if backup.is_err() { return Err(rejected("Could not snapshot the current runtime resources")); }
+        if let Some(prepared) = &prepared_runtime { prepared.materialize().await?; }
+        else { write_protection_yaml(base_path.to_str().ok_or_else(changed)?, &base).await?; }
+        write_protection_yaml(&next.core_config.config_path, &effective).await
+    }.await;
+    let started = if written.is_ok() { CORE_MANAGER
         .lock()
         .await
         .start_core(next.clone(), owner.identity.clone())
-        .await;
+        .await } else { Err(anyhow!("Runtime protection configuration could not be applied")) };
     let healthy = started.is_ok() && controller_version(&next).await.is_ok();
     let outcome = if healthy {
         "changed"
@@ -498,6 +576,9 @@ async fn switch_protection(
             .await
             .map_err(|_| rejected("Candidate stop unconfirmed; inspect current core"))?;
         CORE_MANAGER.lock().await.set_session_protection(previous).await;
+        CORE_MANAGER.lock().await.set_transport_base(previous_base).await;
+        if let Ok(Some(backup)) = backup.as_mut() { backup.restore().await?; }
+        write_protection_yaml(&old.core_config.config_path, &old_yaml).await?;
         CORE_MANAGER
             .lock()
             .await

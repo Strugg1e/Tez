@@ -315,7 +315,8 @@ async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig,
 
 pub struct CoreManager {
     #[cfg(target_os = "macos")]
-    session_protection: Mutex<Option<super::session_protection::SessionCoreCopy>>,
+    session_protection: Mutex<Option<Arc<super::session_protection::SessionCoreCopy>>>,
+    transport_base: Mutex<Option<String>>,
     identity_gate: Arc<Mutex<()>>,
     running_pid: Arc<AtomicU32>,
     running_config: Mutex<Option<ClashConfig>>,
@@ -344,6 +345,7 @@ impl CoreManager {
         CoreManager {
             #[cfg(target_os = "macos")]
             session_protection: Mutex::new(None),
+            transport_base: Mutex::new(None),
             identity_gate: Arc::new(Mutex::new(())),
             running_pid: Arc::new(AtomicU32::new(0)),
             running_config: Mutex::new(None),
@@ -387,13 +389,21 @@ impl CoreManager {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) async fn take_session_protection(&self) -> Option<super::session_protection::SessionCoreCopy> {
+    pub(super) async fn take_session_protection(&self) -> Option<Arc<super::session_protection::SessionCoreCopy>> {
         self.session_protection.lock().await.take()
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) async fn set_session_protection(&self, value: Option<super::session_protection::SessionCoreCopy>) {
+    pub(super) async fn set_session_protection(&self, value: Option<Arc<super::session_protection::SessionCoreCopy>>) {
         *self.session_protection.lock().await = value;
+    }
+
+    pub(super) async fn transport_base(&self) -> Option<String> {
+        self.transport_base.lock().await.clone()
+    }
+
+    pub(super) async fn set_transport_base(&self, value: Option<String>) {
+        *self.transport_base.lock().await = value;
     }
 
     #[cfg(target_os = "macos")]
@@ -524,6 +534,8 @@ impl CoreManager {
         let core_ipc_path = start_clash
             .as_ref()
             .map(|config| config.core_config.core_ipc_path.clone());
+        let session_yaml = start_clash.as_ref().map(|config| std::path::Path::new(&config.core_config.config_dir)
+            .join(super::runtime_generation::SESSION_CONFIG_FILE_NAME));
         if let Some(config) = start_clash {
             info!("Clearing running config: {:?}", config);
         } else {
@@ -532,6 +544,13 @@ impl CoreManager {
 
         remove_core_runtime_record().await;
         self.after_stop(core_ipc_path).await;
+        if self.transport_base.lock().await.take().is_some() {
+            if let Some(path) = session_yaml {
+                if let Err(error) = tokio::fs::remove_file(path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound { tracing::warn!("Could not remove ended transport session file: {error}"); }
+                }
+            }
+        }
         #[cfg(target_os = "macos")]
         {
             crate::set_session_core_ipc_path(None);

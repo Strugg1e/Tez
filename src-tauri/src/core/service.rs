@@ -896,7 +896,7 @@ pub(crate) fn run_privileged_service_action(action: PendingAction) -> Result<()>
 }
 
 /// Builds the same runtime bundle description for both service start and staging.
-async fn collect_service_runtime_bundle(config_file: &Path) -> Result<RuntimeBundle> {
+pub(super) async fn collect_service_runtime_bundle(config_file: &Path) -> Result<RuntimeBundle> {
     let verge_config = Config::verge().await;
     let clash_core = verge_config.latest_arc().get_valid_clash_core();
     drop(verge_config);

@@ -371,7 +371,7 @@ pub(super) async fn commit_staged_config(
     write_atomically(config_path, yaml.as_bytes()).await
 }
 
-pub(super) async fn write_atomically(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_atomically(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
     async fn write_temp(staged: &Path, contents: &[u8]) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt as _;
 
@@ -646,6 +646,8 @@ mod tests {
             "config.yaml",
             "Config.yaml",
             "CONFIG.YAML",
+            "config.session.yaml",
+            "CONFIG.SESSION.YAML",
             ".runtime-manifest.json",
             ".Runtime-Manifest.JSON",
         ] {

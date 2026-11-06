@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
-mkdir -p .build/module-cache
+mkdir -p .build/module-cache output.noindex
 sources=()
 for source in Sources/TezNative/*.swift; do
     [[ "$source" == */TezNativeApp.swift ]] || sources+=("$source")

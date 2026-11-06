@@ -12,6 +12,7 @@ struct LiveWorkspaceView: View {
     @State private var coreBusy = false
     @State private var coreMessage: String?
     @State private var coreDetails: String?
+    @State private var coreFeedbackFailed = false
     @State private var inspectionBusy = false
     @State private var confirmClaim = false
     @State private var claimInspection: NativeCoreInspection?
@@ -24,7 +25,8 @@ struct LiveWorkspaceView: View {
 
     private var connectionPresentation: TezConnectionPresentation {
         TezConnectionPresentation(state: store.state, hasSnapshot: store.snapshot != nil,
-                                  coreState: store.snapshot?.core.state, writable: hasWriteCapability)
+                                  coreState: store.snapshot?.core.lifecycle?.state == "stopped" ? "stopped" : store.snapshot?.core.state,
+                                  writable: hasWriteCapability)
     }
 
     init(store: NativeBackendStore, selection: Binding<WorkspaceSection?> = .constant(.connection)) {
@@ -41,6 +43,7 @@ struct LiveWorkspaceView: View {
                     Spacer(minLength: 0)
                 }
                 .padding(20)
+                .overlay { TezWindowDragRegion(identifier: "tez.window.drag.brand").accessibilityHidden(true) }
                 List(WorkspaceSection.allCases, selection: $selection) { section in
                     Label(section.title, systemImage: section.symbol)
                         .padding(.vertical, 5)
@@ -83,6 +86,7 @@ struct LiveWorkspaceView: View {
                         ContentUnavailableView(emptyTitle, systemImage: (selection ?? .connection).symbol,
                                                description: Text(emptyDescription))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .tezWindowDragBackground("tez.window.drag.empty")
                     }
                 }
             }
@@ -170,7 +174,7 @@ struct LiveWorkspaceView: View {
     }
 
     private func connection(_ snapshot: NativeSnapshot) -> some View {
-        ScrollView {
+        TezPageScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("连接概况").font(TezType.page)
                 NativeProxyControls(store: store, snapshot: snapshot) {
@@ -179,20 +183,31 @@ struct LiveWorkspaceView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 12) {
                     Text("内核与服务").font(TezType.section)
-                    if LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) || store.supports("native_upgrade_core") {
+                    let actions = NativeCoreActions(coreState: snapshot.core.state, inspection: snapshot.core.lifecycle, writable: !store.isReadOnlyConnection)
+                    if LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) || store.canResumeCoreManagement {
                         HStack(spacing: 12) {
                             ForEach(LiveCoreAction.allCases) { action in
                                 Button(action.title, systemImage: action.symbol) { pendingCoreAction = action }
-                                    .disabled(store.state != .connected || coreBusy || store.workspaceBusy || !store.supports(action.command)
-                                              || (action == .start && snapshot.core.state == "ready"))
+                                    .disabled(store.state != .connected || coreBusy || store.workspaceBusy
+                                              || !(store.supports(action.command) || (action == .start && store.canResumeCoreManagement))
+                                              || !(action == .start ? actions.canStart : action == .stop ? actions.canStop : actions.canRestart))
                                     .accessibilityIdentifier("live.core.\(action.rawValue)")
                             }
                             if coreBusy { ProgressView().controlSize(.small) }
                             Spacer()
                         }
                     }
+                    if let coreMessage {
+                        LiveCommandFeedback(message: coreMessage, details: coreDetails, tone: coreFeedbackFailed ? .error : .neutral)
+                            .accessibilityIdentifier("live.core.feedback")
+                    }
                     if let inspection = snapshot.core.lifecycle {
-                        Text(inspection.explanation).font(TezType.body).foregroundStyle(.secondary)
+                        HStack(spacing: 16) {
+                            Label(store.state != .connected ? "系统服务未确认" : inspection.serviceProtocol == nil ? "系统服务未响应" : "系统服务已连接", systemImage: "gearshape.2")
+                            Label(store.state == .connected ? inspection.stateLabel : "内核状态未确认", systemImage: "cpu")
+                        }.font(TezType.metadata).foregroundStyle(.secondary)
+                        Text(store.state == .connected ? inspection.explanation : "当前为离线快照。重新连接后再确认服务与内核运行状态。")
+                            .font(TezType.body).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     NativeSessionProtectionView(store: store, coreState: snapshot.core.state)
@@ -220,18 +235,23 @@ struct LiveWorkspaceView: View {
                             }
                             if let inspection = snapshot.core.lifecycle {
                                 if store.supports("native_install_service") {
-                                    TezSettingRow(title: "后台服务", detail: inspection.serviceProtocol == nil ? "尚未安装。安装时 macOS 会请求授权。" : "更新时 macOS 会请求授权。") {
-                                        Button(inspection.serviceProtocol == nil ? "安装后台服务…" : "升级后台服务…", systemImage: "gearshape.2") {
+                                    TezSettingRow(title: "后台服务", detail: !store.isReadOnlyConnection && !inspection.canInstallService ? "先停止自有内核，再更新后台服务。" : inspection.serviceProtocol == nil ? "后台服务未响应。安装或修复时 macOS 会请求授权。" : "更新时 macOS 会请求授权。安装完成后内核保持停止。") {
+                                        Button(inspection.serviceProtocol == nil ? "安装或修复后台服务…" : "升级后台服务…", systemImage: "gearshape.2") {
                                             serviceInstallInspection = inspection
                                             confirmServiceInstall = true
                                         }
-                                        .disabled(coreBusy || store.workspaceBusy)
+                                        .disabled(coreBusy || store.workspaceBusy || !inspection.canInstallService)
                                         .accessibilityIdentifier("live.service.install")
                                     }
                                 }
                                 TezSettingRow(title: "内核控制权", detail: "重新检测运行状态；接管后原管理会话失效。") {
                                     HStack {
                                         TezToolButton(title: "重新检测内核", symbol: "arrow.clockwise", enabled: !inspectionBusy && !store.workspaceBusy && store.state == .connected) { inspectCore() }
+                                        if store.isReadOnlyConnection && inspection.state == "runningReadOnly"
+                                            && inspection.serviceControlAvailable == true && !store.supports("native_claim_core") {
+                                            Button("恢复管理连接", systemImage: "arrow.triangle.2.circlepath") { store.reconnectAfterClaim() }
+                                                .disabled(coreBusy || store.workspaceBusy)
+                                        }
                                         if store.supports("native_claim_core") {
                                             Button("接管控制权…", systemImage: "key.fill") { claimInspection = inspection; confirmClaim = true }
                                                 .disabled(coreBusy || store.workspaceBusy || inspection.state != "runningReadOnly" || inspection.serviceStartedAt == nil)
@@ -245,9 +265,6 @@ struct LiveWorkspaceView: View {
                     if snapshot.core.lifecycle == nil && !LiveCoreAction.allCases.contains(where: { store.supports($0.command) }) {
                         Text("只读连接：当前后台未开放内核控制。")
                             .font(TezType.metadata).foregroundStyle(.secondary).padding(.bottom, 12)
-                    }
-                    if let coreMessage {
-                        LiveCommandFeedback(message: coreMessage, details: coreDetails).padding(.bottom, 12)
                     }
                     if let message = snapshot.core.message {
                         Text(LiveText.message(message)).font(TezType.metadata).foregroundStyle(.secondary)
@@ -287,7 +304,16 @@ struct LiveWorkspaceView: View {
         inspectionBusy = true
         Task { @MainActor in
             defer { inspectionBusy = false }
-            if store.supports("native_inspect_core") { _ = try? await store.request("native_inspect_core") }
+            do {
+                let inspection = try await store.request("native_inspect_core").decoded(NativeCoreInspection.self)
+                coreMessage = inspection.explanation
+                coreDetails = nil
+                coreFeedbackFailed = false
+            } catch {
+                coreMessage = "内核状态检测失败。当前状态未确认，未执行启动或接管。"
+                coreDetails = NativeFeatureError.message(error)
+                coreFeedbackFailed = true
+            }
             store.refresh()
         }
     }
@@ -329,6 +355,7 @@ struct LiveWorkspaceView: View {
         coreBusy = true
         coreMessage = nil
         coreDetails = nil
+        coreFeedbackFailed = false
         Task { @MainActor in
             defer { coreBusy = false }
             do {
@@ -340,16 +367,35 @@ struct LiveWorkspaceView: View {
                     coreMessage = "后台服务重新安装完成。内核保持停止，请手动启动。"
                     store.refresh()
                 } else {
-                    coreMessage = "后台服务更新完成，正在恢复连接。检测完成后可启动或接管内核。"
-                    store.reconnectAfterClaim()
+                    coreMessage = "后台服务更新完成。请按最新状态手动启动或接管内核。"
+                    store.refresh()
                 }
             } catch {
-                coreMessage = "后台服务更新未完成。取消授权后可以重试；其他情况请重新检测内核状态。"
+                coreMessage = serviceFailureSummary(error)
                 coreDetails = NativeFeatureError.message(error)
-                if store.isReadOnlyConnection, case NativeBackendError.remote = error { store.reconnectAfterClaim() }
-                else { store.refresh() }
+                coreFeedbackFailed = true
+                store.refresh()
             }
         }
+    }
+
+    private func serviceFailureSummary(_ error: Error) -> String {
+        guard case NativeBackendError.remote(let remote) = error else {
+            return "后台服务更新结果未确认。请查看技术详情并重新检测状态。"
+        }
+        if remote.code == .string("SERVICE_INSTALL_CANCELLED") { return "管理员授权已取消，未完成服务更新。" }
+        let detail = remote.detail
+        let reason: String
+        if detail.contains("owner lock") { reason = "后台服务未能及时退出，更新中断。" }
+        else if detail.contains("Failed to unload") { reason = "系统未完成后台服务卸载，更新中断。" }
+        else if detail.contains("Failed to publish approved cores") { reason = "内核文件安装失败，服务更新中断。" }
+        else if detail.contains("Failed to publish the background service") { reason = "后台服务文件安装失败。" }
+        else if detail.contains("Failed to register") { reason = "系统未能加载后台服务。" }
+        else if detail.contains("did not become ready") { reason = "后台服务没有就绪，更新未通过检查。" }
+        else { reason = "后台服务更新失败，请查看技术详情。" }
+        if detail.contains("could not be restored") { return reason + " 自动恢复失败，请重新检测后修复服务。" }
+        if detail.contains("background service was restored") { return reason + " 后台服务已恢复，请重新检测内核。" }
+        return reason + " 请重新检测当前状态。"
     }
 
     private func inspectServiceInstall() {
@@ -373,19 +419,27 @@ struct LiveWorkspaceView: View {
     }
 
     private func runCore(_ action: LiveCoreAction) {
-        guard !coreBusy, !store.workspaceBusy, store.supports(action.command) else { return }
+        guard !coreBusy, !store.workspaceBusy,
+              store.supports(action.command) || (action == .start && store.canResumeCoreManagement) else { return }
         coreBusy = true
         coreMessage = nil
         coreDetails = nil
+        coreFeedbackFailed = false
         Task { @MainActor in
             defer { coreBusy = false }
             do {
+                if action == .start && store.canResumeCoreManagement {
+                    try await store.resumeCoreManagement()
+                    coreMessage = "管理连接已恢复，启动请求已完成。运行状态以后台快照为准。"
+                    return
+                }
                 let result = try await store.request(action.command, serialWorkspace: true)
                 coreMessage = "\(action.title)请求已完成。运行状态以后台快照为准。"
                 coreDetails = LiveCommandFeedback.render(result)
             } catch {
                 coreMessage = "\(action.title)请求失败。请检查详情和当前内核状态。"
                 coreDetails = LiveCommandFeedback.errorDetails(error)
+                coreFeedbackFailed = true
             }
             store.refresh()
         }
@@ -522,6 +576,7 @@ private struct LiveProfilesView: View {
                 .accessibilityIdentifier("live.profiles.add")
         }
         .padding(.horizontal, TezStyle.pageInset).frame(height: 72)
+        .tezWindowDragBackground("tez.window.drag.header")
         .background { TezContentMaterial(material: .headerView) }
     }
 
@@ -564,12 +619,13 @@ private struct LiveProfilesView: View {
                 Spacer()
             }.font(TezType.metadata).foregroundStyle(.secondary)
                 .padding(.horizontal, 14).frame(height: 28)
+                .tezWindowDragBackground("tez.window.drag.footer")
         }
         .frame(minWidth: 200, idealWidth: 236, maxWidth: 280)
     }
 
     private var profileDetailPane: some View {
-        ScrollView {
+        TezPageScrollView {
             if let profile = selected {
                 profileDetails(profile).id(profile.uid).transition(.opacity)
             } else {
@@ -717,6 +773,7 @@ private struct LiveRoutesView: View {
                 let compact = geometry.size.width < 700 || geometry.size.height < 560
                 VStack(spacing: 0) {
                     groupContext(compact: compact)
+                        .tezWindowDragBackground("tez.window.drag.header")
                     Divider()
                     filterBar
                     Divider()
@@ -849,6 +906,7 @@ private struct LiveRoutesView: View {
         .font(TezType.body)
         .padding(.horizontal, TezStyle.pageInset)
         .frame(height: 48)
+        .tezWindowDragBackground("tez.window.drag.filter")
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
@@ -858,6 +916,7 @@ private struct LiveRoutesView: View {
                 ContentUnavailableView(search.isEmpty ? "没有线路" : "没有匹配的线路",
                                        systemImage: search.isEmpty ? "network" : "magnifyingglass")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .tezWindowDragBackground("tez.window.drag.empty")
                     .background(Color(nsColor: .textBackgroundColor))
             } else if showProtocol {
                 Table(visibleRows, selection: $selectedID, sortOrder: $sortOrder) {
@@ -1121,7 +1180,7 @@ private struct LiveRoutesView: View {
     }
 
     private func detailRail(compact: Bool) -> some View {
-      ScrollView {
+      TezPageScrollView {
         VStack(spacing: 0) {
             routeDetails(compact: compact)
                 .padding(.horizontal, TezStyle.pageInset)
@@ -1156,11 +1215,12 @@ private struct LiveRoutesView: View {
             .font(TezType.metadata).foregroundStyle(.secondary)
             .padding(.horizontal, TezStyle.pageInset)
             .frame(height: 28)
+            .tezWindowDragBackground("tez.window.drag.footer")
     }
 
     private var sideInspector: some View {
       VStack(spacing: 0) {
-        ScrollView {
+        TezPageScrollView {
             if let row = selected {
                 VStack(alignment: .leading, spacing: 24) {
                   VStack(alignment: .leading, spacing: 6) {
@@ -1195,6 +1255,7 @@ private struct LiveRoutesView: View {
             if let error = latency.error { TezOperationFeedback(message: error, tone: .error) }
         }
         .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+        .tezWindowDragBackground("tez.window.drag.actions")
         .accessibilityIdentifier("live.routes.actionRail")
       }
         .background { TezContentMaterial(material: .contentBackground) }

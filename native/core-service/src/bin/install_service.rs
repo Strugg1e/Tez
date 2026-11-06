@@ -615,6 +615,48 @@ fn launchd_service_target() -> String {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn repair_after_service_stop(timeout: Duration, mut repair: impl FnMut() -> Result<(), Error>) -> Result<(), Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match repair() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)) => {
+                if Instant::now() >= deadline {
+                    return Err(error).context("Timed out waiting for the service to release its owner lock");
+                }
+                std::thread::sleep(Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())));
+            }
+            Err(error) => return Err(error).context("Failed to prepare stopped service state"),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn finish_service_installation(
+    result: Result<(), Error>,
+    restore_required: bool,
+    restore: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    match result {
+        Err(error) if restore_required => match restore() {
+            Ok(()) => Err(error).context("Installation failed; the background service was restored. Inspect the current core before retrying"),
+            Err(recovery) => Err(error).context(format!("Installation failed and the background service could not be restored: {recovery:#}")),
+        },
+        result => result,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_launchd_service(plist_path: &str, debug: bool) -> Result<(), Error> {
+    if probe_launchd_service(debug)? == LaunchdInstallPlan::SkipBootout {
+        run_command("launchctl", &["enable", &launchd_service_target()], debug)?;
+        run_command("launchctl", &["bootstrap", "system", plist_path], debug)?;
+    }
+    wait_for_service_ready()
+}
+
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum LaunchdInstallPlan {
     SkipBootout,
@@ -792,38 +834,42 @@ fn main() -> Result<(), Error> {
     );
     let plist_path = plist_file.to_string_lossy().into_owned();
 
-    if launchd_install_plan == LaunchdInstallPlan::Bootout {
-        // A loaded job may have lost its plist; only the label still reaches it.
-        run_command("launchctl", &["bootout", &launchd_service_target()], debug)?;
-    }
-    shared::repair_active_owner_state()?;
-    // Staged where the service is already down, so a core it was running no longer holds its file.
-    install_service_cores(&options.cores)?;
-    publish_staged_binary(&staged, &target_binary_path)?;
-    std::fs::write(&info_plist_path, info_plist_content)
-        .with_context(|| format!("failed to write Info.plist {info_plist_path:?}"))?;
-    File::create(&plist_file)
-        .and_then(|mut file| file.write_all(launchd_plist_content.as_bytes()))
-        .map_err(|e| anyhow::anyhow!("Failed to write plist file: {}", e))?;
+    let restore_required = launchd_install_plan == LaunchdInstallPlan::Bootout;
+    let result = (|| {
+        if restore_required {
+            // A loaded job may have lost its plist; only the label still reaches it.
+            run_command("launchctl", &["bootout", &launchd_service_target()], debug)
+                .context("Failed to unload the background service")?;
+        }
+        // bootout removes the launchd job before the exiting daemon releases its owner lock.
+        repair_after_service_stop(Duration::from_secs(10), shared::repair_active_owner_state)?;
+        install_service_cores(&options.cores).context("Failed to publish approved cores")?;
+        publish_staged_binary(&staged, &target_binary_path).context("Failed to publish the background service")?;
+        std::fs::write(&info_plist_path, info_plist_content)
+            .with_context(|| format!("failed to write Info.plist {info_plist_path:?}"))?;
+        File::create(&plist_file)
+            .and_then(|mut file| file.write_all(launchd_plist_content.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("Failed to write plist file: {}", e))?;
 
-    set_macos_permissions(&plist_file, 0o644)?;
-    set_macos_owner(&plist_file)?;
-    set_macos_permissions(&target_binary_path, 0o544)?;
-    set_macos_owner(&target_binary_path)?;
-    set_macos_permissions(&bundle_path, 0o755)?;
-    set_macos_owner_recursive(&bundle_path)?;
+        set_macos_permissions(&plist_file, 0o644)?;
+        set_macos_owner(&plist_file)?;
+        set_macos_permissions(&target_binary_path, 0o544)?;
+        set_macos_owner(&target_binary_path)?;
+        set_macos_permissions(&bundle_path, 0o755)?;
+        set_macos_owner_recursive(&bundle_path)?;
 
-    let launchd_target = launchd_service_target();
-    run_command("launchctl", &["enable", &launchd_target], debug)?;
-    run_command("launchctl", &["bootstrap", "system", &plist_path], debug)?;
-    run_command(
-        "launchctl",
-        &["start", clash_verge_service_ipc::MACOS_SERVICE_ID],
-        debug,
-    )?;
-    wait_for_service_ready()?;
-
-    Ok(())
+        let launchd_target = launchd_service_target();
+        run_command("launchctl", &["enable", &launchd_target], debug)?;
+        run_command("launchctl", &["bootstrap", "system", &plist_path], debug)
+            .context("Failed to register the background service with launchd")?;
+        run_command(
+            "launchctl",
+            &["start", clash_verge_service_ipc::MACOS_SERVICE_ID],
+            debug,
+        )?;
+        wait_for_service_ready().context("The background service did not become ready")
+    })();
+    finish_service_installation(result, restore_required, || restore_launchd_service(&plist_path, debug))
 }
 
 #[cfg(target_os = "linux")]
@@ -1039,6 +1085,96 @@ fn configure_windows_service_recovery(service: &platform_lib::service::Service) 
 mod install_core_tests {
     use super::install_core;
     use std::path::PathBuf;
+
+    #[test]
+    fn macos_repair_waits_for_the_exiting_service_lock() -> anyhow::Result<()> {
+        let mut attempts = 0;
+        super::repair_after_service_stop(std::time::Duration::from_secs(1), || {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+            }
+            Ok(())
+        })?;
+        assert_eq!(attempts, 3);
+        let error = super::repair_after_service_stop(std::time::Duration::ZERO, || {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+        }).expect_err("a service that never exits must not hang installation");
+        assert!(format!("{error:#}").contains("service to release"));
+        Ok(())
+    }
+
+    #[test]
+    fn macos_install_failure_restores_the_unloaded_service_and_keeps_the_error() {
+        let mut restored = false;
+        let error = super::finish_service_installation(Err(anyhow::anyhow!("core publication failed")), true, || {
+            restored = true;
+            Ok(())
+        }).unwrap_err();
+        assert!(restored);
+        let detail = format!("{error:#}");
+        assert!(detail.contains("core publication failed") && detail.contains("restored"));
+        let error = super::finish_service_installation(Err(anyhow::anyhow!("publication failed")), true, || {
+            Err(anyhow::anyhow!("bootstrap failed"))
+        }).unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("publication failed") && detail.contains("bootstrap failed"));
+        assert!(super::finish_service_installation(Ok(()), true, || panic!("successful installation must not restore")).is_ok());
+        assert!(super::finish_service_installation(Err(anyhow::anyhow!("preflight failed")), false, || panic!("nothing was unloaded")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "Creates and removes one isolated GUI launchd job; never touches the Tez service"]
+    fn macos_launchd_exit_and_failed_install_recovery() -> anyhow::Result<()> {
+        use std::{fs::OpenOptions, os::fd::AsRawFd, time::Duration};
+        let root = scratch("launchd-recovery")?;
+        let label = format!("app.tez.install-check.{}", std::process::id());
+        let domain = format!("gui/{}", unsafe { platform_lib::getuid() });
+        let target = format!("{domain}/{label}");
+        struct Cleanup(String, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/bin/launchctl").args(["remove", &self.0]).output();
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(label.clone(), root.clone());
+        let lock_path = root.join("owner.lock");
+        let ready = root.join("ready");
+        let plist = root.join("fixture.plist");
+        let script = "use Fcntl ':DEFAULT'; sysopen(my $lock,$ARGV[0],O_RDWR|O_CREAT,0600) or die $!; flock($lock,2) or die $!; $SIG{TERM}=sub{select(undef,undef,undef,0.25); exit 0}; sysopen(my $ready,$ARGV[1],O_WRONLY|O_CREAT,0600) or die $!; close($ready); while(1){sleep 1}";
+        std::fs::write(&plist, format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/usr/bin/perl</string><string>-e</string><string>{script}</string><string>{}</string><string>{}</string></array><key>RunAtLoad</key><true/></dict></plist>", lock_path.display(), ready.display()))?;
+        let bootstrap = || -> anyhow::Result<()> {
+            super::run_command("/bin/launchctl", &["bootstrap", &domain, plist.to_str().unwrap()], false)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !ready.exists() {
+                anyhow::ensure!(std::time::Instant::now() < deadline, "fixture did not acquire its lock");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        };
+        let repair = || -> anyhow::Result<()> {
+            let file = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+            if unsafe { platform_lib::flock(file.as_raw_fd(), platform_lib::LOCK_EX | platform_lib::LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        };
+        bootstrap()?;
+        assert!(repair().is_err(), "the real job must hold the lock before bootout");
+        super::run_command("/bin/launchctl", &["bootout", &target], false)?;
+        super::repair_after_service_stop(Duration::from_secs(3), repair)?;
+        std::fs::remove_file(&ready)?;
+        let error = super::finish_service_installation(Err(anyhow::anyhow!("injected publication failure")), true, bootstrap)
+            .expect_err("restoration must not hide the failed installation");
+        assert!(format!("{error:#}").contains("background service was restored"));
+        super::run_command("/bin/launchctl", &["print", &target], false)?;
+        assert!(repair().is_err(), "restoration must start a real replacement job");
+        super::run_command("/bin/launchctl", &["bootout", &target], false)?;
+        super::repair_after_service_stop(Duration::from_secs(3), repair)?;
+        Ok(())
+    }
 
     fn scratch(label: &str) -> anyhow::Result<PathBuf> {
         let timestamp = std::time::SystemTime::now()
@@ -1394,16 +1530,16 @@ mod tests {
             .expect("the Linux installer must follow the macOS installer");
         let compact: String = macos_main.chars().filter(|character| !character.is_whitespace()).collect();
         let own_service_calls = [
-            "run_command(\"launchctl\",&[\"bootout\",&launchd_service_target()],debug)?;",
+            "run_command(\"launchctl\",&[\"bootout\",&launchd_service_target()],debug)",
             "run_command(\"launchctl\",&[\"enable\",&launchd_target],debug)?;",
-            "run_command(\"launchctl\",&[\"bootstrap\",\"system\",&plist_path],debug)?;",
+            "run_command(\"launchctl\",&[\"bootstrap\",\"system\",&plist_path],debug)",
             "run_command(\"launchctl\",&[\"start\",clash_verge_service_ipc::MACOS_SERVICE_ID],debug,)?;",
         ];
         assert_eq!(compact.matches("run_command(").count(), own_service_calls.len());
         for call in own_service_calls {
             assert!(compact.contains(call), "missing expected Tez installer call: {call}");
         }
-        assert!(macos_main.contains("wait_for_service_ready()?;"));
+        assert!(macos_main.contains("wait_for_service_ready()"));
         assert!(
             !macos_main.contains("uninstall_old_service"),
             "installing Tez must not invoke another product's helper cleanup"

@@ -207,6 +207,206 @@ async fn protection_checks(
     Ok(disabled.session)
 }
 
+#[cfg(target_os = "macos")]
+async fn chrome_hello(session: &CoreSessionSnapshot, listener: &tokio::net::TcpListener, node: &str) -> Result<bool> {
+    use tokio::io::AsyncReadExt as _;
+    let socket = session.core_ipc_path.as_deref().context("Missing fixture controller")?;
+    let client = kode_bridge::IpcHttpClient::new(Path::new(socket))?;
+    let route = if node.ends_with("Provider") { format!("/providers/proxies/SubscriptionFixture/{node}/healthcheck") }
+        else { format!("/proxies/{node}/delay") };
+    let endpoint = format!("{route}?timeout=1500&url=http%3A%2F%2F127.0.0.1%3A9");
+    let trigger = tokio::spawn(async move { client.get(&endpoint).send().await });
+    let capture = async {
+        let (mut stream, _) = listener.accept().await?;
+        let mut header = [0; 5];
+        stream.read_exact(&mut header).await?;
+        ensure!(header[0] == 22, "Expected a TLS handshake record");
+        let mut body = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+        stream.read_exact(&mut body).await?;
+        ensure!(body.len() > 40 && body[0] == 1, "Expected ClientHello");
+        let start = 39 + body[38] as usize;
+        let length = u16::from_be_bytes([body[start], body[start + 1]]) as usize;
+        let ciphers = &body[start + 2..start + 2 + length];
+        Ok::<_, anyhow::Error>(ciphers.chunks_exact(2).any(|cipher| cipher[0] == cipher[1] && cipher[0] & 0x0f == 0x0a))
+    };
+    let captured = tokio::time::timeout(Duration::from_secs(4), capture).await;
+    let response = tokio::time::timeout(Duration::from_secs(3), &mut { trigger }).await;
+    match captured {
+        Ok(value) => value.with_context(|| format!("Invalid {node} handshake")),
+        Err(error) => Err(anyhow::anyhow!("No {node} ClientHello: {error}; delay response: {response:?}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn runtime_protection_checks(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    runtime: &RuntimeBundle,
+    current: &CoreSessionSnapshot,
+) -> Result<CoreSessionSnapshot> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let mut compatible = runtime.clone();
+    compatible.yaml = FIXTURE.replace("proxies: []", &format!("proxies:\n- {{name: TransportInline, type: trojan, server: 127.0.0.1, port: {port}, password: fixture, sni: fixture.test}}"))
+        .replace("proxies: [DIRECT, REJECT]", "proxies: [DIRECT, REJECT]\n  - name: ProviderFixture\n    type: select\n    use: [SubscriptionFixture]");
+    compatible.yaml.push_str(&format!("proxy-providers:\n  SubscriptionFixture:\n    type: inline\n    override: {{udp: true}}\n    payload:\n    - {{name: TransportProvider, type: trojan, server: 127.0.0.1, port: {port}, password: fixture, sni: fixture.test}}\n    - {{name: PresetProvider, type: trojan, server: 127.0.0.1, port: {port}, password: fixture, sni: fixture.test, client-fingerprint: none}}\n    - {{name: UnsupportedProvider, type: ss, server: 127.0.0.1, port: {port}, cipher: aes-128-gcm, password: fixture}}\n"));
+    let subscription_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/subscription.yaml", subscription_listener.local_addr()?);
+    let mut yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&compatible.yaml)?;
+    let provider = yaml["proxy-providers"]["SubscriptionFixture"].as_mapping_mut().unwrap();
+    let payload = provider.remove("payload").context("Missing fixture payload")?;
+    let body = serde_yaml_ng::to_string(&serde_yaml_ng::Mapping::from_iter([("proxies".into(), payload)]))?;
+    provider.insert("type".into(), "http".into());
+    provider.insert("url".into(), url.clone().into());
+    provider.insert("path".into(), "subscription-fixture.yaml".into());
+    provider.insert("interval".into(), 86400.into());
+    compatible.yaml = serde_yaml_ng::to_string(&yaml)?;
+    compatible.remote_providers.push(RemoteProvider { destination: "subscription-fixture.yaml".into(), url });
+    let asset = Path::new(&credentials.app_data_dir).join("rollback-rules.yaml");
+    std::fs::write(&asset, "payload: ['DOMAIN,fixture.test']\n")?;
+    compatible.assets.push(RuntimeAsset { source: asset.to_string_lossy().into_owned(), destination: "rules/rollback.yaml".into() });
+    compatible.assets.push(RuntimeAsset { source: asset.to_string_lossy().into_owned(), destination: "config.protection.next".into() });
+    let subscription = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        loop {
+            let Ok((mut stream, _)) = subscription_listener.accept().await else { break };
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let mut request = RuntimeProtectionRequest {
+        expected: current.identity.clone(), process_enabled: false, transport_enabled: true, restart: false, runtime: None,
+    };
+    ensure!(set_runtime_protection(credentials, session, &request).await?.code != 0, "Unsupported-only configuration was accepted");
+    ensure!(get_status(credentials).await?.data.context("Missing status")?.core_pid == Some(current.identity.pid), "Unsupported preflight stopped the core");
+    request.transport_enabled = false;
+    request.restart = true;
+    request.runtime = Some(compatible.clone());
+    let mut active = set_runtime_protection(credentials, session, &request).await?.data.context("Could not load transport fixture")?.session;
+    ensure!(!chrome_hello(&active, &listener, "TransportInline").await?, "Baseline unexpectedly uses a browser handshake");
+    request.runtime = None;
+    request.restart = false;
+    request.transport_enabled = true;
+    request.expected = active.identity.clone();
+    request.expected.pid += 1;
+    ensure!(set_runtime_protection(credentials, session, &request).await?.code != 0, "Combined change accepted a stale identity");
+    request.expected = active.identity.clone();
+    ensure!(set_runtime_protection(credentials, &proof(session.generation, &"f".repeat(64)), &request).await?.code != 0, "Combined change accepted a stale token");
+    for (process, transport) in [(false, true), (true, true), (true, false), (false, false), (true, true), (false, true)] {
+        request.expected = active.identity.clone();
+        request.process_enabled = process;
+        request.transport_enabled = transport;
+        let changed = set_runtime_protection(credentials, session, &request).await?;
+        ensure!(changed.code == 0, "Combined protection refused: {}", changed.message);
+        let changed = changed.data.context("Missing combined outcome")?;
+        ensure!(changed.outcome == "changed" && changed.session.identity.pid != active.identity.pid
+            && changed.session.identity.generation == active.identity.generation, "Combined change did not retain one session");
+        active = changed.session;
+        let durable = service_paths()?.for_owner(&credentials.identity).runtime_dir().join("config.yaml");
+        ensure!(std::fs::read_to_string(&durable)? == compatible.yaml, "Session transport overlay changed the durable baseline");
+        ensure!(std::fs::read_to_string(durable.with_file_name("config.protection.next"))? == "payload: ['DOMAIN,fixture.test']\n", "Protection staging clobbered a provider resource");
+        ensure!(active.session_protection == process && active.transport_protection == transport, "Protection modes interfered");
+        ensure!(active.runtime_base_yaml.as_deref() == transport.then_some(compatible.yaml.as_str()), "Recovery baseline was contaminated");
+        if !transport { ensure!(active.runtime_yaml == compatible.yaml, "Disabling transport did not restore the baseline"); }
+        ensure!(chrome_hello(&active, &listener, "TransportInline").await? == transport, "Inline TLS handshake did not follow transport mode");
+        ensure!(chrome_hello(&active, &listener, "TransportProvider").await? == transport, "Provider expression did not change the TLS handshake");
+        ensure!(!chrome_hello(&active, &listener, "PresetProvider").await?, "Provider expression replaced an explicit fingerprint");
+        request.expected = active.identity.clone();
+        let unchanged = set_runtime_protection(credentials, session, &request).await?.data.context("Missing idempotent outcome")?;
+        ensure!(unchanged.outcome == "unchanged" && unchanged.session.identity == active.identity, "Idempotent combined apply restarted the core");
+    }
+    request.expected = active.identity.clone();
+    request.process_enabled = true;
+    request.transport_enabled = true;
+    active = set_runtime_protection(credentials, session, &request).await?.data.context("Missing dual protection")?.session;
+    let client = kode_bridge::IpcHttpClient::new(Path::new(active.core_ipc_path.as_deref().context("Missing controller")?))?;
+    ensure!(client.put("/providers/proxies/SubscriptionFixture").send().await?.is_success()
+        && chrome_hello(&active, &listener, "TransportProvider").await?, "HTTP subscription refresh lost the transport overlay");
+    let mut refreshed = compatible.clone();
+    refreshed.yaml.push_str("# subscription refresh\n");
+    let staged = stage_runtime(credentials, session, &refreshed).await?.data.context("Missing staged response")?;
+    let StageRuntimeOutcome::Staged { config_path } = staged else { anyhow::bail!("Dual-protected staging failed") };
+    let client = kode_bridge::IpcHttpClient::new(Path::new(active.core_ipc_path.as_deref().context("Missing controller")?))?;
+    let loaded = client.put("/configs?force=true").json_body(&serde_json::json!({"path":config_path})).send().await?;
+    ensure!(loaded.is_success() && chrome_hello(&active, &listener, "TransportProvider").await?, "Protected subscription reload failed");
+    let recovered = recover_core_session(credentials, session).await?.data.context("Missing staged recovery")?;
+    ensure!(recovered.identity == active.identity && recovered.transport_protection && recovered.session_protection
+        && recovered.runtime_base_yaml.as_deref() == Some(refreshed.yaml.as_str()), "Staging lost session protection or baseline");
+    request.expected = recovered.identity;
+    request.restart = true;
+    request.runtime = Some(refreshed.clone());
+    active = set_runtime_protection(credentials, session, &request).await?.data.context("Missing protected restart")?.session;
+    ensure!(active.transport_protection && active.session_protection && chrome_hello(&active, &listener, "TransportProvider").await?, "Manual/config restart lost protections");
+    let before = active.identity.pid;
+    ensure!(unsafe { platform_lib::kill(before as i32, platform_lib::SIGTERM) } == 0, "Could not signal dual-protected fixture");
+    for _ in 0..200 {
+        if let Some(next) = recover_core_session(credentials, session).await?.data && next.identity.pid != before { active = next; break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    ensure!(active.identity.pid != before && active.session_protection && active.transport_protection
+        && active.runtime_base_yaml.as_deref() == Some(refreshed.yaml.as_str()), "Watchdog lost dual session state");
+    request.expected = active.identity.clone();
+    let mut broken = refreshed.clone();
+    broken.yaml = "invalid: [".into();
+    request.runtime = Some(broken);
+    let refused = set_runtime_protection(credentials, session, &request).await?;
+    ensure!(refused.code != 0 && get_status(credentials).await?.data.context("Missing status")?.core_pid == Some(active.identity.pid), "Invalid transport config stopped the core");
+    request.transport_enabled = false;
+    request.process_enabled = false;
+    let generation = service_paths()?.for_owner(&credentials.identity).runtime_dir();
+    let old_manifest = std::fs::read(generation.join(".runtime-manifest.json"))?;
+    request.runtime = Some(RuntimeBundle { yaml: FIXTURE.replace("mode: rule", "mode: broken"), ..runtime.clone() });
+    let rollback = set_runtime_protection(credentials, session, &request).await?.data.context("Missing combined rollback")?;
+    ensure!(rollback.outcome == "rolled_back" && rollback.session.session_protection && rollback.session.transport_protection
+        && rollback.session.runtime_base_yaml.as_deref() == Some(refreshed.yaml.as_str())
+        && chrome_hello(&rollback.session, &listener, "TransportProvider").await?, "Failed candidate did not restore both modes");
+    ensure!(std::fs::read_to_string(generation.join("rules/rollback.yaml"))? == "payload: ['DOMAIN,fixture.test']\n", "Rollback lost the previous runtime asset");
+    ensure!(std::fs::read(generation.join(".runtime-manifest.json"))? == old_manifest, "Rollback did not restore the previous resource manifest");
+    let mut no_tls = runtime.clone();
+    no_tls.yaml = FIXTURE.replace("proxies: []", "proxies: [{name: Plain, type: ss, server: 127.0.0.1, port: 1, cipher: aes-128-gcm, password: fixture}]");
+    ensure!(matches!(stage_runtime(credentials, session, &no_tls).await?.data, Some(StageRuntimeOutcome::Staged { .. })), "Could not stage a no-TLS subscription");
+    request.expected = rollback.session.identity;
+    request.process_enabled = true;
+    request.transport_enabled = true;
+    request.runtime = Some(no_tls);
+    let no_tls = set_runtime_protection(credentials, session, &request).await?;
+    ensure!(no_tls.code == 0, "Restart rejected a retained transport mode with no compatible nodes: {}", no_tls.message);
+    let no_tls = no_tls.data.context("Missing no-TLS restart")?;
+    ensure!(no_tls.session.session_protection && no_tls.session.transport_protection, "Restart lost protection modes on an uncovered subscription");
+    request.expected = no_tls.session.identity;
+    request.process_enabled = false;
+    request.runtime = None;
+    let independent = set_runtime_protection(credentials, session, &request).await?;
+    ensure!(independent.code == 0, "Process protection was coupled to TLS node availability");
+    let independent = independent.data.context("Missing independent protection outcome")?;
+    ensure!(!independent.session.session_protection && independent.session.transport_protection, "Independent process disable changed transport mode");
+    request.expected = independent.session.identity;
+    request.restart = true;
+    request.runtime = Some(compatible.clone());
+    let before_cold = set_runtime_protection(credentials, session, &request).await?.data.context("Missing pre-recovery protection")?;
+    ensure!(chrome_hello(&before_cold.session, &listener, "TransportInline").await?, "Transport was not active before service restart");
+    stop_ipc_server().await?;
+    let _restarted = run_ipc_server().await?;
+    restore_desired_state().await?;
+    let after_cold = recover_core_session(credentials, session).await?.data.context("Service restart did not restore the owned baseline")?;
+    ensure!(!after_cold.session_protection && !after_cold.transport_protection
+        && after_cold.runtime_base_yaml.is_none() && after_cold.runtime_yaml == compatible.yaml
+        && !chrome_hello(&after_cold, &listener, "TransportInline").await?, "Service restart retained an unreported transport overlay");
+    println!("PASS: durable baseline and cold service restore default off; no-TLS restart and independent process toggle; resource/manifest rollback; provider names cannot collide with protection temporaries");
+    request.transport_enabled = false;
+    request.process_enabled = false;
+    request.expected = after_cold.identity;
+    request.runtime = Some(runtime.clone());
+    let restored = set_runtime_protection(credentials, session, &request).await?.data.context("Missing baseline restoration")?;
+    ensure!(!restored.session.session_protection && !restored.session.transport_protection && restored.session.runtime_yaml == runtime.yaml, "Modes did not reset to the source fixture");
+    subscription.abort();
+    std::fs::remove_file(asset)?;
+    println!("PASS: four protection combinations and both toggle orders; one session per combined change; idempotence; identity/token and unsupported preflight; real loopback ClientHello with inline and HTTP provider Chrome fingerprints; explicit fingerprint retained; baseline restoration; HTTP subscription refresh and config reload, manual restart, watchdog recovery and failed candidate rollback preserve both modes");
+    Ok(restored.session)
+}
+
 async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path) -> Result<()> {
     let start = StartClashRequest {
         runtime: RuntimeBundle {
@@ -382,6 +582,7 @@ async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path)
     #[cfg(target_os = "macos")]
     {
         claimed = protection_checks(credentials, &session, &start.runtime, &claimed).await?;
+        claimed = runtime_protection_checks(credentials, &session, &start.runtime, &claimed).await?;
     }
     let before_restart = claimed.identity.clone();
     #[cfg(unix)]
@@ -564,12 +765,18 @@ async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path)
             .data
             .context("Fresh recovery failed")?;
         ensure!(!fresh.session_protection, "New session inherited protection");
-        let protected = set_session_protection(
+        let protected = set_runtime_protection(
             credentials,
             &fresh_proof,
-            &SetSessionProtectionRequest {
+            &RuntimeProtectionRequest {
                 expected: fresh.identity,
-                enabled: true,
+                process_enabled: true,
+                transport_enabled: true,
+                restart: false,
+                runtime: Some(RuntimeBundle {
+                    yaml: FIXTURE.replace("proxies: []", "proxies: [{name: StopFixture, type: trojan, server: 127.0.0.1, port: 1, password: fixture}]"),
+                    ..start.runtime.clone()
+                }),
             },
         )
         .await?
@@ -589,7 +796,7 @@ async fn checks(credentials: &OwnerCredentials, stable: &Path, candidate: &Path)
             .await?
             .data
             .context("Fresh recovery failed")?;
-        ensure!(!fresh.session_protection, "Protection survived a stopped core session");
+        ensure!(!fresh.session_protection && !fresh.transport_protection && fresh.runtime_base_yaml.is_none(), "Protection survived a stopped core session");
         ensure!(
             stop_clash(credentials, &fresh_proof).await?.code == 0,
             "Fresh fixture stop failed"

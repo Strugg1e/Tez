@@ -40,6 +40,38 @@ impl PreparedRuntime {
         materialize_plan(&self.runtime, &self.plan, &self.yaml).await
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn backup(&self) -> Result<RuntimeBackup, ServiceError> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid_asset(error.to_string()))?.as_nanos();
+        let directory = self.runtime.with_file_name(format!("runtime.rollback-{nonce:x}"));
+        crate::core::platform_security::ensure_private_service_directory(&directory)
+            .map_err(|error| invalid_asset(error.to_string()))?;
+        let mut backup = RuntimeBackup { directory, files: Vec::new(), preserve: false };
+        // Only files replaced or deleted by this plan belong in the rollback snapshot.
+        let mut targets = std::collections::BTreeSet::from([
+            self.runtime.join(RUNTIME_CONFIG_FILE_NAME), self.runtime.join(SESSION_CONFIG_FILE_NAME),
+            self.runtime.join(super::staging::MANIFEST_FILE_NAME),
+        ]);
+        for destination in self.plan.required_deletes.iter().chain(&self.plan.hygiene_deletes)
+            .chain(self.plan.copies.iter().map(|copy| &copy.destination)) {
+            targets.insert(resolve_in_generation(&self.runtime, destination)?);
+        }
+        for target in targets {
+            let saved = match tokio::fs::symlink_metadata(&target).await {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    let saved = backup.directory.join(backup.files.len().to_string());
+                    tokio::fs::hard_link(&target, &saved).await.map_err(|error| invalid_asset(error.to_string()))?;
+                    Some(saved)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                _ => return Err(invalid_asset("Could not snapshot runtime resource")),
+            };
+            backup.files.push((target, saved));
+        }
+        Ok(backup)
+    }
+
     /// Retires directories left by the old per-start layout after a successful start.
     pub(crate) fn commit(mut self) {
         let stale_paths = std::mem::take(&mut self.stale_runtime_paths);
@@ -50,6 +82,38 @@ impl PreparedRuntime {
         tokio::spawn(async move {
             cleanup_stale_runtime_directories(stale_paths, active_runtime).await;
         });
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct RuntimeBackup {
+    directory: PathBuf,
+    files: Vec<(PathBuf, Option<PathBuf>)>,
+    preserve: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl RuntimeBackup {
+    pub(crate) async fn restore(&mut self) -> Result<(), ServiceError> {
+        self.preserve = true;
+        for (target, saved) in &self.files {
+            if let Some(saved) = saved {
+                crate::core::atomic_file::replace(saved, target).await
+                    .map_err(|error| invalid_asset(format!("Runtime resource rollback failed: {error}")))?;
+            } else {
+                super::staging::remove_staged_file(target).await
+                    .map_err(|error| invalid_asset(format!("New runtime resource cleanup failed: {error}")))?;
+            }
+        }
+        self.preserve = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RuntimeBackup {
+    fn drop(&mut self) {
+        if !self.preserve { let _ = std::fs::remove_dir_all(&self.directory); }
     }
 }
 
@@ -539,6 +603,7 @@ pub(super) fn validate_destination(destination: &str) -> Result<PathBuf, Service
 }
 
 pub(super) const RUNTIME_CONFIG_FILE_NAME: &str = "config.yaml";
+pub(crate) const SESSION_CONFIG_FILE_NAME: &str = "config.session.yaml";
 pub(super) const STAGING_TEMP_INFIX: &str = ".staging-";
 
 /// Canonicalizes a validated destination and rejects service-owned generation names.
@@ -570,6 +635,7 @@ pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError
         // Treat service-owned names case-insensitively for Windows filesystems.
         [only]
             if only.eq_ignore_ascii_case(RUNTIME_CONFIG_FILE_NAME)
+                || only.eq_ignore_ascii_case(SESSION_CONFIG_FILE_NAME)
                 || only.eq_ignore_ascii_case(super::staging::MANIFEST_FILE_NAME) =>
         {
             Err(invalid_asset(format!(

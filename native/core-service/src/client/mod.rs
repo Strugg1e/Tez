@@ -350,6 +350,15 @@ pub async fn set_session_protection(
     .await
 }
 
+pub async fn set_runtime_protection(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    request: &crate::RuntimeProtectionRequest,
+) -> Result<Response<crate::SessionProtectionOutcome>> {
+    protected_call(Verb::Post, IpcCommand::RuntimeProtection, credentials, Some(session), request.clone(),
+        Some(Duration::from_secs(60))).await
+}
+
 pub async fn update_writer(
     credentials: &OwnerCredentials,
     session: &OwnerSessionProof,

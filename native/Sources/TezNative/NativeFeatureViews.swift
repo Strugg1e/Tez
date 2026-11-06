@@ -874,6 +874,7 @@ struct NativeActivityWorkspace: View {
             }
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, TezStyle.pageInset).frame(height: 48)
+            .tezWindowDragBackground("tez.window.drag.header")
             Divider()
             if session.showsLogs { NativeLogsView(store: store, session: session.logs) }
             else { NativeActivityView(store: store, session: session) }
@@ -932,6 +933,7 @@ struct NativeLogsView: View {
                     exportDocument = .init(content: lines.joined(separator: "\n")); exports = true
                 }
             }.padding(.horizontal, TezStyle.pageInset).frame(height: 48)
+                .tezWindowDragBackground("tez.window.drag.filter")
                 .background(Color(nsColor: .controlBackgroundColor))
             Divider()
             if let target = session.relatedTarget {
@@ -992,6 +994,7 @@ struct NativeLogsView: View {
                                tone: logGap || logTruncated ? .warning : .neutral,
                                symbol: session.paused ? "pause.circle" : "text.alignleft", motion: motion)
             }.padding(.horizontal, TezStyle.pageInset).frame(height: 28)
+                .tezWindowDragBackground("tez.window.drag.footer")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor))

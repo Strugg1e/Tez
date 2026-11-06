@@ -51,10 +51,12 @@ struct BackendConnectionCheck {
     static func fixture(_ requestedMode: String) throws {
         let claimedFile = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent(".automatic-claim-ready")
         let installedFile = claimedFile.deletingLastPathComponent().appendingPathComponent(".automatic-install-ready")
+        let idleFile = claimedFile.deletingLastPathComponent().appendingPathComponent(".automatic-idle-ready")
         let upgradeRelease = claimedFile.deletingLastPathComponent().appendingPathComponent(".upgrade-eof-release")
         let upgradeInput = claimedFile.deletingLastPathComponent().appendingPathComponent(".upgrade-eof-input")
         let mode: String
         if requestedMode == "automatic-claim" { mode = FileManager.default.fileExists(atPath: claimedFile.path) ? "prepared-normal" : "automatic-readonly" }
+        else if requestedMode == "automatic-idle" { mode = FileManager.default.fileExists(atPath: idleFile.path) ? "prepared-normal" : "automatic-readonly" }
         else if requestedMode.hasPrefix("automatic-install") { mode = FileManager.default.fileExists(atPath: installedFile.path) ? "prepared-normal" : "automatic-readonly" }
         else if requestedMode == "prepared-upgrade-eof" && FileManager.default.fileExists(atPath: upgradeRelease.path) { mode = "prepared-normal" }
         else { mode = requestedMode }
@@ -76,6 +78,7 @@ struct BackendConnectionCheck {
             try emit(.hello(sessionID: String(getpid()), capabilities: capabilities))
         } else if mode.hasPrefix("prepared-") || mode.hasPrefix("recovery-") {
             var capabilities = ["native_subscribe", "native_get_snapshot", "native_prepare_shutdown"]
+            if requestedMode == "automatic-idle" { capabilities.append("native_core_start") }
             if mode == "prepared-service-install" { capabilities.append("native_install_service") }
             if mode.hasPrefix("prepared-upgrade-") { capabilities.append("native_upgrade_core") }
             try emit(.hello(sessionID: "fixture", capabilities: capabilities))
@@ -90,17 +93,42 @@ struct BackendConnectionCheck {
         var second: String?
         var prepareAttempts = 0
         var prepared = false
+        var coreStartAttempts = 0
+        var serviceRecovered = false
+        func currentSnapshot() -> BackendJSON {
+            guard requestedMode == "automatic-idle", mode == "automatic-readonly", case .object(var value) = snapshot else { return snapshot }
+            value["revision"] = .string(serviceRecovered ? "2" : "1")
+            value["core"] = .object(["state": .string("unavailable"), "message": .null, "lifecycle": .object([
+                "state": .string(serviceRecovered ? "stopped" : "unknown"),
+                "source": .string(serviceRecovered ? "service" : "unknown"), "canStart": .bool(serviceRecovered),
+                "reason": .string(serviceRecovered ? "idle-service" : "service-unavailable"),
+                "processes": .array([]), "serviceProtocol": serviceRecovered ? .string("2.6") : .null,
+                "serviceControlAvailable": .bool(serviceRecovered)
+            ])])
+            return .object(value)
+        }
         while let line = readLine() {
             guard case .request(let id, let command, let params) = try BackendWire.decode(Data(line.utf8)) else { exit(2) }
             if mode == "automatic-readonly", command.hasPrefix("native_core_") || command == "native_prepare_shutdown" { exit(88) }
             if command == "native_subscribe" {
                 if mode == "no-subscribe" { continue }
-                try emit(.response(id: id, outcome: .result(mode.hasPrefix("renewal") ? renewalSnapshot() : snapshot)))
+                try emit(.response(id: id, outcome: .result(mode.hasPrefix("renewal") ? renewalSnapshot() : currentSnapshot())))
                 if mode == "gap" {
                     try emit(.event(sequence: "2", name: "tez://snapshot-changed", payload: snapshot))
                 }
                 if mode == "corrupt" { try FileHandle.standardOutput.write(contentsOf: Data("not-json\n".utf8)) }
                 if mode == "eof" { return }
+            } else if command == "native_core_start" && requestedMode == "automatic-idle" {
+                coreStartAttempts += 1
+                try emit(.response(id: id, outcome: .result(.object(["mode": .string("Service")]))))
+            } else if command == "core-start-attempts" {
+                try emit(.response(id: id, outcome: .result(.integer(Int64(coreStartAttempts)))))
+            } else if command == "simulate-service-recovery" && requestedMode == "automatic-idle" {
+                serviceRecovered = true
+                try Data("ready".utf8).write(to: idleFile)
+                try emit(.response(id: id, outcome: .result(.null)))
+            } else if command == "native_get_snapshot" && requestedMode == "automatic-idle" {
+                try emit(.response(id: id, outcome: .result(currentSnapshot())))
             } else if command == "native_claim_core" && requestedMode == "automatic-claim" {
                 guard params["confirmed"] == .bool(true) else { exit(2) }
                 try Data("claimed".utf8).write(to: claimedFile)
@@ -207,12 +235,12 @@ struct BackendConnectionCheck {
     }
 
     @MainActor
-    static func wait(attempts: Int = 300, _ predicate: () -> Bool) async throws {
+    static func wait(attempts: Int = 300, line: UInt = #line, _ predicate: () -> Bool) async throws {
         for _ in 0..<attempts {
             if predicate() { return }
             try await Task.sleep(for: .milliseconds(10))
         }
-        throw NativeBackendError.unavailable("Test wait timed out")
+        throw NativeBackendError.unavailable("Test wait timed out at line \(line)")
     }
 
     @MainActor
@@ -236,6 +264,26 @@ struct BackendConnectionCheck {
         precondition(NativeObservedMode(state: "ready", value: "rule").label == "规则")
         precondition(NativeObservedMode(state: "ready", value: "unexpected").label == "未确认")
         precondition(NativeObservedMode(state: "unavailable", value: "rule").label == "未确认")
+        let idle = NativeCoreInspection(state: "stopped", source: "service", canStart: true, reason: "idle-service",
+            corePid: nil, serviceGeneration: nil, processes: [], serviceProtocol: "2.6", serviceControlAvailable: true)
+        let idleActions = NativeCoreActions(coreState: "unavailable", inspection: idle, writable: true)
+        precondition(idle.canInstallService)
+        precondition(idleActions.canStart && !idleActions.canStop && !idleActions.canRestart)
+        let observerActions = NativeCoreActions(coreState: "unavailable", inspection: idle, writable: false)
+        precondition(observerActions.canStart && !observerActions.canStop)
+        let unknown = NativeCoreInspection(state: "unknown", source: "unknown", canStart: false, reason: "service-unavailable",
+            corePid: nil, serviceGeneration: nil, processes: [])
+        let unknownActions = NativeCoreActions(coreState: "unavailable", inspection: unknown, writable: true)
+        precondition(unknown.canInstallService)
+        precondition(!unknownActions.canStart && !unknownActions.canStop && !unknownActions.canRestart)
+        let owned = NativeCoreInspection(state: "running", source: "service", canStart: false, reason: "owned-service",
+            corePid: 123, serviceGeneration: 42, processes: [])
+        let ownedActions = NativeCoreActions(coreState: "error", inspection: owned, writable: true)
+        precondition(!owned.canInstallService)
+        precondition(!ownedActions.canStart && ownedActions.canStop && ownedActions.canRestart,
+            "controller errors must not remove control of the confirmed owned process")
+        let external = NativeCoreActions(coreState: "ready", inspection: owned, writable: false)
+        precondition(!external.canStop && !external.canRestart)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -256,6 +304,24 @@ struct BackendConnectionCheck {
         precondition(observerClosed && automaticRead.state == .disconnected)
         try await wait { kill(pid_t(observerPID), 0) == -1 && errno == ESRCH }
         try await wait { !FileManager.default.fileExists(atPath: observerRecovery) }
+
+        let recoveredService = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-idle"],
+            timeout: .seconds(1), mode: .automatic)
+        recoveredService.connect()
+        try await wait { recoveredService.state == .connected }
+        precondition(!recoveredService.canResumeCoreManagement)
+        _ = try await recoveredService.request("simulate-service-recovery")
+        recoveredService.refresh()
+        try await wait { recoveredService.canResumeCoreManagement }
+        precondition(recoveredService.isReadOnlyConnection && !recoveredService.supports("native_core_start"),
+            "detecting an idle service must not automatically start a managed host")
+        try await recoveredService.resumeCoreManagement()
+        try await wait { recoveredService.state == .connected && !recoveredService.isReadOnlyConnection }
+        precondition(!recoveredService.canResumeCoreManagement && recoveredService.requiresManagedShutdown)
+        let starts = try await recoveredService.request("core-start-attempts")
+        precondition(starts == .integer(1), "one explicit start must both restore management and send exactly one core start")
+        let recoveredClosed = await recoveredService.shutdownForTermination()
+        precondition(recoveredClosed)
 
         let automaticReconnect = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-readonly"],
             timeout: .seconds(1), mode: .automatic)
@@ -405,7 +471,8 @@ struct BackendConnectionCheck {
         precondition(cancelledInstall.serviceSetupInProgress)
         do { _ = try await installing.value; fatalError("Cancelled installation returned success") }
         catch NativeBackendError.remote(let remote) { precondition(remote.code == .string("SERVICE_INSTALL_CANCELLED")) }
-        precondition(!cancelledInstall.serviceSetupInProgress && !cancelledInstall.workspaceBusy && cancelledInstall.isReadOnlyConnection)
+        precondition(!cancelledInstall.serviceSetupInProgress && !cancelledInstall.workspaceBusy && cancelledInstall.isReadOnlyConnection
+            && !cancelledInstall.serviceCapabilitiesNeedRefresh)
         cancelledInstall.disconnect()
         let installedAutomatic = NativeBackendStore(helperURL: helper, arguments: ["--fixture", "automatic-install"],
             timeout: .seconds(1), mode: .automatic)

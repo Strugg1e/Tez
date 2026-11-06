@@ -33,6 +33,8 @@ pub enum IpcCommand {
     UpgradeCore,
     #[strum(serialize = "/tez/core/session-protection")]
     SessionProtection,
+    #[strum(serialize = "/tez/core/runtime-protection")]
+    RuntimeProtection,
     #[strum(serialize = "/system-proxy")]
     SetSystemProxy,
     #[strum(serialize = "/writer")]

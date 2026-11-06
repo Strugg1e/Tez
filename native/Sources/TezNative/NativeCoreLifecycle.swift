@@ -12,9 +12,21 @@ struct NativeCoreInspection: Codable, Equatable, Sendable {
     var serviceProtocol: String? = nil
     var serviceControlAvailable: Bool? = nil
 
+    var canInstallService: Bool {
+        if serviceControlAvailable == true { return canStart && state == "stopped" && source == "service" }
+        return canStart
+            || (reason == "service-unavailable" && source == "unknown" && processes.isEmpty)
+            || (reason == "service-upgrade-required" && state == "stopped" && source == "service" && processes.isEmpty)
+            || (state == "runningReadOnly" && source == "service")
+    }
+
     var explanation: String {
         switch reason {
+        case "owned-service": "Tez 正在管理此内核。停止和重启只作用于当前会话。"
+        case "owned-service-recovering": "自有内核正在恢复。可以停止恢复过程，暂不重复启动。"
         case "service-upgrade-required": "当前后台服务不支持新版内核控制。更新后台服务后才能启动、停止或重启内核。"
+        case "service-unavailable": "系统后台服务未响应。请安装或修复后台服务；重新检测不会启动内核。"
+        case "service-status-unavailable": "后台服务可以连接，但运行状态读取失败。暂不启动或接管内核，请重新检测。"
         case "idle-service": "没有运行中的内核，可以启动 Tez 内核。"
         case "service-session-unavailable": "内核仍在服务中运行。当前缺少控制会话，先只读连接，不停止或重复启动内核。"
         case "external-core": "检测到其他内核进程。当前只读连接，不自动终止进程。"
@@ -29,11 +41,31 @@ struct NativeCoreInspection: Codable, Equatable, Sendable {
 
     var stateLabel: String {
         switch state {
+        case "running": "运行中 · Tez 管理"
+        case "recoveringOwned": "自有内核恢复中"
         case "stopped": "未运行"
         case "runningReadOnly": "检测到运行内核 · 只读"
         case "recovering": "服务恢复中"
         case "conflict": "多个内核待确认"
         default: "状态待确认"
+        }
+    }
+}
+
+struct NativeCoreActions {
+    let canStart: Bool
+    let canStop: Bool
+    let canRestart: Bool
+
+    init(coreState: String, inspection: NativeCoreInspection?, writable: Bool) {
+        if let inspection {
+            canStart = inspection.canStart && inspection.state == "stopped"
+            canStop = writable && ["running", "recoveringOwned"].contains(inspection.state)
+            canRestart = writable && inspection.state == "running"
+        } else {
+            canStart = writable && coreState == "unavailable"
+            canStop = writable && coreState == "ready"
+            canRestart = canStop
         }
     }
 }

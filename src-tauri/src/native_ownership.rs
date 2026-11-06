@@ -26,6 +26,40 @@ pub(crate) async fn protection_supported() -> bool {
         .is_some_and(|info| info.supports_tez_lifecycle() && info.session_protection)
 }
 
+pub(crate) async fn runtime_protection_supported() -> bool {
+    service::get_version().await.ok().filter(|response| response.code == 0)
+        .and_then(|response| response.data).is_some_and(|info| info.supports_tez_lifecycle() && info.runtime_protection)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RuntimeProtectionParams {
+    confirmed: bool,
+    expected: CoreIdentity,
+    process_enabled: bool,
+    transport_enabled: bool,
+}
+
+pub(crate) async fn set_runtime_protection(params: Value) -> CmdResult<Value> {
+    let request: RuntimeProtectionParams = serde_json::from_value(params)
+        .map_err(|_| CommandFailure::coded("INVALID_PARAMS", "Expected confirmed runtime protection modes and current core identity"))?;
+    if !request.confirmed {
+        return Err(CommandFailure::coded("CORE_CONFIRMATION_REQUIRED", "Changing runtime protections restarts the owned core"));
+    }
+    if !runtime_protection_supported().await {
+        return Err(CommandFailure::coded("RUNTIME_PROTECTION_UNAVAILABLE", "Update the background service to apply combined runtime protections"));
+    }
+    let outcome = CoreManager::global().set_native_runtime_protection(&service::RuntimeProtectionRequest {
+        expected: request.expected, process_enabled: request.process_enabled, transport_enabled: request.transport_enabled,
+        restart: false, runtime: None,
+    }).await.map_err(|error| CommandFailure::coded("RUNTIME_PROTECTION_UNCONFIRMED", format_args!("{error:#}")))?;
+    let report = service::protection::inspect_transport(outcome.session.runtime_base_yaml.as_deref().unwrap_or(&outcome.session.runtime_yaml)).ok();
+    Ok(json!({"outcome":outcome.outcome,"enabled":outcome.session.session_protection,
+        "transportEnabled":outcome.session.transport_protection,"transportSupported":true,"transportReport":report,
+        "protectionSupported":true,"generation":outcome.session.identity.generation,"pid":outcome.session.identity.pid,
+        "started_at":outcome.session.identity.started_at}))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProtectionParams {
@@ -120,7 +154,8 @@ fn service_install_target_available(inspection: &crate::native_lifecycle::Inspec
         return inspection.can_start && inspection.state == "stopped" && inspection.source == "service";
     }
     inspection.can_start
-        || (inspection.reason == "service-unavailable" && inspection.processes.is_empty())
+        || (inspection.reason == "service-unavailable" && inspection.source == "unknown" && inspection.processes.is_empty())
+        || (inspection.reason == "service-upgrade-required" && inspection.state == "stopped" && inspection.source == "service" && inspection.processes.is_empty())
         || (inspection.state == "runningReadOnly" && inspection.source == "service")
 }
 
@@ -173,7 +208,7 @@ fn validate_managed_install_identity(
 ) -> Result<()> {
     ensure!(matches!(mode, crate::core::manager::RunningMode::NotRunning), "Stop the owned core before reinstalling the service");
     ensure!(!core_busy, "Another or recovering core session prevents service reinstallation");
-    ensure!(inspection.service_control_available, "Managed reinstallation requires a compatible Tez service");
+    ensure!(inspection.service_protocol.is_none() || inspection.service_control_available, "Managed reinstallation requires a compatible Tez service");
     ensure!(request.expected.is_none(), "A running-core confirmation cannot authorize idle reinstallation");
     validate_install_identity(None, inspection)
 }
@@ -186,8 +221,10 @@ pub(crate) async fn install_managed_service(params: Value) -> CmdResult<Value> {
         let manager = CoreManager::global();
         let _update = manager.claim_config_update(&write)?;
         let inspection = crate::native_lifecycle::inspect().await;
-        let installation = service::inspect_installation(&[]).await?;
-        validate_managed_install_identity(&request, &inspection, *manager.get_running_mode(), installation.core_busy)?;
+        let core_busy = if inspection.service_protocol.is_some() {
+            service::inspect_installation(&[]).await?.core_busy
+        } else { false };
+        validate_managed_install_identity(&request, &inspection, *manager.get_running_mode(), core_busy)?;
         ensure!(service_tools_available(), "Required bundled service tools are unavailable");
         let _execution = service::execution::CoreExecutionGuard::acquire()?;
         let inspection = crate::native_lifecycle::inspect().await;
@@ -212,10 +249,12 @@ async fn install_service_tools() -> Result<()> {
 }
 
 fn service_install_failure(error: anyhow::Error) -> CommandFailure {
-    let cancelled = format!("{error:#}").contains("(-128)");
+    let detail = format!("{error:#}");
+    let cancelled = detail.contains("(-128)");
+    let detail: String = detail.chars().take(4000).collect();
     CommandFailure::coded(if cancelled { "SERVICE_INSTALL_CANCELLED" } else { "SERVICE_INSTALL_FAILED" },
         if cancelled { "Administrator authorization was cancelled. Inspect the current core before retrying." }
-        else { "Service upgrade was not confirmed. Inspect the current core and retry explicitly; no automatic retry was scheduled." })
+        else { &detail })
 }
 
 #[derive(Deserialize)]
@@ -380,7 +419,8 @@ pub(crate) async fn control_state(params: Value) -> CmdResult<Value> {
             "Service session changed"
         );
         let supported = protection_supported().await;
-        let (pid, started_at, enabled) = if supported {
+        let transport_supported = runtime_protection_supported().await;
+        let (pid, started_at, enabled, transport_enabled, report) = if supported {
             let state = service::session_protection_state(&credentials, &proof).await?;
             ensure!(state.code == 0, "Session protection status unavailable");
             let state = state.data.context("Missing session protection state")?;
@@ -388,12 +428,15 @@ pub(crate) async fn control_state(params: Value) -> CmdResult<Value> {
                 Some(state.identity.pid),
                 Some(state.identity.started_at),
                 Some(state.enabled),
+                Some(state.transport_enabled),
+                state.transport_report,
             )
         } else {
-            (status.core_pid, status.core_started_at, None)
+            (status.core_pid, status.core_started_at, None, None, None)
         };
         Ok(json!({"generation":proof.generation,"pid":pid,"started_at":started_at,
-            "protectionSupported":supported,"enabled":enabled}))
+            "protectionSupported":supported,"enabled":enabled,"transportSupported":transport_supported,
+            "transportEnabled":transport_enabled,"transportReport":report}))
     }
     .await;
     result.map_err(|_| CommandFailure::coded("CORE_CONTROL_UNAVAILABLE", "Owned core identity could not be confirmed"))
@@ -438,6 +481,23 @@ mod tests {
         inspection.source = "service";
         inspection.can_start = false;
         assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, false).is_err());
+        inspection.state = "unknown";
+        inspection.reason = "service-unavailable";
+        inspection.source = "unknown";
+        inspection.service_protocol = None;
+        inspection.service_control_available = false;
+        assert!(validate_managed_install_identity(&request, &inspection, RunningMode::NotRunning, false).is_ok(),
+            "repair must remain available after the service is unloaded");
+    }
+
+    #[test]
+    fn native_service_install_failure_preserves_the_failed_step() {
+        let failure = service_install_failure(anyhow::anyhow!("service owner lock is held").context("Waiting for background service to exit"));
+        assert_eq!(failure.code.as_deref(), Some("SERVICE_INSTALL_FAILED"));
+        assert!(failure.detail.contains("Waiting for background service to exit"));
+        assert!(failure.detail.contains("service owner lock is held"));
+        let cancelled = service_install_failure(anyhow::anyhow!("User canceled. (-128)"));
+        assert_eq!(cancelled.code.as_deref(), Some("SERVICE_INSTALL_CANCELLED"));
     }
 
     #[tokio::test]
@@ -451,9 +511,11 @@ mod tests {
             assert!(install_service(value.clone()).await.is_err());
             assert!(install_managed_service(value.clone()).await.is_err());
             assert!(set_protection(value.clone()).await.is_err());
+            assert!(set_runtime_protection(value.clone()).await.is_err());
             assert!(upgrade(value).await.is_err());
         }
         assert!(set_protection(json!({"confirmed":false,"enabled":true,"expected":{"generation":1,"pid":1,"started_at":1}})).await.is_err());
+        assert!(set_runtime_protection(json!({"confirmed":false,"processEnabled":true,"transportEnabled":true,"expected":{"generation":1,"pid":1,"started_at":1}})).await.is_err());
         assert!(control_state(json!({"unexpected":true})).await.is_err());
     }
 
